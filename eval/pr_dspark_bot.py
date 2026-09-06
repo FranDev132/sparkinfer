@@ -158,14 +158,23 @@ SCORING_DIMS = [
     # to the block-scaled NVFP4 GEMM above 16 rows -- everything it does happens ABOVE 8, so as
     # scored at c8 it measured ~0%.
     #
-    # Measured on main at the scoring length, aggregate tok/s: c8 72.7, c16 72.5, c32 72.5. The
-    # ceiling is visible as the SAME number three widths running -- past 8 rows the batch is split
-    # into chunks that each re-read all ~15 GB of weights, so extra concurrency buys nothing.
+    # Measured on main at the scoring length, aggregate tok/s:
     #
-    # Gate-safe, measured before adding rather than after: 4 runs of IDENTICAL code give 0.83%
-    # spread at both widths (worst case -0.83% against the -2.00% reject bar, ~2.4x margin), in
-    # line with the existing rows. The 64-token ladder looked fine too and would have REJECTED
+    #     c1 95.1   c2 180.8   c4 302.4   c8 461.1   c16 484.5   c32 486.1
+    #
+    # Scaling is real up to c8 and then FLATTENS -- c8 to c32 gains 1.4%. That is the
+    # kQwen35MaxPackedRows = 8 ceiling: past 8 rows the batch is split into chunks of 8 and every
+    # chunk re-reads all ~15 GB of weights, so the extra concurrency buys almost nothing.
+    #
+    # Gate-safe, measured before adding rather than after, on the CURRENT main: 4 runs of
+    # IDENTICAL code give 0.56% / 0.62% / 0.76% spread at c8 / c16 / c32 (worst case -0.76%
+    # against the -2.00% reject bar). The 64-token ladder looked fine too and would have REJECTED
     # unchanged code at -3.37%, so this is checked every time a width is added.
+    #
+    # The first version of this comment quoted ~72 tok/s at every width. Those numbers came from a
+    # scratch tree that predated the packed-decode merge (#975), i.e. the OLD chunked regime, and
+    # were not main's. Measure the baseline on a tree that is actually main -- a control run at an
+    # existing width is the cheap way to catch it.
     "cb-decode@c16", "cb-decode@c32",
 ]
 SCORING_DIM = SCORING_DIMS[0]
