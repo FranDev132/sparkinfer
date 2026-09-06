@@ -239,6 +239,41 @@ struct Qwen35Model::Impl {
     int dflash_graph_attn_mode = -1;
     bool dflash_graph_sparse = false;
 
+    // Per-session parking lot for the AR decode graph.
+    //
+    // activate_session() used to DESTROY cu_graph outright, because every node in it bakes this
+    // session's device pointers -- lin_state / lin_conv_state / penalty_counts / logit_bias, and
+    // kv->block_table(active_seq_id). Correct, but it made a session switch cost a full capture +
+    // instantiate of the whole 64-layer decode, and the continuous-batch worker switches sessions
+    // on EVERY token once two requests are in flight. Measured on RTX 5090 / Qwen3.8-27B-NVFP4,
+    // that is ~1.09 ms per token: per-token wall time goes 13.07 ms at concurrency 1 to 14.16 ms
+    // at concurrency 2, so aggregate throughput FALLS 84.9 -> 74.4 tok/s going 1 -> 2.
+    //
+    // Parking the outgoing session's graph under its own seq_id and restoring the incoming one
+    // keeps exactly the same "a decode graph only ever runs for the session it was captured for"
+    // guarantee, while making a switch a pointer swap.
+    //
+    // Safe because every pointer a decode node bakes is stable for the session's lifetime: the
+    // per-session buffers are allocated once in open_session(), and block_table(seq) is
+    // d_block_tables + slot * max_blocks_per_seq -- a fixed slab offset whose CONTENTS grow as
+    // blocks are appended but whose ADDRESS does not. That is the same assumption the pre-existing
+    // code already made by replaying one capture across a session's whole decode phase.
+    //
+    // n_splits is parked with the graph: the adaptive-splits check invalidates on
+    // `want != s.n_splits`, so restoring a graph without restoring the value it was captured at
+    // would tear it straight back down.
+    struct ParkedDecodeGraph {
+        cudaGraph_t graph{};
+        cudaGraphExec_t exec{};
+        int attn_mode = -1;
+        bool sparse = false;
+        int n_splits = 0;
+    };
+    std::unordered_map<uint64_t, ParkedDecodeGraph> parked_graphs;
+    // Bounded purely as a leak backstop -- close_session() drops a session's entry, so in steady
+    // state this holds one graph per LIVE session, which is the server's concurrency limit.
+    static constexpr size_t kMaxParkedGraphs = 64;
+
     // scratch (bf16)
     bf16 *x, *xn, *q, *k, *v, *attn, *ao, *h, *hn, *routed, *shared;
     bf16 *qraw = nullptr, *qgate = nullptr;
@@ -759,6 +794,11 @@ Qwen35Model::~Qwen35Model() {
         if (kv.second.lin_state) cudaFree(kv.second.lin_state);
         if (kv.second.lin_conv_state) cudaFree(kv.second.lin_conv_state);
     }
+    for (auto& kv : p_->parked_graphs) {
+        if (kv.second.exec) cudaGraphExecDestroy(kv.second.exec);
+        if (kv.second.graph) cudaGraphDestroy(kv.second.graph);
+    }
+    p_->parked_graphs.clear();
     if (p_->graph_ready) { cudaGraphExecDestroy(p_->cu_exec); cudaGraphDestroy(p_->cu_graph); }
     if (p_->graph_prefill_ready) { cudaGraphExecDestroy(p_->cu_prefill_exec); cudaGraphDestroy(p_->cu_prefill_graph); }
     if (p_->dflash_graph_ready) { cudaGraphExecDestroy(p_->cu_dflash_exec); cudaGraphDestroy(p_->cu_dflash_graph); }
@@ -2619,8 +2659,29 @@ Qwen35Model::BenchDecodeResult Qwen35Model::bench_decode(int warmup, int n, int 
     return out;
 }
 
+void Qwen35Model::drop_parked_decode_graphs() {
+    Impl& s = *p_;
+    // Self-guarding: most callers reach this through invalidate_decode_graph(), and while the
+    // device-touching ones (cache_prefix, clear_prefix_cache) already hold device_mu, the DSpark
+    // ones (set_dflash_capture, restore_spec_snapshot) do not. Destroying a raw graph handle
+    // unlocked was merely racy; mutating a std::unordered_map unlocked is undefined. Recursive,
+    // so the callers that do hold it are unaffected.
+    std::lock_guard<std::recursive_mutex> device_lock(s.device_mu);
+    for (auto& kv : s.parked_graphs) {
+        if (kv.second.exec) cudaGraphExecDestroy(kv.second.exec);
+        if (kv.second.graph) cudaGraphDestroy(kv.second.graph);
+    }
+    s.parked_graphs.clear();
+}
+
 void Qwen35Model::invalidate_decode_graph() {
     Impl& s = *p_;
+    // Parked graphs go too. This function means "something the capture depends on changed"
+    // (weights, splits policy, sparse budget, bench toggles), and a graph parked under the old
+    // setting is exactly as stale as the active one. activate_session() deliberately does NOT
+    // route its decode-graph handling through here -- a session switch invalidates nothing, it
+    // just moves which capture is current.
+    drop_parked_decode_graphs();
     if (s.graph_ready) {
         cudaGraphExecDestroy(s.cu_exec);
         cudaGraphDestroy(s.cu_graph);
@@ -3088,6 +3149,15 @@ void Qwen35Model::close_session(uint64_t seq_id, const std::vector<int>* store_t
     std::lock_guard<std::recursive_mutex> device_lock(p_->device_mu);
     Impl& s = *p_;
     if (seq_id == 0) return;
+    // Drop this session's parked decode graph before the buffers its nodes bake are freed below.
+    {
+        auto parked = s.parked_graphs.find(seq_id);
+        if (parked != s.parked_graphs.end()) {
+            if (parked->second.exec) cudaGraphExecDestroy(parked->second.exec);
+            if (parked->second.graph) cudaGraphDestroy(parked->second.graph);
+            s.parked_graphs.erase(parked);
+        }
+    }
     // Store to the external cache tier before freeing the blocks it reads -- this is the
     // "session close" eviction point (docs/lmcache_bridge_protocol.md's STORE trigger list).
     // store_tokens is null for most callers (this model class doesn't itself track a session's
@@ -3126,6 +3196,35 @@ void Qwen35Model::close_session(uint64_t seq_id, const std::vector<int>* store_t
 void Qwen35Model::activate_session(uint64_t seq_id) {
     Impl& s = *p_;
     if (s.active_seq_id == seq_id) return;
+    // Guards parked_graphs, which close_session() also mutates. The pre-existing code only
+    // touched raw graph handles here and could get away without it; a std::unordered_map cannot,
+    // since a concurrent insert/erase is undefined rather than merely racy. Recursive and the
+    // same mutex close_session() already holds when it calls activate_session(0) below, so the
+    // nesting is fine.
+    std::lock_guard<std::recursive_mutex> device_lock(s.device_mu);
+
+    // Park the OUTGOING session's decode graph rather than destroying it (see
+    // Impl::parked_graphs for why: destroying it here is what made concurrency 2 slower than
+    // concurrency 1). Everything the capture bakes belongs to the session it is parked under, so
+    // it stays valid until that session is closed or something global invalidates it.
+    if (s.graph_ready) {
+        auto& slot = s.parked_graphs[s.active_seq_id];
+        // A previous park for this same id can only exist if it was never restored; free it
+        // rather than leaking the graph it holds.
+        if (slot.exec) cudaGraphExecDestroy(slot.exec);
+        if (slot.graph) cudaGraphDestroy(slot.graph);
+        slot.graph = s.cu_graph;
+        slot.exec = s.cu_exec;
+        slot.attn_mode = s.graph_attn_mode;
+        slot.sparse = s.graph_sparse;
+        slot.n_splits = s.n_splits;
+        s.cu_graph = nullptr;
+        s.cu_exec = nullptr;
+        s.graph_ready = false;
+        s.graph_attn_mode = -1;
+        s.graph_sparse = false;
+    }
+
     s.active_seq_id = seq_id;
     auto it = s.sessions.find(seq_id);
     if (it == s.sessions.end() && seq_id == 0) it = s.sessions.find(0);  // defensive fallback
@@ -3140,7 +3239,44 @@ void Qwen35Model::activate_session(uint64_t seq_id) {
         s.penalty_counts = it->second.penalty_counts;
         s.logit_bias = it->second.logit_bias;
     }
-    invalidate_decode_graph();
+
+    // The PREFILL and DFlash graphs are still torn down on a switch. They bake the same
+    // session-owned pointers, but neither is replayed often enough for parking to pay: prefill
+    // runs once per request and the DFlash verify graph is not on the server's decode path at
+    // all. Keeping them on the old teardown keeps this change to the one graph that is replayed
+    // every token.
+    if (s.dflash_graph_ready) {
+        cudaGraphExecDestroy(s.cu_dflash_exec);
+        cudaGraphDestroy(s.cu_dflash_graph);
+        s.cu_dflash_exec = nullptr;
+        s.cu_dflash_graph = nullptr;
+        s.dflash_graph_ready = false;
+        s.dflash_graph_attn_mode = -1;
+        s.dflash_graph_sparse = false;
+    }
+    if (s.graph_prefill_ready) {
+        cudaGraphExecDestroy(s.cu_prefill_exec);
+        cudaGraphDestroy(s.cu_prefill_graph);
+        s.cu_prefill_exec = nullptr;
+        s.cu_prefill_graph = nullptr;
+        s.graph_prefill_ready = false;
+        s.graph_prefill_attn_mode = -1;
+    }
+
+    // Restore the INCOMING session's parked graph, if it still has one.
+    auto parked = s.parked_graphs.find(seq_id);
+    if (parked != s.parked_graphs.end()) {
+        s.cu_graph = parked->second.graph;
+        s.cu_exec = parked->second.exec;
+        s.graph_ready = s.cu_exec != nullptr;
+        s.graph_attn_mode = parked->second.attn_mode;
+        s.graph_sparse = parked->second.sparse;
+        s.n_splits = parked->second.n_splits;
+        s.parked_graphs.erase(parked);
+    }
+
+    // Leak backstop only -- close_session() is what normally reclaims these.
+    if (s.parked_graphs.size() > Impl::kMaxParkedGraphs) drop_parked_decode_graphs();
 }
 
 uint64_t Qwen35Model::active_session() const { return p_->active_seq_id; }

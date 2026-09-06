@@ -545,6 +545,10 @@ public:
 
 private:
     void invalidate_decode_graph();
+    // Frees every decode graph parked under a non-active session id (see the parking lot in
+    // qwen35.cpp's Impl). Called by invalidate_decode_graph(), which is the "something global
+    // changed" path, and as a size backstop.
+    void drop_parked_decode_graphs();
     void dflash_maybe_capture_layer(int layer);
     // Depth-adaptive KV-split count for a given seqlen (32/128/160/256 tiers, GQA-8/hd256
     // occupancy correction). Shared by forward_token()'s normal per-token adaptation and
