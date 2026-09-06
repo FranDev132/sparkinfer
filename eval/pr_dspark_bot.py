@@ -1871,6 +1871,10 @@ def eval_qwen38_on_box(host, port, pr_ref: str, main: dict):
             "pr_prefill_pp": pr.get("prefill_pp", 0.0), "main_prefill_pp": main.get("prefill_pp", 0.0),
             "pr_prefill4_pp": pr.get("prefill4_pp", 0.0), "main_prefill4_pp": main.get("prefill4_pp", 0.0),
             "pr_prefill16_pp": pr.get("prefill16_pp", 0.0), "main_prefill16_pp": main.get("prefill16_pp", 0.0),
+            "pr_cb1_agg": pr.get("cb1_agg", 0.0), "main_cb1_agg": main.get("cb1_agg", 0.0),
+            "pr_cb2_agg": pr.get("cb2_agg", 0.0), "main_cb2_agg": main.get("cb2_agg", 0.0),
+            "pr_cb4_agg": pr.get("cb4_agg", 0.0), "main_cb4_agg": main.get("cb4_agg", 0.0),
+            "pr_cb8_agg": pr.get("cb8_agg", 0.0), "main_cb8_agg": main.get("cb8_agg", 0.0),
             "pr_prefill256_pp": pr.get("prefill256_pp", 0.0), "main_prefill256_pp": main.get("prefill256_pp", 0.0),
             "pr_decode_tps": pr.get("dspark_tps", 0.0), "main_decode_tps": main.get("dspark_tps", 0.0),
             "pr_mean_accept": pr.get("mean_accept", 0.0), "main_mean_accept": main.get("mean_accept", 0.0),
@@ -2138,6 +2142,14 @@ def eval_qwen38_on_box(host, port, pr_ref: str, main: dict):
         "prefill4_regressed": prefill4_label == "REJECT",
         "pr_prefill16_pp": pr["prefill16_pp"],
         "main_prefill16_pp": main["prefill16_pp"],
+        "pr_cb1_agg": pr.get("cb1_agg", 0.0),
+        "main_cb1_agg": main.get("cb1_agg", 0.0),
+        "pr_cb2_agg": pr.get("cb2_agg", 0.0),
+        "main_cb2_agg": main.get("cb2_agg", 0.0),
+        "pr_cb4_agg": pr.get("cb4_agg", 0.0),
+        "main_cb4_agg": main.get("cb4_agg", 0.0),
+        "pr_cb8_agg": pr.get("cb8_agg", 0.0),
+        "main_cb8_agg": main.get("cb8_agg", 0.0),
         "prefill16_delta_pct": prefill16_delta_pct,
         "prefill16_regressed": prefill16_label == "REJECT",
         "pr_prefill256_pp": pr["prefill256_pp"],
@@ -2234,6 +2246,14 @@ def format_comment(commit: str, res: dict) -> str:
         "main_prefill4_pp": res.get("main_prefill4_pp"),
         "prefill4_delta_pct": res.get("prefill4_delta_pct"),
         "pr_prefill16_pp": res.get("pr_prefill16_pp"),
+        "pr_cb1_agg": res.get("pr_cb1_agg"),
+        "main_cb1_agg": res.get("main_cb1_agg"),
+        "pr_cb2_agg": res.get("pr_cb2_agg"),
+        "main_cb2_agg": res.get("main_cb2_agg"),
+        "pr_cb4_agg": res.get("pr_cb4_agg"),
+        "main_cb4_agg": res.get("main_cb4_agg"),
+        "pr_cb8_agg": res.get("pr_cb8_agg"),
+        "main_cb8_agg": res.get("main_cb8_agg"),
         "main_prefill16_pp": res.get("main_prefill16_pp"),
         "prefill16_delta_pct": res.get("prefill16_delta_pct"),
         "pr_prefill256_pp": res.get("pr_prefill256_pp"),
@@ -2423,7 +2443,9 @@ def format_comment(commit: str, res: dict) -> str:
         f"{banner}"
         f"| metric | value |\n|---|---|\n"
         f"| **label** | `eval-dspark:{lab}` |\n"
-        f"| scored at | **DSpark decode + batched prefill @4k/@16k/@32k; target prefill @256k** on the ModelOpt NVFP4 checkpoint |\n"
+        f"| scored at | **DSpark decode + batched prefill @4k/@16k/@32k; target prefill @256k; "
+        f"concurrent decode @c2/c4/c8** on the ModelOpt NVFP4 checkpoint |\n"
+        f"| winning axis | **{str(res.get('scored_dimension') or '—').replace('|', '/')}** — the dimension this label came from |\n"
         f"| **PR DSpark @4k** | **{_v('pr_dspark4_tps', '.2f', ' tok/s')}** |\n"
         f"| **main DSpark @4k** | **{_v('main_dspark4_tps', '.2f', ' tok/s')}** |\n"
         f"| DSpark decode @4k vs main | {_pct('decode4_delta_pct', 'pr_dspark4_tps', 'main_dspark4_tps')} |\n"
@@ -2447,6 +2469,18 @@ def format_comment(commit: str, res: dict) -> str:
         f"| **PR decode @256k** | **{_v('pr_decode256_tps', '.2f', ' tok/s')}** |\n"
         f"| **main decode @256k** | **{_v('main_decode256_tps', '.2f', ' tok/s')}** |\n"
         f"| prefill @256k vs main | {_pct('prefill256_delta_pct', 'pr_prefill256_pp', 'main_prefill256_pp')} |\n"
+        f"| **PR concurrent decode @c2** | **{_v('pr_cb2_agg', '.1f', ' tok/s agg')}** |\n"
+        f"| **main concurrent decode @c2** | **{_v('main_cb2_agg', '.1f', ' tok/s agg')}** |\n"
+        f"| concurrent decode @c2 vs main | {_pct('cb2_delta_pct', 'pr_cb2_agg', 'main_cb2_agg')} |\n"
+        f"| **PR concurrent decode @c4** | **{_v('pr_cb4_agg', '.1f', ' tok/s agg')}** |\n"
+        f"| **main concurrent decode @c4** | **{_v('main_cb4_agg', '.1f', ' tok/s agg')}** |\n"
+        f"| concurrent decode @c4 vs main | {_pct('cb4_delta_pct', 'pr_cb4_agg', 'main_cb4_agg')} |\n"
+        f"| **PR concurrent decode @c8** | **{_v('pr_cb8_agg', '.1f', ' tok/s agg')}** |\n"
+        f"| **main concurrent decode @c8** | **{_v('main_cb8_agg', '.1f', ' tok/s agg')}** |\n"
+        f"| concurrent decode @c8 vs main | {_pct('cb8_delta_pct', 'pr_cb8_agg', 'main_cb8_agg')} |\n"
+        f"| PR concurrent decode @c1 (floor) | {_v('pr_cb1_agg', '.1f', ' tok/s agg')} |\n"
+        f"| main concurrent decode @c1 (floor) | {_v('main_cb1_agg', '.1f', ' tok/s agg')} |\n"
+        f"| concurrent @c1 vs main (floor) | {_pct('cb1_delta_pct', 'pr_cb1_agg', 'main_cb1_agg')} |\n"
         f"| PR AR tok/s (floor) | {_v('pr_ar_tps', '.2f')} |\n"
         f"| main AR tok/s (floor) | {_v('main_ar_tps', '.2f')} |\n"
         f"| AR vs main (floor) | {_pct('ar_delta_pct', 'pr_ar_tps', 'main_ar_tps')} |\n"

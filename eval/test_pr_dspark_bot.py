@@ -10,6 +10,33 @@ class Prefill256KEvalTests(unittest.TestCase):
         self.assertIn("target-prefill@256k", bot.SCORING_DIMS)
         self.assertIn("native-nvfp4-256k-prefill", bot.EVAL_SCHEMA_VERSION)
 
+    def test_comment_shows_the_axis_that_earned_the_label(self):
+        # #973 scored XL from cb-decode@c2 while every row in its comment read +0.0%, because the
+        # dimensions were added to scoring and to the payload but never to the rendered table. A
+        # label with no visible supporting number reads as a bug or a rigged verdict.
+        res = {"ok": True, "label": "XL", "delta_pct": 33.2, "scored_dimension": "cb-decode@c2",
+               "pr_cb1_agg": 91.6, "main_cb1_agg": 91.7,
+               "pr_cb2_agg": 96.3, "main_cb2_agg": 72.3,
+               "pr_cb4_agg": 88.1, "main_cb4_agg": 72.8,
+               "pr_cb8_agg": 80.2, "main_cb8_agg": 71.9}
+        body = bot.format_comment("deadbeef", res)
+        self.assertIn("winning axis", body)
+        self.assertIn("cb-decode@c2", body)
+        for c in (2, 4, 8):
+            self.assertIn(f"concurrent decode @c{c} vs main", body)
+        self.assertIn("+33.2%", body)
+        # c=1 is labelled a floor in the table too, so nobody reads it as a scored axis.
+        self.assertIn("(floor)", body)
+        # The header must say concurrency was scored, or the label has no stated basis.
+        self.assertIn("concurrent decode @c2/c4/c8", body)
+
+    def test_comment_renders_absent_concurrency_as_dash_not_zero(self):
+        # An unmeasured dimension must not render as +0.0%: that reads as "measured, no change".
+        res = {"ok": True, "label": "none", "delta_pct": 0.0}
+        body = bot.format_comment("deadbeef", res)
+        self.assertIn("| **PR concurrent decode @c2** | **—** |", body)
+        self.assertNotIn("concurrent decode @c2 vs main | +0.0%", body)
+
     def test_concurrency_is_scored_and_c1_is_only_a_floor(self):
         # Every other dimension measures ONE stream. Without these, a PR that fixed aggregate
         # throughput under concurrency scored exactly zero -- which is what #973 and #975 hit.
