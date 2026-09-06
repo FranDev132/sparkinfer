@@ -1015,8 +1015,9 @@ for rep in $(seq 1 {spec_reps}); do
   #
   # So hash each rep's AR token stream and require the hashes to AGREE ACROSS PROCESSES. Greedy
   # decode is a function of its input; two clean starts on identical ids must emit identical
-  # tokens. Costs no extra GPU time -- these reps already run -- and covers 4k/16k/32k, all of
-  # which sit above the 2048 threshold where the padded-stride regime begins.
+  # tokens. Costs no extra GPU time -- these reps already run. Applied at 4k, 16k and 32k (each
+  # rep loop carries its own copy), all of which sit above the 2048 threshold where the
+  # padded-stride regime begins.
   REP_HASH=$(sed -n 's/^DSPARK_AR_TOKENS //p' "$REP_OUT" | tail -1 | sha256sum | cut -c1-16)
   echo "DSPARK_AR_HASH $rep ${{REP_HASH:-none}}"
   if [ "$rep" -eq 1 ]; then
@@ -1076,6 +1077,15 @@ for rep in $(seq 1 {spec_reps}); do
   if [ "$rep" -eq 1 ]; then cp "$REP_OUT" "$DS4_OUT"; fi
   REP_LL=$(sed -n 's/^METRIC LOSSLESS //p' "$REP_OUT" | tail -1)
   [ "${{REP_LL:-0}}" = "1" ] || DS4_ALL_OK=0
+  # Cross-run determinism at 4k, same rationale as the 16k loop: losslessness is checked inside a
+  # single process and cannot see a nondeterministic shared prefill.
+  REP_HASH=$(sed -n 's/^DSPARK_AR_TOKENS //p' "$REP_OUT" | tail -1 | sha256sum | cut -c1-16)
+  if [ "$rep" -eq 1 ]; then
+    DS4_HASH0="$REP_HASH"
+  elif [ -n "$DS4_HASH0" ] && [ -n "$REP_HASH" ] && [ "$REP_HASH" != "$DS4_HASH0" ]; then
+    echo "DSPARK_NONDETERMINISTIC context=4k rep=$rep hash=$REP_HASH != rep1=$DS4_HASH0" >&2
+    DS_DETERMINISTIC=0
+  fi
   echo "DSPARK4_FRESH_REP $rep lossless=${{REP_LL:-0}}"
 done
 echo "METRIC LOSSLESS $DS4_ALL_OK" >> "$DS4_OUT"
@@ -1120,6 +1130,15 @@ for rep in $(seq 1 {spec_reps}); do
   if [ "$rep" -eq 1 ]; then cp "$REP_OUT" "$DS32_OUT"; fi
   REP_LL=$(sed -n 's/^METRIC LOSSLESS //p' "$REP_OUT" | tail -1)
   [ "${{REP_LL:-0}}" = "1" ] || DS32_ALL_OK=0
+  # Cross-run determinism at 32k -- the deepest scored context, and the one where a
+  # depth-dependent defect is most likely to show first.
+  REP_HASH=$(sed -n 's/^DSPARK_AR_TOKENS //p' "$REP_OUT" | tail -1 | sha256sum | cut -c1-16)
+  if [ "$rep" -eq 1 ]; then
+    DS32_HASH0="$REP_HASH"
+  elif [ -n "$DS32_HASH0" ] && [ -n "$REP_HASH" ] && [ "$REP_HASH" != "$DS32_HASH0" ]; then
+    echo "DSPARK_NONDETERMINISTIC context=32k rep=$rep hash=$REP_HASH != rep1=$DS32_HASH0" >&2
+    DS_DETERMINISTIC=0
+  fi
   echo "DSPARK32_FRESH_REP $rep lossless=${{REP_LL:-0}}"
 done
 echo "METRIC LOSSLESS $DS32_ALL_OK" >> "$DS32_OUT"

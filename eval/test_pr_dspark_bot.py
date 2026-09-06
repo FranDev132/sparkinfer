@@ -44,7 +44,13 @@ class Prefill256KEvalTests(unittest.TestCase):
         script = bot._remote_script("main", role="main")
         self.assertIn("SPARKINFER_DSPARK_DUMP_TOKENS=1", script)   # compact prefix cannot diverge-detect
         self.assertIn("DSPARK_AR_HASH", script)
-        self.assertIn("DSPARK_NONDETERMINISTIC", script)
+        # ALL THREE scored contexts, not just 16k. The first version of this gate guarded 16k only
+        # while its own comment claimed 4k/16k/32k -- the same kind of comment-contradicts-code
+        # defect this whole line of work exists to remove.
+        self.assertIn("DSPARK_NONDETERMINISTIC rep=", script)              # 16k
+        self.assertIn("DSPARK_NONDETERMINISTIC context=4k rep=", script)
+        self.assertIn("DSPARK_NONDETERMINISTIC context=32k rep=", script)
+        self.assertEqual(script.count("DSPARK_AR_TOKENS"), 3)
         self.assertIn("RESULT_AR_DETERMINISTIC", script)
         parsed = bot._parse_remote("RESULT_AR_DETERMINISTIC 0\n")
         self.assertEqual(parsed["ar_deterministic"], 0)
