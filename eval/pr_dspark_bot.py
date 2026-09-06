@@ -153,6 +153,20 @@ SCORING_DIMS = [
     # (13 -> 30 -> 55 -> 106 ms), i.e. requests queue behind one another rather than batching.
     # A PR that fixed that scored exactly zero here, because every other dimension is bs=1.
     "cb-decode@c2", "cb-decode@c4", "cb-decode@c8",
+    # c16/c32 added 2026-09-06 for the same reason c2/c4/c8 were: the gate could not see the thing
+    # a PR was optimising. #988 raises kQwen35MaxPackedRows from 8 to 32 and switches the dense FFN
+    # to the block-scaled NVFP4 GEMM above 16 rows -- everything it does happens ABOVE 8, so as
+    # scored at c8 it measured ~0%.
+    #
+    # Measured on main at the scoring length, aggregate tok/s: c8 72.7, c16 72.5, c32 72.5. The
+    # ceiling is visible as the SAME number three widths running -- past 8 rows the batch is split
+    # into chunks that each re-read all ~15 GB of weights, so extra concurrency buys nothing.
+    #
+    # Gate-safe, measured before adding rather than after: 4 runs of IDENTICAL code give 0.83%
+    # spread at both widths (worst case -0.83% against the -2.00% reject bar, ~2.4x margin), in
+    # line with the existing rows. The 64-token ladder looked fine too and would have REJECTED
+    # unchanged code at -3.37%, so this is checked every time a width is added.
+    "cb-decode@c16", "cb-decode@c32",
 ]
 SCORING_DIM = SCORING_DIMS[0]
 
@@ -189,7 +203,7 @@ MODELOPT_NEEDS_REBASE = "dspark-needs-rebase"
 # v12 (2026-09-06): concurrency dimensions added (cb-decode@c2/c4/c8 scored, cb-decode@c1 as a
 # floor). Same reasoning as every prior bump -- a PR evaluated before a scoring change existed must
 # not keep a label that the current dimension set would not have produced.
-EVAL_SCHEMA_VERSION = "v12-dspark-native-nvfp4-256k-prefill-decode-concurrency"
+EVAL_SCHEMA_VERSION = "v13-dspark-native-nvfp4-256k-prefill-decode-concurrency-wide"
 MARKER_RE = re.compile(
     r"<!-- sparkinfer-dspark-eval:" + re.escape(EVAL_SCHEMA_VERSION) + r":([0-9a-f]+)(?:\s+(\{.*?\}))? -->",
     re.DOTALL,
@@ -1267,7 +1281,7 @@ fi
 # worst case sits 5-7x inside the reject band. Do not shorten this to save GPU time; the four runs
 # together cost ~3 minutes against the 256k row's ~65.
 wait_gpu_clear
-for CC in 1 2 4 8; do
+for CC in 1 2 4 8 16 32; do
   CB_OUT=/tmp/dspark_cb_$CC.txt
   if ! timeout 900 env \
     SPARKINFER_QWEN38_PREFILL_NVFP4=1 \
@@ -1925,6 +1939,8 @@ def eval_qwen38_on_box(host, port, pr_ref: str, main: dict):
             "pr_cb2_agg": pr.get("cb2_agg", 0.0), "main_cb2_agg": main.get("cb2_agg", 0.0),
             "pr_cb4_agg": pr.get("cb4_agg", 0.0), "main_cb4_agg": main.get("cb4_agg", 0.0),
             "pr_cb8_agg": pr.get("cb8_agg", 0.0), "main_cb8_agg": main.get("cb8_agg", 0.0),
+            "pr_cb16_agg": pr.get("cb16_agg", 0.0), "main_cb16_agg": main.get("cb16_agg", 0.0),
+            "pr_cb32_agg": pr.get("cb32_agg", 0.0), "main_cb32_agg": main.get("cb32_agg", 0.0),
             "pr_prefill256_pp": pr.get("prefill256_pp", 0.0), "main_prefill256_pp": main.get("prefill256_pp", 0.0),
             "pr_decode_tps": pr.get("dspark_tps", 0.0), "main_decode_tps": main.get("dspark_tps", 0.0),
             "pr_mean_accept": pr.get("mean_accept", 0.0), "main_mean_accept": main.get("mean_accept", 0.0),
@@ -2006,6 +2022,8 @@ def eval_qwen38_on_box(host, port, pr_ref: str, main: dict):
         ("cb-decode@c2",      pr["cb2_agg"],    main["cb2_agg"]),
         ("cb-decode@c4",      pr["cb4_agg"],    main["cb4_agg"]),
         ("cb-decode@c8",      pr["cb8_agg"],    main["cb8_agg"]),
+        ("cb-decode@c16",     pr["cb16_agg"],   main["cb16_agg"]),
+        ("cb-decode@c32",     pr["cb32_agg"],   main["cb32_agg"]),
         # Floor, not a scored axis: a PR must not buy concurrency scaling by slowing the
         # single-stream continuous-batch path. Same role the ar-decode floors play for DSpark.
         ("cb-decode@c1",      pr["cb1_agg"],    main["cb1_agg"]),
@@ -2217,6 +2235,10 @@ def eval_qwen38_on_box(host, port, pr_ref: str, main: dict):
         "main_cb4_agg": main.get("cb4_agg", 0.0),
         "pr_cb8_agg": pr.get("cb8_agg", 0.0),
         "main_cb8_agg": main.get("cb8_agg", 0.0),
+        "pr_cb16_agg": pr.get("cb16_agg", 0.0),
+        "main_cb16_agg": main.get("cb16_agg", 0.0),
+        "pr_cb32_agg": pr.get("cb32_agg", 0.0),
+        "main_cb32_agg": main.get("cb32_agg", 0.0),
         "prefill16_delta_pct": prefill16_delta_pct,
         "prefill16_regressed": prefill16_label == "REJECT",
         "pr_prefill256_pp": pr["prefill256_pp"],
@@ -2322,6 +2344,10 @@ def format_comment(commit: str, res: dict) -> str:
         "main_cb4_agg": res.get("main_cb4_agg"),
         "pr_cb8_agg": res.get("pr_cb8_agg"),
         "main_cb8_agg": res.get("main_cb8_agg"),
+        "pr_cb16_agg": res.get("pr_cb16_agg"),
+        "main_cb16_agg": res.get("main_cb16_agg"),
+        "pr_cb32_agg": res.get("pr_cb32_agg"),
+        "main_cb32_agg": res.get("main_cb32_agg"),
         "main_prefill16_pp": res.get("main_prefill16_pp"),
         "prefill16_delta_pct": res.get("prefill16_delta_pct"),
         "pr_prefill256_pp": res.get("pr_prefill256_pp"),
@@ -2555,6 +2581,12 @@ def format_comment(commit: str, res: dict) -> str:
         f"| **PR concurrent decode @c8** | **{_v('pr_cb8_agg', '.1f', ' tok/s agg')}** |\n"
         f"| **main concurrent decode @c8** | **{_v('main_cb8_agg', '.1f', ' tok/s agg')}** |\n"
         f"| concurrent decode @c8 vs main | {_pct('cb8_delta_pct', 'pr_cb8_agg', 'main_cb8_agg')} |\n"
+        f"| **PR concurrent decode @c16** | **{_v('pr_cb16_agg', '.1f', ' tok/s agg')}** |\n"
+        f"| **main concurrent decode @c16** | **{_v('main_cb16_agg', '.1f', ' tok/s agg')}** |\n"
+        f"| concurrent decode @c16 vs main | {_pct('cb16_delta_pct', 'pr_cb16_agg', 'main_cb16_agg')} |\n"
+        f"| **PR concurrent decode @c32** | **{_v('pr_cb32_agg', '.1f', ' tok/s agg')}** |\n"
+        f"| **main concurrent decode @c32** | **{_v('main_cb32_agg', '.1f', ' tok/s agg')}** |\n"
+        f"| concurrent decode @c32 vs main | {_pct('cb32_delta_pct', 'pr_cb32_agg', 'main_cb32_agg')} |\n"
         f"| PR concurrent decode @c1 (floor) | {_v('pr_cb1_agg', '.1f', ' tok/s agg')} |\n"
         f"| main concurrent decode @c1 (floor) | {_v('main_cb1_agg', '.1f', ' tok/s agg')} |\n"
         f"| concurrent @c1 vs main (floor) | {_pct('cb1_delta_pct', 'pr_cb1_agg', 'main_cb1_agg')} |\n"

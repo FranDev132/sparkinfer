@@ -69,7 +69,8 @@ class Prefill256KEvalTests(unittest.TestCase):
     def test_concurrency_is_scored_and_c1_is_only_a_floor(self):
         # Every other dimension measures ONE stream. Without these, a PR that fixed aggregate
         # throughput under concurrency scored exactly zero -- which is what #973 and #975 hit.
-        for dim in ("cb-decode@c2", "cb-decode@c4", "cb-decode@c8"):
+        for dim in ("cb-decode@c2", "cb-decode@c4", "cb-decode@c8",
+                    "cb-decode@c16", "cb-decode@c32"):
             self.assertIn(dim, bot.SCORING_DIMS)
         # c=1 must NOT be scored: it is the floor that stops a PR buying concurrency scaling by
         # slowing the single-stream path. Scoring it would let that trade earn a tier.
@@ -78,7 +79,7 @@ class Prefill256KEvalTests(unittest.TestCase):
     def test_remote_script_measures_the_concurrency_ladder(self):
         script = bot._remote_script("main", role="main")
         self.assertIn("qwen3_gguf_cb_bench", script)
-        self.assertIn("for CC in 1 2 4 8; do", script)
+        self.assertIn("for CC in 1 2 4 8 16 32; do", script)
         # 256 tokens per request, not 64. A ~1s run measures its own startup: on identical code
         # c=4 spread 3.40% and could land at -3.37%, hard-REJECTING a PR that changed nothing,
         # because REGRESS_TOL rejects below -2.00%. At 256 the worst case is -0.41%. Pinned here
