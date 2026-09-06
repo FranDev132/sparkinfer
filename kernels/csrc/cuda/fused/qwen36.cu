@@ -310,6 +310,89 @@ __global__ void gdn_ar_fast_kernel(const __nv_bfloat16* __restrict__ q,
     if (lane == 0) out[(size_t)vh * HEAD_DIM + j] = __float2bfloat16(y);
 }
 
+// ---------------------------------------------------------------------------
+// BATCHED decode step: B INDEPENDENT sequences, one token each.
+//
+// Not the same shape as the chunked/compact scans next door. Those walk N CONSECUTIVE positions
+// of ONE sequence and therefore carry a serial dependence between rows. Here each row is a
+// different request advancing its own recurrent state by exactly one step, so the rows are fully
+// independent and the batch is just another grid axis.
+//
+// Why it exists: the continuous-batch worker runs one full 64-layer forward PER SEQUENCE, and
+// decode is bandwidth-bound on weight reads, so N concurrent requests read every weight N times
+// and aggregate throughput does not scale with concurrency. Packing the rows into one forward
+// fixes that, and the 48 Gated-DeltaNet layers are the only stage with no batched decode form --
+// the projections/FFN already take R rows through one weight read, and the paged attention
+// already takes num_seqs.
+//
+// The per-row state pointers arrive as a DEVICE ARRAY rather than a base + stride, because each
+// session's lin_state / lin_conv_state is its own cudaMalloc. That also keeps this CUDA-graph
+// safe: the graph bakes the ADDRESS of the pointer array, and the packer refreshes its CONTENTS
+// before each replay, the same trick d_scalars already uses for token id / position.
+//
+// Row b reads activation row b and state states[b]; with batch == 1 and states[0] equal to what
+// the unbatched launcher is handed, every lane does bit-identical arithmetic in the same order,
+// so a packed step and a sequential step agree exactly rather than approximately.
+template <int COLS, int HEAD_DIM>
+__global__ void gdn_ar_fast_batched_kernel(const __nv_bfloat16* __restrict__ q,
+                                           const __nv_bfloat16* __restrict__ k,
+                                           const __nv_bfloat16* __restrict__ v,
+                                           const __nv_bfloat16* __restrict__ alpha,
+                                           const __nv_bfloat16* __restrict__ beta,
+                                           const __nv_bfloat16* __restrict__ dt,
+                                           const __nv_bfloat16* __restrict__ a,
+                                           float* const* __restrict__ states,
+                                           size_t state_off,
+                                           __nv_bfloat16* __restrict__ out,
+                                           int q_heads, int v_heads, bool qh_block,
+                                           bool state_bf16) {
+    constexpr int NROW = HEAD_DIM / 32;
+    const int vh   = blockIdx.x;
+    const int j    = blockIdx.y * COLS + (threadIdx.x >> 5);
+    const int b    = blockIdx.z;
+    const int lane = threadIdx.x & 31;
+    if (vh >= v_heads || j >= HEAD_DIM) return;
+    const int qh   = qh_block ? (vh / (v_heads / q_heads)) : (vh % q_heads);
+    const float scale = rsqrtf((float)HEAD_DIM);
+    // Per-row activation strides. dt/a are WEIGHTS (one value per v-head, shared by every row)
+    // and are deliberately not strided; alpha/beta are per-token projections and are.
+    const int qdim = q_heads * HEAD_DIM, vdim = v_heads * HEAD_DIM;
+    const __nv_bfloat16* qrow = q + (size_t)b * qdim;
+    const __nv_bfloat16* krow = k + (size_t)b * qdim;
+    const __nv_bfloat16* vrow = v + (size_t)b * vdim;
+    const __nv_bfloat16* arow = alpha + (size_t)b * v_heads;
+    const __nv_bfloat16* brow = beta  + (size_t)b * v_heads;
+    const float bb = q36_sigmoid(q36_to_f(brow[vh]));
+    const float g  = __expf(q36_softplus(q36_to_f(arow[vh]) + q36_to_f(dt[vh])) * q36_to_f(a[vh]));
+    const __nv_bfloat16* qhptr = qrow + (size_t)qh * HEAD_DIM;
+    const __nv_bfloat16* khptr = krow + (size_t)qh * HEAD_DIM;
+    const __nv_bfloat16* vhptr = vrow + (size_t)vh * HEAD_DIM;
+    float* col = states[b] + state_off + ((size_t)vh * HEAD_DIM + j) * HEAD_DIM;
+
+    float sloc[NROW];
+    float part_sk = 0.f;
+    #pragma unroll
+    for (int r = 0; r < NROW; r++) {
+        const int i = lane + r * 32;
+        const float sv = col[i];
+        sloc[r] = sv;
+        part_sk += sv * q36_to_f(khptr[i]);
+    }
+    const float sk = g * q36_wsum(part_sk);
+    const float delta = (q36_to_f(vhptr[j]) - sk) * bb;
+    float part_y = 0.f;
+    #pragma unroll
+    for (int r = 0; r < NROW; r++) {
+        const int i = lane + r * 32;
+        float s_new = sloc[r] * g + q36_to_f(khptr[i]) * delta;
+        if (state_bf16) s_new = q36_to_f(__float2bfloat16(s_new));
+        col[i] = s_new;
+        part_y += s_new * q36_to_f(qhptr[i]) * scale;
+    }
+    const float y = q36_wsum(part_y);
+    if (lane == 0) out[(size_t)b * vdim + (size_t)vh * HEAD_DIM + j] = __float2bfloat16(y);
+}
+
 // Default GDN path: warp-per-state-column with native [vh][row][col] layout (no transposed
 // state). One warp owns column j; row slices live in registers; grid fills the GPU.
 template <int WARPS_PER_BLK, int HEAD_DIM>
@@ -553,6 +636,50 @@ void launch_qwen36_conv_split_l2(const void* qkv_bf16, const void* conv_w_bf16,
         q_heads, head_dim, eps);
 }
 
+// Batched decode step over B independent sequences. Mirrors launch_qwen36_gdn_ar's dispatch so
+// the two stay on the same kernel family; only the grid gains a batch axis and the state arrives
+// as a per-row pointer array. Restricted to the fast head_dim==128 path, which is the only one
+// the packed decode path uses (Qwen3.8 linear_head_dim = 128); anything else must keep running
+// the unbatched launcher per row.
+bool launch_qwen36_gdn_ar_batched(const void* q_bf16, const void* k_bf16, const void* v_bf16,
+                                  const void* alpha_bf16, const void* beta_bf16,
+                                  const void* dt_bf16, const void* a_bf16,
+                                  float* const* states, size_t state_off, void* out_bf16,
+                                  int batch, int q_heads, int v_heads, int head_dim,
+                                  bool qh_block, cudaStream_t stream) {
+    if (batch < 1 || head_dim != 128) return false;
+    static const bool state_bf16 = [] {
+        const char* e = getenv("SPARKINFER_GDN_STATE_BF16");
+        return e && e[0] == '1';
+    }();
+    static int cols = -1;
+    if (cols < 0) {
+        const char* e = getenv("SPARKINFER_GDN_FAST_COLS");
+        if (e) cols = atoi(e);
+        else cols = (v_heads >= 32) ? 4 : 8;
+        if (!(cols == 4 || cols == 8 || cols == 16)) cols = 8;
+    }
+    constexpr int HD = 128;
+    const int c = cols;
+    dim3 grid(v_heads, (HD + c - 1) / c, batch);
+#define SI_GDN_AR_B(C_)                                                                    \
+    gdn_ar_fast_batched_kernel<C_, HD><<<grid, (C_) * 32, 0, stream>>>(                    \
+        reinterpret_cast<const __nv_bfloat16*>(q_bf16),                                    \
+        reinterpret_cast<const __nv_bfloat16*>(k_bf16),                                    \
+        reinterpret_cast<const __nv_bfloat16*>(v_bf16),                                    \
+        reinterpret_cast<const __nv_bfloat16*>(alpha_bf16),                                \
+        reinterpret_cast<const __nv_bfloat16*>(beta_bf16),                                 \
+        reinterpret_cast<const __nv_bfloat16*>(dt_bf16),                                   \
+        reinterpret_cast<const __nv_bfloat16*>(a_bf16),                                    \
+        states, state_off, reinterpret_cast<__nv_bfloat16*>(out_bf16),                     \
+        q_heads, v_heads, qh_block, state_bf16)
+    if (c == 4)       SI_GDN_AR_B(4);
+    else if (c == 16) SI_GDN_AR_B(16);
+    else              SI_GDN_AR_B(8);
+#undef SI_GDN_AR_B
+    return true;
+}
+
 void launch_qwen36_gdn_ar(const void* q_bf16, const void* k_bf16, const void* v_bf16,
                           const void* alpha_bf16, const void* beta_bf16,
                           const void* dt_bf16, const void* a_bf16,
@@ -747,6 +874,91 @@ __global__ void conv_split_l2norm_fused_kernel(
     } else {
         out[0] = __float2bfloat16(oy);
     }
+}
+
+// Batched twin of conv_split_l2norm_fused_kernel: B independent rows, each with its OWN conv
+// state (a device array of pointers, same reasoning as gdn_ar_fast_batched_kernel above).
+// blockIdx.y is the row; everything else is the unbatched kernel unchanged, so batch == 1 with
+// states[0] equal to the unbatched conv_state argument reproduces it exactly.
+__global__ void conv_split_l2norm_fused_batched_kernel(
+    const __nv_bfloat16* __restrict__ qkv,
+    const __nv_bfloat16* __restrict__ conv_w,
+    __nv_bfloat16* const* __restrict__ conv_states,
+    size_t conv_off,
+    __nv_bfloat16* __restrict__ q,
+    __nv_bfloat16* __restrict__ k,
+    __nv_bfloat16* __restrict__ v,
+    int q_heads, int v_heads, int head_dim, int conv_kernel, float eps)
+{
+    const int h  = blockIdx.x;
+    const int b  = blockIdx.y;
+    const int t  = threadIdx.x;
+    const int q_dim = q_heads * head_dim;
+    const int v_dim = v_heads * head_dim;
+    const int qkv_dim = 2 * q_dim + v_dim;
+
+    const __nv_bfloat16* qkv_row = qkv + (size_t)b * qkv_dim;
+    __nv_bfloat16* conv_state = conv_states[b] + conv_off;
+
+    bool do_norm = false;
+    int d;
+    __nv_bfloat16* out;
+    if (h < q_heads) {
+        d = h * head_dim + t;  out = q + (size_t)b * q_dim + d;  do_norm = true;
+    } else if (h < 2 * q_heads) {
+        d = q_dim + (h - q_heads) * head_dim + t;
+        out = k + (size_t)b * q_dim + d - q_dim;  do_norm = true;
+    } else {
+        d = 2 * q_dim + (h - 2 * q_heads) * head_dim + t;
+        out = v + (size_t)b * v_dim + d - 2 * q_dim;
+    }
+    if (d >= qkv_dim) return;
+
+    float y = 0.f;
+    for (int p = 0; p < conv_kernel - 1; p++)
+        y += q36_to_f(conv_state[(size_t)p * qkv_dim + d]) *
+             q36_to_f(conv_w[(size_t)d * conv_kernel + p]);
+    y += q36_to_f(qkv_row[d]) * q36_to_f(conv_w[(size_t)d * conv_kernel + (conv_kernel - 1)]);
+
+    for (int p = 0; p < conv_kernel - 2; p++)
+        conv_state[(size_t)p * qkv_dim + d] = conv_state[(size_t)(p + 1) * qkv_dim + d];
+    if (conv_kernel > 1)
+        conv_state[(size_t)(conv_kernel - 2) * qkv_dim + d] = qkv_row[d];
+
+    const float oy = q36_silu(y);
+
+    if (do_norm) {
+        const float ss = q36_wsum(oy * oy);
+        __shared__ float sw[32];
+        if ((t & 31) == 0) sw[t >> 5] = ss;
+        __syncthreads();
+        if (t < 32) {
+            float vv = (t < (head_dim + 31) / 32) ? sw[t] : 0.f;
+            vv = q36_wsum(vv);
+            if (t == 0) sw[0] = rsqrtf(vv + eps);
+        }
+        __syncthreads();
+        out[0] = __float2bfloat16(oy * sw[0]);
+    } else {
+        out[0] = __float2bfloat16(oy);
+    }
+}
+
+void launch_qwen36_conv_split_l2norm_fused_batched(
+    const void* qkv_bf16, const void* conv_w_bf16,
+    void* const* conv_states_bf16, size_t conv_off, void* q_bf16, void* k_bf16,
+    void* v_bf16, int batch, int q_heads, int v_heads, int head_dim,
+    int conv_kernel, float eps, cudaStream_t stream)
+{
+    if (batch < 1) return;
+    conv_split_l2norm_fused_batched_kernel<<<dim3(2 * q_heads + v_heads, batch), head_dim, 0, stream>>>(
+        reinterpret_cast<const __nv_bfloat16*>(qkv_bf16),
+        reinterpret_cast<const __nv_bfloat16*>(conv_w_bf16),
+        reinterpret_cast<__nv_bfloat16* const*>(conv_states_bf16), conv_off,
+        reinterpret_cast<__nv_bfloat16*>(q_bf16),
+        reinterpret_cast<__nv_bfloat16*>(k_bf16),
+        reinterpret_cast<__nv_bfloat16*>(v_bf16),
+        q_heads, v_heads, head_dim, conv_kernel, eps);
 }
 
 void launch_qwen36_conv_split_l2norm_fused(

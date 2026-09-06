@@ -192,6 +192,11 @@ void launch_capture_rows(const void* src, void* dst, int rows, int hidden, int d
                          cudaStream_t stream);
 
 void launch_broadcast_rows_i32(const int* src, int* dst, int n, int rows, cudaStream_t stream);
+// Packed-decode twin: dst[r][0..n) = row_tables[r][0..n). `row_tables` is a DEVICE array of
+// per-row block-table pointers, so the gather runs inside a graph capture and the captured graph
+// stays valid across row-set changes -- it bakes the array's address, never a session's table.
+void launch_gather_rows_i32(const int* const* row_tables, int* dst, int n, int rows,
+                            cudaStream_t stream);
 
 // DSpark's Markov head: a low-rank learned bigram bias, added in place to one row of draft
 // logits. bias[v] = sum_r(w1[prev_token][r] * w2[v][r]) -- w1 is a [verifier_vocab, rank]

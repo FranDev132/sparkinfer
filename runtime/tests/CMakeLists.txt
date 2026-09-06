@@ -43,6 +43,11 @@ target_link_libraries(lmcache_bridge_client_cpu_test PRIVATE Threads::Threads)
 set_target_properties(lmcache_bridge_client_cpu_test PROPERTIES CXX_STANDARD 17)
 add_test(NAME lmcache_bridge_client_cpu_test COMMAND lmcache_bridge_client_cpu_test)
 
+# Packed-decode GDN kernels vs the unbatched path, bit for bit.
+add_executable(gdn_batched_gpu_test gdn_batched_gpu_test.cpp)
+target_link_libraries(gdn_batched_gpu_test PRIVATE sparkinfer_runtime CUDA::cudart)
+add_test(NAME gdn_batched_gpu_test COMMAND gdn_batched_gpu_test)
+
 add_executable(batch_engine_gpu_test batch_engine_gpu_test.cpp)
 target_link_libraries(batch_engine_gpu_test PRIVATE sparkinfer_runtime CUDA::cudart)
 add_test(NAME batch_engine_gpu_test COMMAND batch_engine_gpu_test)

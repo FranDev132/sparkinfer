@@ -238,6 +238,19 @@ struct Qwen35Model::Impl {
     bool dflash_graph_ready = false;
     int dflash_graph_attn_mode = -1;
     bool dflash_graph_sparse = false;
+    // Reusable device pointer arrays for packed decode (see Qwen35Model::decode_packed). Their
+    // ADDRESSES are baked into the packed graph; their CONTENTS are rewritten every step, which
+    // is what lets one graph per row count serve any set of sessions.
+    void* packed_dev_states = nullptr;
+    void* packed_dev_convs = nullptr;
+    void* packed_dev_tables = nullptr;
+    // Pinned staging + the seq_ids the device arrays currently hold, so an unchanged row set
+    // skips the upload entirely.
+    void* packed_host_states = nullptr;
+    void* packed_host_convs = nullptr;
+    void* packed_host_tables = nullptr;
+    void* packed_host_seqs = nullptr;
+    int   packed_rows_valid = 0;
 
     // Per-session parking lot for the AR decode graph.
     //
@@ -794,6 +807,13 @@ Qwen35Model::~Qwen35Model() {
         if (kv.second.lin_state) cudaFree(kv.second.lin_state);
         if (kv.second.lin_conv_state) cudaFree(kv.second.lin_conv_state);
     }
+    if (p_->packed_host_states) cudaFreeHost(p_->packed_host_states);
+    if (p_->packed_host_convs) cudaFreeHost(p_->packed_host_convs);
+    if (p_->packed_host_tables) cudaFreeHost(p_->packed_host_tables);
+    if (p_->packed_host_seqs) cudaFreeHost(p_->packed_host_seqs);
+    if (p_->packed_dev_states) cudaFree(p_->packed_dev_states);
+    if (p_->packed_dev_convs) cudaFree(p_->packed_dev_convs);
+    if (p_->packed_dev_tables) cudaFree(p_->packed_dev_tables);
     for (auto& kv : p_->parked_graphs) {
         if (kv.second.exec) cudaGraphExecDestroy(kv.second.exec);
         if (kv.second.graph) cudaGraphDestroy(kv.second.graph);
@@ -3158,6 +3178,10 @@ void Qwen35Model::close_session(uint64_t seq_id, const std::vector<int>* store_t
             s.parked_graphs.erase(parked);
         }
     }
+    // The packed row-set cache is keyed on seq_ids; a closing session frees the very buffers those
+    // device arrays point at, and a later session can be handed the same id. Force the next packed
+    // step to re-upload rather than trust a match.
+    s.packed_rows_valid = 0;
     // Store to the external cache tier before freeing the blocks it reads -- this is the
     // "session close" eviction point (docs/lmcache_bridge_protocol.md's STORE trigger list).
     // store_tokens is null for most callers (this model class doesn't itself track a session's
@@ -3191,6 +3215,88 @@ void Qwen35Model::close_session(uint64_t seq_id, const std::vector<int>* store_t
         s.sessions.erase(it);
     }
     if (s.active_seq_id == seq_id) activate_session(0);
+}
+
+int Qwen35Model::max_packed_rows() { return kQwen35MaxPackedRows; }
+
+bool Qwen35Model::decode_packed(const int* tokens, const int* positions,
+                                const uint64_t* seq_ids, int n, int* out_sampled) {
+    Impl& s = *p_;
+    if (!tokens || !positions || !seq_ids || !out_sampled) return false;
+    if (n < 1 || n > kQwen35MaxPackedRows) return false;
+    if (!s.cfg.hybrid || !s.gguf) return false;
+    std::lock_guard<std::recursive_mutex> device_lock(s.device_mu);
+
+    // Resolve each row's per-session buffers. A row whose session is missing (or never got its
+    // hybrid state) cannot be packed -- decline the whole batch rather than silently decode it
+    // against another request's state.
+    // PINNED staging, allocated once. The upload below must be async -- a synchronous copy, or an
+    // async one from a stack array that has to be waited on, forces the CPU to drain the GPU every
+    // step, and the engine's per-row callbacks then run with the device idle. Measured at
+    // concurrency 8 that stall was ~4.5 ms of a ~24 ms step, against ~19.5 ms of actual GPU work.
+    if (!s.packed_dev_states) {
+        const size_t np = kQwen35MaxPackedRows;
+        if (cudaMalloc(&s.packed_dev_states, np * sizeof(float*)) != cudaSuccess) return false;
+        if (cudaMalloc(&s.packed_dev_convs, np * sizeof(void*)) != cudaSuccess) return false;
+        if (cudaMalloc(&s.packed_dev_tables, np * sizeof(const int*)) != cudaSuccess) return false;
+        if (cudaHostAlloc(&s.packed_host_states, np * sizeof(float*), cudaHostAllocDefault)
+            != cudaSuccess) return false;
+        if (cudaHostAlloc(&s.packed_host_convs, np * sizeof(void*), cudaHostAllocDefault)
+            != cudaSuccess) return false;
+        if (cudaHostAlloc(&s.packed_host_tables, np * sizeof(const int*), cudaHostAllocDefault)
+            != cudaSuccess) return false;
+        if (cudaHostAlloc(&s.packed_host_seqs, np * sizeof(uint64_t), cudaHostAllocDefault)
+            != cudaSuccess) return false;
+    }
+    float** h_states = static_cast<float**>(s.packed_host_states);
+    void**  h_convs  = static_cast<void**>(s.packed_host_convs);
+    const int** h_tables = static_cast<const int**>(s.packed_host_tables);
+    uint64_t* h_seqs = static_cast<uint64_t*>(s.packed_host_seqs);
+
+    // Skip the upload entirely when the row set has not moved. Each session's buffers and its
+    // block-table slab row are fixed for its lifetime, so the same seq_ids imply the same three
+    // arrays -- and a steady stream of concurrent requests decodes the SAME set for many steps in
+    // a row.
+    bool same = (s.packed_rows_valid == n);
+    for (int i = 0; i < n && same; i++) same = h_seqs[i] == seq_ids[i];
+
+    for (int i = 0; i < n; i++) {
+        auto it = s.sessions.find(seq_ids[i]);
+        if (it == s.sessions.end() || !it->second.lin_state || !it->second.lin_conv_state)
+            return false;
+        const int* tbl = s.kv->block_table(seq_ids[i]);
+        if (!tbl) return false;
+        if (!same) {
+            h_states[i] = it->second.lin_state;
+            h_convs[i]  = it->second.lin_conv_state;
+            h_tables[i] = tbl;
+            h_seqs[i]   = seq_ids[i];
+        }
+    }
+
+    if (!same) {
+        cu(cudaMemcpyAsync(s.packed_dev_states, h_states, (size_t)n * sizeof(float*),
+                           cudaMemcpyHostToDevice, s.stream), "packed states");
+        cu(cudaMemcpyAsync(s.packed_dev_convs, h_convs, (size_t)n * sizeof(void*),
+                           cudaMemcpyHostToDevice, s.stream), "packed convs");
+        cu(cudaMemcpyAsync(s.packed_dev_tables, h_tables, (size_t)n * sizeof(const int*),
+                           cudaMemcpyHostToDevice, s.stream), "packed tables");
+        s.packed_rows_valid = n;
+    }
+
+    Qwen35PrefillCtx ctx{ s.cfg, s.w, s.kv, s.stream, s.stream_k, s.stream_v, seq_ids[0],
+                          h_states[0], h_convs[0], s.logits, s.d_out_id, s.h_out_id, s.gguf,
+                          s.emb_norm_ones,
+                          s.qdim, s.kvdim, s.linear_qdim, s.linear_vdim, s.linear_qkvdim,
+                          s.moe_rs_gate, s.moe_rs_up, s.moe_rs_down, s.n_splits,
+                          nullptr, 0, nullptr, 0 };
+    ctx.packed_pos       = positions;
+    ctx.packed_rows      = reinterpret_cast<const int* const*>(s.packed_dev_tables);
+    ctx.packed_lin_state = reinterpret_cast<float* const*>(s.packed_dev_states);
+    ctx.packed_lin_conv  = reinterpret_cast<void* const*>(s.packed_dev_convs);
+    const int consumed = dflash_verify_short_run(ctx, tokens, n, positions[0],
+                                                 nullptr, 0, nullptr, out_sampled);
+    return consumed == n;
 }
 
 void Qwen35Model::activate_session(uint64_t seq_id) {

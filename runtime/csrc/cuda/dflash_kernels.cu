@@ -2176,6 +2176,32 @@ void launch_capture_rows(const void* src, void* dst, int rows, int hidden, int d
         (const bf16*)src, (bf16*)dst, rows, hidden, dst_row_stride);
 }
 
+// Per-row block-table GATHER for packed decode: row b's table is the slab row for ITS OWN
+// session, so dst[b][*] = table_base[slots[b]][*]. The broadcast twin below is the speculative
+// case, where all rows belong to one sequence.
+//
+// slots lives in DEVICE memory and the gather runs INSIDE the graph capture, which is what keeps
+// one packed-decode graph usable for any set of sessions: the capture bakes the address of
+// `slots` and of the destination, never a particular session's table, so a replay after the row
+// set rotates reads the new mapping instead of the captured one.
+__global__ void k_gather_rows_i32(const int* const* __restrict__ row_tables,
+                                  int* __restrict__ dst, int n, int rows) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int total = n * rows;
+    if (idx >= total) return;
+    const int r = idx / n, i = idx - r * n;
+    dst[idx] = row_tables[r][i];
+}
+
+void launch_gather_rows_i32(const int* const* row_tables, int* dst, int n, int rows,
+                            cudaStream_t stream) {
+    const int total = n * rows;
+    if (total <= 0) return;
+    const int threads = 256;
+    k_gather_rows_i32<<<(total + threads - 1) / threads, threads, 0, stream>>>(
+        row_tables, dst, n, rows);
+}
+
 void launch_broadcast_rows_i32(const int* src, int* dst, int n, int rows, cudaStream_t stream) {
     const int total = n * rows;
     if (total <= 0) return;

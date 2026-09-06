@@ -65,6 +65,26 @@ struct Qwen35PrefillCtx {
     // Indexed by the row within THIS PASS, so a windowed prefill must hand over the slice for its
     // own window rather than the whole prompt -- the same relationship `tok` already has to pos0.
     const int*           mrope_pos  = nullptr;
+
+    // PACKED CONTINUOUS-BATCH DECODE. Non-null `packed_rows` turns dflash_verify_short_run's N
+    // rows from "N consecutive positions of ONE sequence" into "N INDEPENDENT sequences, one
+    // decode token each" -- which is the same forward, since every stage below the GDN block
+    // already works per row: the projections and FFN take R rows through a single weight read, the
+    // paged attention takes num_seqs with a per-row block table, and the KV-append kernels are
+    // already instantiated for a per-row table (SINGLE_SEQUENCE=false).
+    //
+    // Every one of these is a DEVICE array of N entries, refreshed by the caller before each step
+    // and never baked into the capture, so ONE packed graph per row count serves any set of
+    // sessions. That is the whole reason they are pointer arrays rather than a base plus stride:
+    // each session's lin_state / lin_conv_state / block table is its own allocation.
+    //   packed_rows        [N] block-table pointers, one per row's sequence
+    //   packed_lin_state   [N] per-session GDN recurrent-state bases (layer selected by offset)
+    //   packed_lin_conv    [N] per-session GDN conv-window bases
+    //   packed_pos         [N] HOST array of each row's absolute position in its own sequence
+    const int*           packed_pos       = nullptr;
+    const int* const*    packed_rows      = nullptr;
+    float* const*        packed_lin_state = nullptr;
+    void* const*         packed_lin_conv  = nullptr;
 };
 
 // Fill the paged KV cache + Gated-DeltaNet state for positions 0..n-1 in one batched pass.

@@ -9,6 +9,10 @@
 
 namespace sparkinfer {
 
+// Largest packed continuous-batch decode row count. Mirrors the verify graph tiers in
+// qwen35_prefill.cpp -- one captured graph per row count, so this bounds how many are kept.
+inline constexpr int kQwen35MaxPackedRows = 8;
+
 class ThermalGovernor;   // optional decode-time thermal pacing (thermal_governor.h)
 class BridgeClient;      // optional external KV cache tier (lmcache_bridge_client.h)
 
@@ -475,6 +479,25 @@ public:
     // have the original prompt at this call site and pass nullptr, which is a pure no-op.
     void close_session(uint64_t seq_id, const std::vector<int>* store_tokens = nullptr);
     void activate_session(uint64_t seq_id);
+
+    // PACKED CONTINUOUS-BATCH DECODE: advance `n` INDEPENDENT sequences by one token each in ONE
+    // forward, instead of one full forward per sequence.
+    //
+    // This is what makes aggregate throughput scale with concurrency. Decode is bandwidth-bound on
+    // weight reads, so N sequential forwards read every weight N times; packing the rows reads them
+    // once and pays only the per-row cost, which for the dominant GEMVs is a few percent because
+    // they already take R rows through a single weight read.
+    //
+    // tokens/positions/seq_ids are HOST arrays of n entries; out_sampled receives n token ids
+    // (greedy argmax, matching what forward_token returns at temperature 0). Returns false --
+    // having changed nothing -- when the shape is unsupported, so the caller can fall back to
+    // stepping the jobs one at a time.
+    //
+    // Every sequence must have an open session and live KV. n is capped by the packed graph tiers.
+    bool decode_packed(const int* tokens, const int* positions, const uint64_t* seq_ids, int n,
+                       int* out_sampled);
+    // Largest n decode_packed() accepts. Matches the packed graph tiers.
+    static int max_packed_rows();
     uint64_t active_session() const;
 
     // Zeros seq_id's running presence/frequency-penalty count buffer. MUST be called once per

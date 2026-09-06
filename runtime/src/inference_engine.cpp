@@ -302,14 +302,18 @@ void ContinuousBatchEngine::worker_loop() {
         // one prefill chunk if scheduled. Re-enter the scheduler after the step.
         bool any_finished = false;
         const bool mix_decode = !decode_ids.empty();
-        for (uint64_t id : decode_ids) {
-            Job* job = nullptr;
-            {
-                std::lock_guard<std::mutex> lock(mu_);
-                auto it = jobs_.find(id);
-                if (it != jobs_.end() && !it->second->done) job = it->second.get();
+        // One packed forward for the whole decode batch when every row is eligible; otherwise the
+        // original one-forward-per-sequence loop, unchanged.
+        if (!step_jobs_packed(decode_ids, any_finished)) {
+            for (uint64_t id : decode_ids) {
+                Job* job = nullptr;
+                {
+                    std::lock_guard<std::mutex> lock(mu_);
+                    auto it = jobs_.find(id);
+                    if (it != jobs_.end() && !it->second->done) job = it->second.get();
+                }
+                if (job) any_finished = step_job(*job, /*chunked=*/false) || any_finished;
             }
-            if (job) any_finished = step_job(*job, /*chunked=*/false) || any_finished;
         }
         if (!prefill_ids.empty()) {
             Job* job = nullptr;
@@ -323,6 +327,156 @@ void ContinuousBatchEngine::worker_loop() {
         }
         if (any_finished) cv_.notify_all();
     }
+}
+
+// Was a lambda inside step_job(); hoisted so the packed decode path retires a row through the
+// SAME code rather than a second copy that could drift from it.
+void ContinuousBatchEngine::finish_job_impl(Job& j) {
+    j.done = true;
+    if (j.seq_id != 0) {
+        // Offer this session's KV to the external cache tier (docs/lmcache_bridge_protocol.md)
+        // only once the full prompt has actually been ingested -- j.phase only advances past
+        // PREFILL once prefill_pos reaches the prompt's end (see step_job). A job
+        // cancelled/timed-out mid-prefill has KV for only part of its prompt range (possibly
+        // garbage past prefill_pos), so store_tokens must stay null in that case; passing the
+        // full prompt would tell close_session a longer range is valid than actually is.
+        model_->close_session(j.seq_id, j.phase != SeqPhase::PREFILL ? &j.req.prompt : nullptr);
+    } else {
+        // Session 0 is the shared prefix session. Freeing it wholesale is what made the
+        // prefix cache cache nothing: prefix_cached_len() then returned 0 and the next
+        // matching request re-prefilled the entire prefix. Keep the prefix's own blocks and
+        // drop only the suffix + generated tail, so the next request reuses them. The
+        // recurrent state is NOT kept -- decoding mutated it -- and is replayed from
+        // cache_prefix()'s snapshot by restore_prefix_state() on the next reuse.
+        const int keep = j.req.use_prefix_session ? model_->prefix_block_count() : 0;
+        if (keep > 0 && kv_->truncate_blocks(j.seq_id, keep)) {
+            // prefix stays installed and active; nothing else to do
+        } else {
+            kv_->free(j.seq_id);
+            if (j.req.use_prefix_session) model_->release_prefix_session();
+        }
+    }
+    j.seq_id = 0;
+}
+
+// Packed decode: one forward for the whole decode batch.
+//
+// worker_loop() below used to run `for (id : decode_ids) step_job(...)`, i.e. a full 64-layer
+// forward PER SEQUENCE. Decode is bandwidth-bound on weight reads, so N concurrent requests read
+// every weight N times and aggregate throughput does not scale with concurrency at all. The
+// scheduler already hands us the batch; this executes it as one.
+//
+// Declines (returning false having changed nothing) whenever a row would not decode identically
+// to what step_job would have produced: anything still prefilling, teacher-forced scoring,
+// per-token logprobs, or any sampler setting other than plain greedy -- decode_packed() returns
+// the argmax, which is exactly forward_token()'s result at temperature 0 with no truncation or
+// penalties, and nothing else. A declined batch just falls back to the sequential loop.
+bool ContinuousBatchEngine::step_jobs_packed(const std::vector<uint64_t>& ids, bool& any_finished) {
+    static const bool enabled = [] {
+        const char* e = getenv("SPARKINFER_PACKED_DECODE");
+        return !(e && e[0] == '0');
+    }();
+    if (!enabled || !model_) return false;
+    // A batch WIDER than the packed graph tiers is split into chunks of `cap`, not declined.
+    // Declining it fell all the way back to one forward per sequence, so crossing the cap cost
+    // more than never packing at all: measured on RTX 5090 / Qwen3.8-27B-NVFP4, aggregate went
+    // 334.9 tok/s at concurrency 8 to 79.0 at 12 -- a 4.2x collapse one request past the cap.
+    const int cap = Qwen35Model::max_packed_rows();
+    if ((int)ids.size() < 2) return false;
+    const Qwen35Config& cfg = model_->config();
+
+    std::vector<Job*> jobs;
+    jobs.reserve(ids.size());
+    {
+        std::lock_guard<std::mutex> lock(mu_);
+        for (uint64_t id : ids) {
+            auto it = jobs_.find(id);
+            if (it == jobs_.end() || it->second->done) return false;
+            jobs.push_back(it->second.get());
+        }
+    }
+    for (Job* j : jobs) {
+        if (j->phase != SeqPhase::DECODE) return false;
+        if (j->next_token < 0 || j->next_token >= cfg.vocab) return false;
+        if (!j->req.forced_tokens.empty()) return false;
+        if (j->req.logprobs || j->on_token_logprob) return false;
+        if (j->req.temperature != 0.f) return false;
+        if (j->req.top_k > 0 || j->req.top_p < 1.0f) return false;
+        if (j->req.presence_penalty != 0.f || j->req.frequency_penalty != 0.f) return false;
+    }
+
+    // Emit each row's pending token and run the same termination checks step_job() does. A job
+    // that finishes here simply drops out of the packed forward below.
+    std::vector<Job*> live;
+    live.reserve(jobs.size());
+    for (Job* j : jobs) {
+        const auto t_emit = std::chrono::steady_clock::now();
+        if (!j->saw_first_tok) {
+            j->t_first = t_emit;
+            j->saw_first_tok = true;
+            j->ttft_ms = std::chrono::duration<double, std::milli>(j->t_first - j->t_submit).count();
+        }
+        j->output.push_back(j->next_token);
+        j->decode_emitted++;
+        if (j->on_token && !j->on_token(j->next_token)) {
+            j->cancelled = true;
+            j->generation_ms = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - j->t_submit).count();
+            finish_job_impl(*j);
+            any_finished = true;
+            continue;
+        }
+        const bool hit_eos = j->next_token == cfg.eos_id ||
+                             (cfg.eos_id2 >= 0 && j->next_token == cfg.eos_id2);
+        const bool hit_limit = j->decode_emitted >= j->req.max_new_tokens;
+        if (hit_eos || hit_limit) {
+            j->reached_token_limit = hit_limit && !hit_eos;
+            const auto t_end = std::chrono::steady_clock::now();
+            j->generation_ms = std::chrono::duration<double, std::milli>(t_end - j->t_submit).count();
+            if (j->saw_first_tok && j->generation_ms > j->ttft_ms && j->decode_emitted > 0) {
+                const double decode_ms = std::max(j->generation_ms - j->ttft_ms, 1.0);
+                j->decode_tps = (double)j->decode_emitted * 1000.0 / decode_ms;
+            }
+            finish_job_impl(*j);
+            any_finished = true;
+            continue;
+        }
+        live.push_back(j);
+    }
+    if (live.empty()) return true;
+
+    // Advance the survivors in chunks of `cap`. A chunk of one (the tail of an odd batch, or all
+    // but one row having finished above) is not worth a packed forward, and decode_packed declines
+    // a batch it cannot serve; either way those rows still have to advance, so they fall through
+    // to the ordinary per-row forward. Tokens already emitted stay emitted -- this is the same
+    // work by a different route, not a retry.
+    std::vector<int> toks, pos, out;
+    std::vector<uint64_t> seqs;
+    for (size_t off = 0; off < live.size(); off += (size_t)cap) {
+        const size_t m = std::min((size_t)cap, live.size() - off);
+        toks.clear(); pos.clear(); seqs.clear(); out.assign(m, -1);
+        for (size_t i = 0; i < m; i++) {
+            Job* j = live[off + i];
+            toks.push_back(j->next_token);
+            pos.push_back((int)j->req.prompt.size() + j->decode_emitted - 1);
+            seqs.push_back(j->seq_id);
+        }
+        bool ok = false;
+        if (m >= 2)
+            ok = model_->decode_packed(toks.data(), pos.data(), seqs.data(), (int)m, out.data());
+        if (!ok) {
+            for (size_t i = 0; i < m; i++) {
+                Job* j = live[off + i];
+                model_->activate_session(j->seq_id);
+                out[i] = model_->forward_token(j->next_token, pos[i], true, j->req.temperature,
+                                               j->req.seed, (uint64_t)j->decode_emitted,
+                                               j->req.top_k, j->req.top_p,
+                                               j->req.presence_penalty, j->req.frequency_penalty);
+            }
+        }
+        for (size_t i = 0; i < m; i++) live[off + i]->next_token = out[i];
+    }
+    return true;
 }
 
 bool ContinuousBatchEngine::step_job(Job& job, bool chunked) {
@@ -347,33 +501,7 @@ bool ContinuousBatchEngine::step_job(Job& job, bool chunked) {
     // paths quietly drifts out of sync with the others. A lambda (not a free function) because
     // Job is private to ContinuousBatchEngine; only code with this member function's access can
     // name it.
-    auto finish_job = [this](Job& j) {
-        j.done = true;
-        if (j.seq_id != 0) {
-            // Offer this session's KV to the external cache tier (docs/lmcache_bridge_protocol.md)
-            // only once the full prompt has actually been ingested -- j.phase only advances past
-            // PREFILL once prefill_pos reaches the prompt's end (see step_job). A job
-            // cancelled/timed-out mid-prefill has KV for only part of its prompt range (possibly
-            // garbage past prefill_pos), so store_tokens must stay null in that case; passing the
-            // full prompt would tell close_session a longer range is valid than actually is.
-            model_->close_session(j.seq_id, j.phase != SeqPhase::PREFILL ? &j.req.prompt : nullptr);
-        } else {
-            // Session 0 is the shared prefix session. Freeing it wholesale is what made the
-            // prefix cache cache nothing: prefix_cached_len() then returned 0 and the next
-            // matching request re-prefilled the entire prefix. Keep the prefix's own blocks and
-            // drop only the suffix + generated tail, so the next request reuses them. The
-            // recurrent state is NOT kept -- decoding mutated it -- and is replayed from
-            // cache_prefix()'s snapshot by restore_prefix_state() on the next reuse.
-            const int keep = j.req.use_prefix_session ? model_->prefix_block_count() : 0;
-            if (keep > 0 && kv_->truncate_blocks(j.seq_id, keep)) {
-                // prefix stays installed and active; nothing else to do
-            } else {
-                kv_->free(j.seq_id);
-                if (j.req.use_prefix_session) model_->release_prefix_session();
-            }
-        }
-        j.seq_id = 0;
-    };
+    auto finish_job = [this](Job& j) { finish_job_impl(j); };
 
     const double timeout_s = request_timeout_s_config();
     if (timeout_s > 0.0) {

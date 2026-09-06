@@ -325,6 +325,27 @@ void launch_qwen36_conv_split_l2norm_fused(const void* qkv_bf16, const void* con
 // (ratio 3) -- confirmed empirically against a real reference implementation (llama.cpp), since
 // the two checkpoints' own HF-side v-head layout conventions differ despite the shared
 // architecture family. This is a property of the loaded checkpoint, not a global default.
+// Batched decode step: B INDEPENDENT sequences advancing one token each, for packed
+// continuous-batch decode. Distinct from the chunked/compact scans, which walk N consecutive
+// positions of ONE sequence and are serial across rows. `states` is a DEVICE array of B state
+// pointers (each session owns its own allocation), which also keeps the call CUDA-graph safe:
+// the graph bakes the array's address and the packer rewrites its contents per replay.
+// Returns false (launching nothing) for shapes it is not instantiated for -- head_dim != 128.
+bool launch_qwen36_gdn_ar_batched(const void* q_bf16, const void* k_bf16, const void* v_bf16,
+                                  const void* alpha_bf16, const void* beta_bf16,
+                                  const void* dt_bf16, const void* a_bf16,
+                                  float* const* states, size_t state_off, void* out_bf16,
+                                  int batch, int q_heads, int v_heads, int head_dim,
+                                  bool qh_block, cudaStream_t stream = nullptr);
+
+// Batched twin of launch_qwen36_conv_split_l2norm_fused; `conv_states` is a device array of B
+// per-session conv-state pointers, same contract as above.
+void launch_qwen36_conv_split_l2norm_fused_batched(
+    const void* qkv_bf16, const void* conv_w_bf16,
+    void* const* conv_states_bf16, size_t conv_off, void* q_bf16, void* k_bf16,
+    void* v_bf16, int batch, int q_heads, int v_heads, int head_dim,
+    int conv_kernel, float eps, cudaStream_t stream = nullptr);
+
 void launch_qwen36_gdn_ar(const void* q_bf16, const void* k_bf16, const void* v_bf16,
                           const void* alpha_bf16, const void* beta_bf16,
                           const void* dt_bf16, const void* a_bf16,

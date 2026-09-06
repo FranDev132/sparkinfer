@@ -2705,7 +2705,21 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
                 c.head_dim, c.linear_head_dim, c.n_experts, c.top_k, (int)dense);
         return -1;
     }
+    // PACKED CONTINUOUS-BATCH DECODE (see Qwen35PrefillCtx::packed_rows). Same forward, but the
+    // N rows are N INDEPENDENT sequences taking one decode step each rather than N consecutive
+    // positions of one sequence. Only four things differ, all below: the block table is gathered
+    // per row instead of broadcast, the GDN block runs the batched per-row AR step instead of the
+    // compact scan, the KV-append uses the per-row-table kernel instead of the single-sequence
+    // one, and there is no accepted-prefix commit because every row is already a real step.
+    const bool packed = s.packed_rows != nullptr;
     const int H = c.hidden, N = n, qdim = s.qdim, kvdim = s.kvdim;
+    // Host-side dispatch hint for the flash-decode split (it selects the tensor-core arm on
+    // seqlen > 512 and mma_chunk >= 32). Packed rows have independent lengths, so take the
+    // longest: the per-row lengths the kernel actually reads still come from `seq`.
+    int packed_seq_hint = 0;
+    if (packed)
+        for (int i = 0; i < N; i++)
+            if (s.packed_pos[i] + 1 > packed_seq_hint) packed_seq_hint = s.packed_pos[i] + 1;
     // Every arena buffer below is sized for the WIDEST verify tier, not for this call's N.
     // The per-tier graphs each bake their own device pointers, and Arena::alloc frees and
     // reallocates a slot the moment a later call asks it for more bytes -- which would leave an
@@ -2940,8 +2954,9 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
     }
     for (int i = 0; i < N; ++i) {
         ph_ids[i] = token_ids[i];
-        ph_pos[i] = start_pos + i;
-        ph_seq[i] = start_pos + i + 1;
+        // Packed rows each sit at their OWN sequence's next position; verify rows are consecutive.
+        ph_pos[i] = packed ? s.packed_pos[i] : start_pos + i;
+        ph_seq[i] = ph_pos[i] + 1;
     }
 
     const bf16* q81_src = nullptr;
@@ -3141,7 +3156,7 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
     // a few KB) so the 10 full-attention layers each run ONE split + ONE combine instead of one per
     // row. That removes 2*(N-1) graph nodes per attention layer, and the graph is ~1000 nodes deep
     // against only ~5.6 ms of kernel time, so node count is itself a real cost here.
-    int* btab_rows = (N > 1) ? a.alloc<int>((size_t)NA * mbs) : nullptr;
+    int* btab_rows = (N > 1 || packed) ? a.alloc<int>((size_t)NA * mbs) : nullptr;
     if (!a.ok) { fprintf(stderr, "[dflash-verify] block-table scratch allocation failed\n"); return -1; }
     bool supported = true;
     int  vfail_L = -1;   // layer whose stage declined, for the bailout diagnostic below
@@ -3162,9 +3177,13 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
         recording = false;
     };
     bool head_ok = false;
-    if (graph_model_key != s.w.lm_head || graph_state_key != s.lin_state ||
-        graph_conv_key != s.lin_conv_state || graph_capture_key != capture_dst ||
-        graph_btable_key != btable || graph_seq_key != s.seq_id || graph_ns_key != ns) {
+    const void* state_key   = packed ? (const void*)s.packed_lin_state : (const void*)s.lin_state;
+    const void* conv_key    = packed ? (const void*)s.packed_lin_conv  : (const void*)s.lin_conv_state;
+    const void* btable_key  = packed ? (const void*)s.packed_rows      : (const void*)btable;
+    const uint64_t seq_key  = packed ? UINT64_MAX - 1 : s.seq_id;
+    if (graph_model_key != s.w.lm_head || graph_state_key != state_key ||
+        graph_conv_key != conv_key || graph_capture_key != capture_dst ||
+        graph_btable_key != btable_key || graph_seq_key != seq_key || graph_ns_key != ns) {
         for (int t = 1; t <= kVerifyMaxRows; t++) {
             if (verify_exec[t]) cudaGraphExecDestroy(verify_exec[t]);
             if (verify_graph[t]) cudaGraphDestroy(verify_graph[t]);
@@ -3173,11 +3192,11 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
         }
         graph_warm = false;
         graph_model_key = s.w.lm_head;
-        graph_state_key = s.lin_state;
-        graph_conv_key = s.lin_conv_state;
+        graph_state_key = state_key;
+        graph_conv_key = conv_key;
         graph_capture_key = capture_dst;
-        graph_btable_key = btable;
-        graph_seq_key = s.seq_id;
+        graph_btable_key = btable_key;
+        graph_seq_key = seq_key;
         graph_ns_key = ns;
     }
     if (graph_ready_t[N] && capture_only) return 0;   // this tier is already built
@@ -3206,7 +3225,13 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
         }
         goto verify_forward_done;
     }
-    recording = graph_warm || capture_only;
+    // Packed decode always records. `recording` gates the EndCapture/instantiate/launch trio at
+    // the bottom, while BeginCapture below is unconditional on this path (we only get here when
+    // this tier's graph is NOT ready), so a false `recording` begins a capture that is never
+    // ended and strands the stream -- every later call then fails with "operation not permitted
+    // when stream is capturing". DSpark never sees that because dflash_generate warms each tier
+    // with a capture_only call during session setup; packed decode has no such warmup.
+    recording = graph_warm || capture_only || packed;
     if (recording)
     // Dense FFN seeds: expert 0, weight 1.0 -- the same constants AR uses. Written ONCE, here,
     // SYNCHRONOUSLY, and deliberately BEFORE the capture begins.
@@ -3234,8 +3259,12 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
     // Device-to-device inside the capture, so each replay re-reads the sequence's live table as it
     // grows instead of baking in the mapping from capture time. One kernel node rather than N
     // memcpy nodes -- same reason as the capture copies above.
-    if (btab_rows)
-        dflash_kernels::launch_broadcast_rows_i32(btable, btab_rows, mbs, N, st);
+    if (btab_rows) {
+        if (packed)
+            dflash_kernels::launch_gather_rows_i32(s.packed_rows, btab_rows, mbs, N, st);
+        else
+            dflash_kernels::launch_broadcast_rows_i32(btable, btab_rows, mbs, N, st);
+    }
     kernels::launch_embedding(ids, s.w.embed_tokens, x, N, H, st);
     kernels::launch_rmsnorm(x, s.w.layers[0].input_norm, xn, N, H, c.rms_eps, st);
     for (int L = 0; L < c.n_layers && supported; ++L) {
@@ -3312,15 +3341,37 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
                 if (!split_ok) pf_cu(cudaStreamWaitEvent(st, ev_join, 0), "verify gdn join wait");
             }
             if (!supported) break;
-            const bf16* conv_live = static_cast<const bf16*>(s.lin_conv_state) +
-                (size_t)L * (c.linear_conv_kernel - 1) * lqkv;
+            const size_t conv_off = (size_t)L * (c.linear_conv_kernel - 1) * lqkv;
+            const size_t state_off = (size_t)L * vh * c.linear_head_dim * c.linear_head_dim;
+            if (packed) {
+                // Rows are independent sequences, so this is the ordinary AR decode step done B
+                // ways -- each row against its OWN conv window and recurrent state, mutating them
+                // in place. That in-place update is why packed mode has no commit stage: the
+                // compact pair below deliberately does NOT touch the live state, because a
+                // speculative verify must be able to discard rejected rows.
+                kernels::launch_qwen36_conv_split_l2norm_fused_batched(
+                    rq, w.ssm_conv, s.packed_lin_conv, conv_off, gq, rk, rv,
+                    N, c.linear_q_heads, vh, c.linear_head_dim, c.linear_conv_kernel,
+                    c.rms_eps, st);
+                if (split_ok) pf_cu(cudaStreamWaitEvent(st, ev_join_ab, 0), "packed gdn ab wait");
+                if (!kernels::launch_qwen36_gdn_ar_batched(
+                        gq, rk, rv, ra, rb, w.ssm_dt, w.ssm_a,
+                        s.packed_lin_state, state_off, att,
+                        N, c.linear_q_heads, vh, c.linear_head_dim, c.gdn_qh_block, st)) {
+                    supported = false;
+                    vfail_L = L;
+                    break;
+                }
+            } else {
+            const bf16* conv_live = static_cast<const bf16*>(s.lin_conv_state) + conv_off;
             kernels::launch_dflash_gdn_conv_compact(rq, w.ssm_conv, conv_live, gq, rk, rv,
                 N, c.linear_q_heads, vh, c.linear_head_dim, c.linear_conv_kernel, c.rms_eps, st);
-            const float* state = s.lin_state + (size_t)L * vh * c.linear_head_dim * c.linear_head_dim;
+            const float* state = s.lin_state + state_off;
             // ra/rb are the scan's only side-branch inputs.
             if (split_ok) pf_cu(cudaStreamWaitEvent(st, ev_join_ab, 0), "verify gdn ab wait");
             kernels::launch_dflash_gdn_scan_compact(gq, rk, rv, ra, rb, w.ssm_dt, w.ssm_a,
                 state, att, N, c.linear_q_heads, vh, c.linear_head_dim, c.gdn_qh_block, st);
+            }
             // ...and lz is gated_norm's.
             if (split_ok) pf_cu(cudaStreamWaitEvent(st, ev_join, 0), "verify gdn z wait");
             // The out-projection is about to quantize lnrm to the NVFP4 activation form; this
@@ -3376,16 +3427,28 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
             char* vs = kv8 ? static_cast<char*>(s.kv->v_scale_pool()) +
                              s.kv->scale_layer_base_elems(L) * 2 : nullptr;
             if (kv8) {
-                kernels::launch_dflash_qknorm_rope_kv_partial_int8_gated(
-                    b8, qb, qg, kf, vf, w.q_norm, w.k_norm, kp, vp, ks, vs, btable, pos,
-                    N, c.n_q_heads, c.n_kv_heads, c.head_dim, c.rope_dim, c.rope_theta, c.rms_eps,
-                    bs, mbs, st);
+                if (packed)
+                    kernels::launch_qknorm_rope_kv_partial_int8_gated(
+                        b8, qb, qg, kf, vf, w.q_norm, w.k_norm, kp, vp, ks, vs, btab_rows, pos,
+                        N, c.n_q_heads, c.n_kv_heads, c.head_dim, c.rope_dim, c.rope_theta,
+                        c.rms_eps, bs, mbs, st);
+                else
+                    kernels::launch_dflash_qknorm_rope_kv_partial_int8_gated(
+                        b8, qb, qg, kf, vf, w.q_norm, w.k_norm, kp, vp, ks, vs, btable, pos,
+                        N, c.n_q_heads, c.n_kv_heads, c.head_dim, c.rope_dim, c.rope_theta,
+                        c.rms_eps, bs, mbs, st);
             } else {
                 kernels::launch_prefill_split_q_gate(b8, qb, qg, N, c.n_q_heads, c.head_dim, st);
-                kernels::launch_dflash_qknorm_rope_kv_partial(
-                    qb, kf, vf, w.q_norm, w.k_norm, kp, vp, btable, pos,
-                    N, c.n_q_heads, c.n_kv_heads, c.head_dim, c.rope_dim, c.rope_theta, c.rms_eps,
-                    bs, mbs, st);
+                if (packed)
+                    kernels::launch_qknorm_rope_kv_partial(
+                        qb, kf, vf, w.q_norm, w.k_norm, kp, vp, btab_rows, pos,
+                        N, c.n_q_heads, c.n_kv_heads, c.head_dim, c.rope_dim, c.rope_theta,
+                        c.rms_eps, bs, mbs, st);
+                else
+                    kernels::launch_dflash_qknorm_rope_kv_partial(
+                        qb, kf, vf, w.q_norm, w.k_norm, kp, vp, btable, pos,
+                        N, c.n_q_heads, c.n_kv_heads, c.head_dim, c.rope_dim, c.rope_theta,
+                        c.rms_eps, bs, mbs, st);
             }
             // Match the autoregressive decode path exactly. Its fused int8 attention gate is
             // enabled only for the 2048/4096-wide layouts; Qwen3.8 (H=5120) applies sigmoid(g)
@@ -3406,7 +3469,7 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
                 // computing what has to be the same number is precisely how the batched path
                 // drifts from AR at long context (#712). start_pos + N is the largest row
                 // length in this batch, matching what AR would report at the last row.
-                1.f / sqrtf((float)c.head_dim), st, nullptr, start_pos + N,
+                1.f / sqrtf((float)c.head_dim), st, nullptr, packed ? packed_seq_hint : start_pos + N,
                 ks, vs, kv8 ? 1 : 0, int8_gate_fused ? qg : nullptr);
             // att/qg rows are contiguous at stride qdim, and the gate is elementwise, so one
             // launch covers the whole block. N separate nodes cost N times the graph-node
@@ -3801,6 +3864,10 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
         verify_dbg_call++;
     }
 verify_forward_done:
+    // Packed decode consumes every row by construction -- each is a real decode step for its own
+    // sequence, and the batched GDN block already advanced that session's conv window and
+    // recurrent state in place. There is no accepted prefix to select and nothing to commit.
+    if (packed) return N;
     int keep = 1;
     while (keep < N && token_ids[keep] == out_argmax[keep - 1]) ++keep;
     if (getenv("SPARKINFER_DFLASH_VERIFY_DUMP_ROW")) {

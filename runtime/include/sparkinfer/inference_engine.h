@@ -223,6 +223,13 @@ private:
     Result wait_locked(uint64_t request_id);
     void worker_loop();
     bool step_job(Job& job, bool chunked = false);
+    // Advance a whole decode batch in ONE packed forward instead of one forward per sequence.
+    // Returns false having done NOTHING when the batch is not eligible, so the caller falls back
+    // to stepping the jobs individually. `any_finished` is set if any job completed.
+    bool step_jobs_packed(const std::vector<uint64_t>& ids, bool& any_finished);
+    // Retire a job: close/free its session and mark it done. Shared by step_job() and the packed
+    // path so "job is over" has exactly one implementation.
+    void finish_job_impl(Job& j);
 
     Qwen35Model* model_;
     KVCacheManager* kv_;
