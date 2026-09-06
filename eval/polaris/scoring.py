@@ -89,7 +89,12 @@ def score(result: dict) -> dict:
     # ---- No-regression guard ----
     # Every measured context must hold >= tolerance vs main branch baseline.
     present = [k for k in GUARD_CTX_KEYS if k in guard]
-    speed_ok = all(guard.get(k, True) for k in present)
+    # bool(present) matters: all([]) is True, so a guard record that measured NO context would
+    # otherwise read as a pass. bool(guard) below catches a wholly EMPTY guard dict but not a
+    # PARTIAL one carrying only top1/kl and no context keys -- which is exactly the shape a
+    # crashed or truncated guard run produces. Fail closed on incomplete evidence, the same way
+    # this function already fails closed on missing and on bad evidence.
+    speed_ok = bool(present) and all(guard.get(k, True) for k in present)
     g_top1 = float(guard.get("top1", 0))
     g_kl = float(guard.get("kl", 99))
     g_acc_ok = g_top1 >= TOP1_BAR and g_kl <= KL_BAR

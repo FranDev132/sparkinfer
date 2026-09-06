@@ -682,6 +682,12 @@ def _public_eval_label(res):
             for s in sides:
                 if s.get("pass") is False and s.get("label"):
                     return s["label"]
+            # A side that FAILED but carries no label of its own must not fall through to
+            # res["label"], which is the passing side's tier: a bidir run whose failing side lost
+            # its label would headline as (say) XL and be paid x4.0 in the SN74 registry instead of
+            # x0.0. Fail closed. The preference order above is unaffected -- a failing side with a
+            # real REJECT or a real `none` still headlines from that side.
+            return "REJECT"
     return res.get("label")
 
 
