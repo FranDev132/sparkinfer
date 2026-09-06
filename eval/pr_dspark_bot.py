@@ -990,6 +990,11 @@ DS_OUT=/tmp/dspark_run.txt
 # the scored throughput sample and aggregate only the absolute correctness verdict across runs.
 DSPARK_INFRA_FAILED=0
 DS_ALL_OK=1
+DS_DETERMINISTIC=1
+DS_HASH0=""
+# Opt-in in dspark_tau_check; the compact 8-token prefix it prints by default cannot distinguish
+# two runs that diverge later in the stream.
+export SPARKINFER_DSPARK_DUMP_TOKENS=1
 for rep in $(seq 1 {spec_reps}); do
   REP_OUT="/tmp/dspark_run_${{rep}}.txt"
   if ! SPARKINFER_DSPARK_SPEC_REPS=1 timeout 900 build/runtime/dspark_tau_check \
@@ -1001,8 +1006,28 @@ for rep in $(seq 1 {spec_reps}); do
   if [ "$rep" -eq 1 ]; then cp "$REP_OUT" "$DS_OUT"; fi
   REP_LL=$(sed -n 's/^METRIC LOSSLESS //p' "$REP_OUT" | tail -1)
   [ "${{REP_LL:-0}}" = "1" ] || DS_ALL_OK=0
+  # CROSS-RUN determinism, not just within-run losslessness. Each rep above asks whether DSpark
+  # matches AR *inside its own process*; if the shared prefill is nondeterministic both legs read
+  # the same corrupted state, agree with each other, and the gate passes -- three times over. That
+  # is exactly how #976 shipped: the fused GQA prefill wrote its P' plane with the wrong row
+  # stride above 2048 tokens, output was wrong AND varied run to run, and every losslessness rep
+  # still reported lossless=1.
+  #
+  # So hash each rep's AR token stream and require the hashes to AGREE ACROSS PROCESSES. Greedy
+  # decode is a function of its input; two clean starts on identical ids must emit identical
+  # tokens. Costs no extra GPU time -- these reps already run -- and covers 4k/16k/32k, all of
+  # which sit above the 2048 threshold where the padded-stride regime begins.
+  REP_HASH=$(sed -n 's/^DSPARK_AR_TOKENS //p' "$REP_OUT" | tail -1 | sha256sum | cut -c1-16)
+  echo "DSPARK_AR_HASH $rep ${{REP_HASH:-none}}"
+  if [ "$rep" -eq 1 ]; then
+    DS_HASH0="$REP_HASH"
+  elif [ -n "$DS_HASH0" ] && [ -n "$REP_HASH" ] && [ "$REP_HASH" != "$DS_HASH0" ]; then
+    echo "DSPARK_NONDETERMINISTIC rep=$rep hash=$REP_HASH != rep1=$DS_HASH0" >&2
+    DS_DETERMINISTIC=0
+  fi
   echo "DSPARK_FRESH_REP $rep lossless=${{REP_LL:-0}}"
 done
+echo "METRIC AR_DETERMINISTIC ${{DS_DETERMINISTIC:-1}}"  >> "$DS_OUT"
 echo "METRIC LOSSLESS $DS_ALL_OK" >> "$DS_OUT"
 echo "METRIC LOSSLESS_RUNS {spec_reps}" >> "$DS_OUT"
 grep -E '^(DSPARK|AR|draft:) ' "$DS_OUT" || true
@@ -1020,6 +1045,7 @@ echo "RESULT_AR_TPS $(_ds_metric AR_TPS)"
 echo "RESULT_MEAN_ACCEPT $(_ds_metric MEAN_ACCEPT)"
 echo "RESULT_LOSSLESS $(_ds_metric LOSSLESS)"
 echo "RESULT_LOSSLESS_RUNS $(_ds_metric LOSSLESS_RUNS)"
+echo "RESULT_AR_DETERMINISTIC $(_ds_metric AR_DETERMINISTIC)"
 PREFILL16_PP=$(_ds_metric DSPARK_PREFILL_PP)
 echo "RESULT_PREFILL16_PP ${{PREFILL16_PP:-0}}"
 
@@ -1452,6 +1478,11 @@ def _parse_remote(stdout: str) -> dict:
                 n, field = body.split("_", 1)
                 if n.isdigit():
                     out[f"cb{int(n)}_{field.lower()}"] = val
+            except (ValueError, IndexError):
+                pass
+        elif line.startswith("RESULT_AR_DETERMINISTIC "):
+            try:
+                out["ar_deterministic"] = int(float(line.split()[1]))
             except (ValueError, IndexError):
                 pass
         elif line.startswith("RESULT_DSPARK_TPS "):
@@ -2064,6 +2095,23 @@ def eval_qwen38_on_box(host, port, pr_ref: str, main: dict):
         label = "REJECT"
         passed = False
 
+    # Cross-run determinism. The losslessness gates below ask whether DSpark matches AR INSIDE one
+    # process; they cannot see a build whose shared prefill is nondeterministic, because both legs
+    # then read the same corrupted state and agree. #976 passed every losslessness rep while
+    # emitting a different answer on each run. Greedy decode is a function of its input, so two
+    # clean starts on identical token ids must produce identical output; anything else is a hard
+    # REJECT regardless of throughput.
+    #
+    # Absent (an older harness that does not emit the marker) is NOT treated as a failure -- that
+    # would REJECT every PR against a stale box -- but it is reported, so a silently missing gate
+    # does not read as a passing one.
+    ar_det = pr.get("ar_deterministic")
+    if ar_det == 0:
+        reason = ("cross-run determinism gate failed: two clean runs on identical token ids "
+                  "produced DIFFERENT AR output (see #976) | " + reason)
+        label = "REJECT"
+        passed = False
+
     lossless_ok = pr.get("lossless") is True and runs >= DSPARK_SPEC_REPS
     runs4 = pr.get("lossless4_runs", 0)
     lossless4_ok = pr.get("lossless4") is True and runs4 >= DSPARK_SPEC_REPS
@@ -2174,6 +2222,7 @@ def eval_qwen38_on_box(host, port, pr_ref: str, main: dict):
         # net loss against ordinary AR decode; this is the number the work is trying to move.
         "dspark_vs_ar": round(pr["dspark_tps"] / pr["ar_tps"], 3) if pr.get("ar_tps") else 0,
         "lossless": lossless_ok,
+        "ar_deterministic": pr.get("ar_deterministic"),
         "lossless_runs": runs,
         "lossless32": lossless32_ok,
         "lossless32_runs": runs32,
@@ -2368,7 +2417,16 @@ def format_comment(commit: str, res: dict) -> str:
     # No "main accuracy" row: this gate is differential, so main IS the reference -- there is no
     # separate absolute bar for it to miss.
     main_acc_note = ""
-    ls_row = _gate("losslessness gate", "lossless",
+    # Cross-run determinism, reported next to losslessness because it answers the question
+    # losslessness cannot: DSpark-matches-AR is checked inside ONE process, so a nondeterministic
+    # shared prefill makes both legs agree on the same wrong state (#976).
+    _det = res.get("ar_deterministic")
+    det_row = (f"| cross-run determinism | ✅ identical output across {DSPARK_SPEC_REPS} clean runs |\n"
+               if _det == 1 else
+               ("| cross-run determinism | ❌ **runs on identical token ids produced DIFFERENT "
+                "output** — see #976 |\n" if _det == 0 else
+                "| cross-run determinism | — not measured (harness predates this gate) |\n"))
+    ls_row = det_row + _gate("losslessness gate", "lossless",
                    "DSpark matches the AR reference token-for-token, verified across "
                    f"**{res.get('lossless_runs', 1)}** independent runs",
                    "DSpark diverged from the AR reference")

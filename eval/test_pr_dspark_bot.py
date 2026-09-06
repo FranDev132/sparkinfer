@@ -37,6 +37,29 @@ class Prefill256KEvalTests(unittest.TestCase):
         self.assertIn("| **PR concurrent decode @c2** | **—** |", body)
         self.assertNotIn("concurrent decode @c2 vs main | +0.0%", body)
 
+    def test_cross_run_determinism_is_a_hard_reject(self):
+        # The losslessness gates compare DSpark to AR INSIDE one process. A nondeterministic shared
+        # prefill makes both legs read the same corrupted state and agree, so #976 passed every
+        # losslessness rep while emitting a different answer each run. This gate is what sees that.
+        script = bot._remote_script("main", role="main")
+        self.assertIn("SPARKINFER_DSPARK_DUMP_TOKENS=1", script)   # compact prefix cannot diverge-detect
+        self.assertIn("DSPARK_AR_HASH", script)
+        self.assertIn("DSPARK_NONDETERMINISTIC", script)
+        self.assertIn("RESULT_AR_DETERMINISTIC", script)
+        parsed = bot._parse_remote("RESULT_AR_DETERMINISTIC 0\n")
+        self.assertEqual(parsed["ar_deterministic"], 0)
+
+    def test_comment_distinguishes_nondeterministic_from_unmeasured(self):
+        # "not measured" must never render as a tick: a silently missing gate reading as a passing
+        # one is how a correctness hole stays invisible.
+        det = bot.format_comment("c", {"ok": True, "label": "none", "ar_deterministic": 1})
+        bad = bot.format_comment("c", {"ok": True, "label": "none", "ar_deterministic": 0})
+        absent = bot.format_comment("c", {"ok": True, "label": "none"})
+        self.assertIn("identical output across", det)
+        self.assertIn("produced DIFFERENT", bad)
+        self.assertIn("not measured", absent)
+        self.assertNotIn("✅ identical output", absent)
+
     def test_concurrency_is_scored_and_c1_is_only_a_floor(self):
         # Every other dimension measures ONE stream. Without these, a PR that fixed aggregate
         # throughput under concurrency scored exactly zero -- which is what #973 and #975 hit.
