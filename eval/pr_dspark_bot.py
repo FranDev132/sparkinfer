@@ -2556,7 +2556,7 @@ def format_comment(commit: str, res: dict) -> str:
         f"| metric | value |\n|---|---|\n"
         f"| **label** | `eval-dspark:{lab}` |\n"
         f"| scored at | **DSpark decode + batched prefill @4k/@16k/@32k; target prefill @256k; "
-        f"concurrent decode @c2/c4/c8** on the ModelOpt NVFP4 checkpoint |\n"
+        f"concurrent decode @c2/c4/c8/c16/c32** on the ModelOpt NVFP4 checkpoint |\n"
         f"| winning axis | **{str(res.get('scored_dimension') or '—').replace('|', '/')}** — the dimension this label came from |\n"
         f"| **PR DSpark @4k** | **{_v('pr_dspark4_tps', '.2f', ' tok/s')}** |\n"
         f"| **main DSpark @4k** | **{_v('main_dspark4_tps', '.2f', ' tok/s')}** |\n"
