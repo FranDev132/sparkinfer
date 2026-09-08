@@ -93,13 +93,13 @@ must not regress:
 
 | context | DSpark decode | AR decode | speedup | mean accepted (τ) |
 |---:|---:|---:|---:|---:|
-| 16k | **130.0** tok/s | 88.5 tok/s | **1.469×** | 1.730 |
+| 16k | **130.3** tok/s | 88.6 tok/s | **1.471×** | 1.730 |
 
 <sub>**Lossless**: the eval regenerates the same prompt with the draft disabled and requires the two token sequences to be byte-identical, so this is exact-token equality with autoregressive decode, not distributional agreement. A run that is not lossless is rejected regardless of speed.</sub>
 
 <sub>Measured at ctx=16384 on `bench/scripts/bench_prompt_32k.txt`. Speculative throughput depends on how predictable the generated text is — the same build measures a materially different τ on prose, code and repetitive text — so treat this as that workload at that context, not a general serving figure. The AR column is the autoregressive decode measured in the same process, same model load, same GPU state.</sub>
 
-<sub>Auto-refreshed by the DSpark eval bot at `d20665282` — these are the numbers that PR measured on the pinned RTX 5090, which after squash-merge are main's. Regenerated on every auto-merge, so the table cannot drift behind the code.</sub>
+<sub>Auto-refreshed by the DSpark eval bot at `b5c957421` — these are the numbers that PR measured on the pinned RTX 5090, which after squash-merge are main's. Regenerated on every auto-merge, so the table cannot drift behind the code.</sub>
 <!-- BENCH:qwen38-dspark:end -->
 
 The two tables measure different corpora, which is the whole point: 4.01× on a mixed workload at
