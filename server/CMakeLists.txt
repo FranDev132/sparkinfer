@@ -32,6 +32,8 @@ add_executable(sparkinfer_server
     src/model_engine.cpp
     src/chat_tokenizer.cpp
     src/chat_tools.cpp
+    src/lmstudio_api.cpp
+    src/ollama_api.cpp
 )
 
 target_include_directories(sparkinfer_server PRIVATE
@@ -70,6 +72,34 @@ if(BUILD_TESTS)
     )
     target_compile_features(chat_tools_test PRIVATE cxx_std_17)
     add_test(NAME chat_tools_test COMMAND chat_tools_test)
+
+    # LM Studio /api/v0 response shaping: pure JSON over plain structs, no engine/CUDA, so it
+    # runs on any box. The assertions are about exact field names and value vocabularies, which
+    # is the entire contract with an LM Studio client.
+    add_executable(lmstudio_api_test
+        tests/lmstudio_api_test.cpp
+        src/lmstudio_api.cpp
+    )
+    target_include_directories(lmstudio_api_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+    )
+    target_link_libraries(lmstudio_api_test PRIVATE nlohmann_json::nlohmann_json)
+    target_compile_features(lmstudio_api_test PRIVATE cxx_std_17)
+    add_test(NAME lmstudio_api_test COMMAND lmstudio_api_test)
+
+    # Ollama /api/* translation: exact field names, NANOSECOND durations, and the shape
+    # differences from OpenAI (message.content, done, done_reason) that are easy to get wrong
+    # while still emitting valid JSON.
+    add_executable(ollama_api_test
+        tests/ollama_api_test.cpp
+        src/ollama_api.cpp
+    )
+    target_include_directories(ollama_api_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+    )
+    target_link_libraries(ollama_api_test PRIVATE nlohmann_json::nlohmann_json)
+    target_compile_features(ollama_api_test PRIVATE cxx_std_17)
+    add_test(NAME ollama_api_test COMMAND ollama_api_test)
 
     # Image input: base64, data: URL parsing, decode -- and the refusals, which are the
     # security-relevant half (no remote fetch, bounded payloads, no silent truncation).

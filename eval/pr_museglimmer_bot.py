@@ -1,31 +1,34 @@
 #!/usr/bin/env python3
 """sparkinfer Muse Glimmer PR auto-evaluator.
 
-SUPERSEDED by eval/pr_qwen38_bot.py, which scores Qwen3.8-27B (decode@128 on the NVFP4
-checkpoint) on a */30 schedule. Only one bot may hold /tmp/sparkinfer_bot.lock, and they all drive
-the same single pinned GPU, so the two are not meant to run concurrently.
+THE SCORED BOT as of 2026-09-09, by explicit instruction. It replaces pr_dspark_bot.py on the
+hourly cron; only one bot may hold /tmp/sparkinfer_bot.lock and they all drive the same single
+pinned GPU, so they must not run concurrently.
 
-NOTE: the crontab is machine state, not repo state -- merging the commit that added this note does
-NOT retire anything by itself. Until the `0 * * * * eval/run_museglimmer_cron.sh` line is removed
-from the eval host's crontab and replaced with run_qwen38_cron.sh's `*/30` line, THIS bot is still
-the one actually scoring PRs. Everything below describes how it behaves whenever it does run.
+NOTE: the crontab is machine state, not repo state -- merging a commit that changes this note
+does NOT change what runs. Whichever `eval/run_*_cron.sh` line is in the eval host's crontab is
+the bot actually scoring PRs.
 
-Sibling of pr_dflash_bot.py — narrowly scoped to Muse Glimmer's plain AR (autoregressive)
-decode + 128-ctx prefill. Not DFlash, not long-context beyond 128. This scope is deliberate:
-Muse Glimmer is a very young architecture (4 real correctness bugs found and fixed in a single
-bring-up session, commit 6d911d4 and preceding) with essentially zero production track record,
-so this bot stays small and strict rather than growing the same multi-context / cross-model-guard
-surface pr_dflash_bot.py has.
+Sibling of pr_dflash_bot.py. Scope as of 2026-09-09 (widened from decode@0 + prefill@128):
+Muse Glimmer's plain AR decode AND prefill across five contexts, plus two cross-model
+no-regression guards at 32k. The earlier narrow scope was deliberate -- Muse Glimmer was a very
+young architecture (4 real correctness bugs found and fixed in one bring-up session, 6d911d4 and
+preceding) -- but it had become the wrong tradeoff: every dimension sat at or below 128 tokens,
+so the gate was blind to long-context work. PR #1006 ("40x prefill@4k", int8 KV honoured at
+ctx >= 4096) moves nothing the old matrix measured.
 
 Scoring, same-box PR-vs-main on a single pinned GPU:
-  1. Speed  — decode (ctx=0) AND prefill@128 (ctx=128), one Muse Glimmer model load via
+  1. Speed  — decode AND prefill at ctx 128/512/4k/16k/32k (SCORED_CTXS), ten axes, one Muse
+              Glimmer model load via
               bench_sweep_run, PR vs a freshly-measured origin/main, same box, same run. Same
               tier buckets as the AR and DFlash bots (BUCKETS/SIG/REGRESS_TOL below — copied,
-              not reinvented). The two dimensions share a regression floor — REGRESS_TOL failing
-              on EITHER is a hard REJECT — but otherwise take the BETTER of the two tiers: a PR
-              that improves one dimension with the other merely flat (not regressed) still earns
-              credit for the real improvement it made, e.g. an XL decode win paired with a flat
-              prefill still reports XL. Added 2026-08-12 (pt. 4 below) because Muse Glimmer's
+              not reinvented). EVERY axis is also a no-regression floor — REGRESS_TOL failing on
+              ANY ONE of the ten is a hard REJECT, so a PR cannot buy a headline win at one
+              context by giving away another — but otherwise the tier is the BEST measured delta
+              across the set: a PR that improves one axis with the rest merely flat (not
+              regressed) still earns credit for the real improvement it made, e.g. an XL
+              prefill@4k win paired with flat decode still reports XL. Originally two dimensions,
+              added 2026-08-12 (pt. 4 below) because Muse Glimmer's
               `batched_prefill_enabled()` always returns false (its SWA/NoPE per-layer pattern
               has no batched kernel yet), so it *always* pays the slow token-loop prefill path —
               a decode-only gate could never see a prefill-specific regression.
@@ -47,9 +50,17 @@ after this bot's first live run wrongly auto-closed an unrelated PR (#768, reope
 apologized); the user was told the risk directly and chose to accept it rather than narrow the
 evaluation scope.
 
-  3. Qwen3.6 no-regression guard — decode + prefill at ctx 0/512/4k/16k/32k, same box, same PR
-              build, vs a freshly-measured origin/main. Reuses pr_dflash_bot.py's GUARD36 sweep
-              mechanism (bench_sweep_run, REGRESS_TOL=0.98) verbatim rather than reinventing it.
+  3. Cross-model no-regression guards @ 32k — decode + prefill on TWO models, same box, same PR
+              build, vs a freshly-measured origin/main:
+                * Qwen3.6-35B-A3B (Q36_GUARD_*), and
+                * the ModelOpt Qwen3.8-27B NVFP4 checkpoint (MODELOPT_MODEL_DIR) -- the one
+                  pr_dspark_bot.py scores, so a shared-code regression is caught here at Muse-PR
+                  time instead of surfacing later as a mystery in that bot's numbers.
+              Narrowed from the previous five-context Qwen3.6 sweep to 32k only: those extra
+              points cost a model load each on models this bot does not score, and 32k is where
+              shared prefill/KV code actually breaks. Both guards share one implementation
+              (_check_model_guard) so they cannot drift apart. Reuses pr_dflash_bot.py's GUARD36
+              sweep mechanism (bench_sweep_run, REGRESS_TOL=0.98) rather than reinventing it.
               A regression here is a hard REJECT regardless of Muse Glimmer's own speed/accuracy
               result — same discipline as the accuracy gate above. This reverses an earlier,
               explicit scope decision to leave cross-model guarding to a separate pushed backup
@@ -117,7 +128,11 @@ MUSEGLIMMER_NEEDS_REBASE = "museglimmer-needs-rebase"
 # Bumped for the Qwen3.6 no-regression guard (see module docstring, pt. 3), then again for
 # 128-ctx prefill scoring (pt. 4) — same reasoning as pr_dflash_bot.py's own v2-qwenguard bump: a
 # PR evaluated before a scoring change existed must not keep a stale-scored label/score forever.
-EVAL_SCHEMA_VERSION = "v3-prefill128"
+# v4 (2026-09-09): scoring matrix widened from {decode@0, prefill@128} to decode AND prefill at
+# 128/512/4k/16k/32k, Qwen3.6 guard narrowed to 32k, ModelOpt Qwen3.8 32k guard added. A PR
+# scored under v3 must not keep a two-dimension label forever, so the version changes and every
+# open PR is re-evaluated.
+EVAL_SCHEMA_VERSION = "v4-ctx5-prefill-decode-modelopt-guard"
 MARKER_RE = re.compile(
     r"<!-- sparkinfer-museglimmer-eval:" + re.escape(EVAL_SCHEMA_VERSION) + r":([0-9a-f]+)(?:\s+(\{.*?\}))? -->",
     re.DOTALL,
@@ -128,15 +143,29 @@ MARKER_RE = re.compile(
 # session validated Muse Glimmer support against /root/sparkinfer_mg specifically, while
 # /root/sparkinfer carries unrelated uncommitted work from a different task that must not be
 # touched or built against.
-REMOTE_REPO = os.environ.get("MUSEGLIMMER_REMOTE_REPO", "/root/sparkinfer_mg")
+# Defaults are the paths that actually exist on the current eval box, NOT historical ones.
+#
+# Both of these were stale and only worked because .env.eval overrode them -- and .env.eval is
+# gitignored, so a box rebuilt from the repo alone, or a restored copy of that file, silently
+# broke the bot. MUSEGLIMMER_GGUF pointed at "muse-glimmer-30B-kquant-17gb.gguf" while the file on
+# disk is "Muse-Glimmer-30B-KQuant-17GB-Q4_K_M.gguf", and REMOTE_REPO at /root/sparkinfer_mg,
+# which does not exist on this box. The env vars still override; they are no longer load-bearing.
+REMOTE_REPO = os.environ.get("MUSEGLIMMER_REMOTE_REPO", "/workspace/eval/bot_repo")
+MUSEGLIMMER_MODELS_DIR = os.environ.get("MUSEGLIMMER_MODELS_DIR",
+                                        "/root/workspace/models_muse_glimmer")
 DEFAULT_GGUF = os.environ.get(
-    "MUSEGLIMMER_GGUF", "/root/workspace/models_muse_glimmer/muse-glimmer-30B-kquant-17gb.gguf"
+    "MUSEGLIMMER_GGUF",
+    os.path.join(MUSEGLIMMER_MODELS_DIR, "Muse-Glimmer-30B-KQuant-17GB-Q4_K_M.gguf"),
 )
 DEFAULT_MODELS_DIR = os.environ.get("MUSEGLIMMER_MODELS_DIR", "/root/workspace/models_muse_glimmer")
 # Shared llama.cpp checkout used by every eval bot on this box (persists outside any repo
 # checkout so `git clean -qfd` in the remote script's checkout step can never delete it).
 LLAMACPP_DIR = os.environ.get("LLAMACPP_DIR", "/root/workspace/.llamacpp")
 BENCH_TOKENS = int(os.environ.get("MUSEGLIMMER_BENCH_TOKENS", "128"))
+# Repeats per context; qwen3_gguf_bench's sweep mode takes the median internally. 5, not 1 --
+# see the two long incident comments in _remote_script (PR #785's bogus XL and PR #790's bogus
+# guard REJECT, both single-sample artefacts on a box where GPU clocks cannot be pinned).
+BENCH_REPS = 5
 ACC_TOPK = int(os.environ.get("MUSEGLIMMER_ACC_TOPK", "128"))
 # Fixed local port for the reference llama-server this bot starts/stops per run. Distinct from
 # accuracy.sh's interactive default (8081) purely so a manual accuracy.sh run on the same box
@@ -154,6 +183,105 @@ Q36_GUARD_MODEL_FILE = os.environ.get("Q36_GUARD_MODEL_FILE", "Qwen3.6-35B-A3B-U
 Q36_GUARD_MODEL_REPO = os.environ.get("PRIMARY36_MODEL_REPO", "unsloth/Qwen3.6-35B-A3B-GGUF")
 Q36_GUARD_TOK_REPO = os.environ.get("PRIMARY36_TOK_REPO", "Qwen/Qwen3.6-35B-A3B")
 GUARD_CTX_LABEL = {0: "128", 512: "512", 4096: "4k", 16384: "16k", 32768: "32k"}
+
+# Scored contexts, BOTH phases at every one (2026-09-09). Previously this bot scored exactly two
+# numbers: decode at ctx=0 and prefill at ctx=128. That could not see anything a long-context PR
+# did -- PR #1006 (int8 KV honoured, "40x prefill@4k") moves nothing this bot measured, because
+# every dimension it had sat at or below 128 tokens.
+#
+# 128 rather than 0 for the short point: qwen3_gguf_bench only emits a prefill number when ctx > 0
+# (see print_bench_block), so a 0 context can contribute decode but never prefill. Using 128 gives
+# both phases at every scored context and makes the matrix uniform.
+#
+# 64k added 2026-09-09. prefill_single_pass_max_tokens() defaults to 32768, so a prompt LONGER than
+# that is ingested in windows with pos0 > 0 -- a different code path that no scored context reached.
+# Measured on main (post-#1006) at that boundary:
+#
+#     ctx=32768   prefill 2080.89 pp tok/s      (single pass)
+#     ctx=49152   prefill   89.11 pp tok/s      (windowed -> refused -> token loop)
+#
+# A 23x cliff the moment windowing engages, completely invisible to a matrix that stops at 32k.
+# 64k rather than 48k because it is the round number the work in this area is reported against and
+# sits further past the boundary; VRAM is flat across the two (28.0 GB at 32k, 28.4 GB at 48k --
+# the prefill arena SHRINKS as windowing bounds it, offsetting the KV growth), and Muse's own
+# context_length is 131072, so 64k is well inside the model's range.
+#
+# 64k gets its OWN tier, not a seat in the long tier, and that is a correctness requirement rather
+# than a cost decision. Contexts inside one bench_sweep_run share a session: KV is sized once for
+# the session's MAXIMUM context, while each context's prefill arena is sized for itself. Putting
+# 64k beside 32k therefore measures 32k under 64k-sized KV pressure, and 32k is the largest
+# single-pass context (prefill_single_pass_max_tokens = 32768), i.e. the most arena-hungry point.
+# Measured on the same main, same box, same day:
+#
+#     32k prefill, long tier ending at 32k    2080.89 pp tok/s
+#     32k prefill, long tier ending at 64k     939.13 pp tok/s     -55%
+#
+# 4k and 16k were unaffected (4128.99 / 2860.47, matching earlier rounds), so this is specifically
+# the big-arena-meets-big-KV interaction. A PR-vs-main delta stayed fair either way -- both legs saw
+# the same pressure -- but the 32k axis stopped measuring 32k serving, and the session also peaked
+# at 97.4% of VRAM. One extra model load (~1 min) buys back both.
+SCORED_CTXS = [128, 512, 4096, 16384, 32768, 65536]
+# Repeats PER CONTEXT, not one number for all five. The reps=5 rule recorded below exists because
+# a SHORT measurement is dominated by launch/dispatch jitter on a box where GPU clocks cannot be
+# pinned -- prefill@128 completes in ~1s, so a single sample is meaningless there. That argument
+# does not transfer to long contexts: measured on main 2026-09-09, Muse prefill runs ~100 pp tok/s
+# at EVERY context (the sequential token-loop path), so one 32k prefill pass already takes ~356
+# seconds. A measurement that long has averaged over its own jitter; repeating it five times buys
+# nothing and costs half an hour.
+#
+#   ctx     decode tok/s   prefill pp tok/s   one prefill pass
+#   128        105.50          111.65             ~1 s
+#   512        103.63          110.30             ~5 s
+#   4k          95.22          103.52            ~40 s
+#   16k         88.93           97.26           ~168 s
+#   32k         80.92           92.29           ~356 s
+#
+# 5/5/3/2/1 keeps the jitter defence exactly where it matters and brings one sweep from ~47 min to
+# ~14 min, which is what makes an hourly round possible at all (the round sweeps TWICE, main and
+# PR, before the two guards and the accuracy gate). Revisit once PR #1006-style work lands: when
+# prefill stops being ~100 pp/s everywhere, long contexts get cheap and reps can go back up.
+# Grouped as (contexts, reps) TIERS, not a per-context dict, because bench_sweep_run
+# (bench/scripts/_eval_speed.sh) accepts "<ctx> <reps>" pairs but then collapses them:
+#
+#     [ "$reps" -gt "$max_reps" ] && max_reps="$reps"
+#     export SPARKINFER_BENCH_SWEEP_REPS="$max_reps"
+#
+# One reps value is applied to EVERY context in the call -- the maximum. Every other bot passes
+# the same reps for every context, so this never mattered until this bot became the first to pass
+# differing values, and the pair syntax made per-context reps look supported. Passing
+# "128 5 ... 32768 1" therefore ran 32k FIVE times (~27 min for that context alone) instead of
+# once, turning a ~14 min sweep into ~45 min and the round into ~2.5 h.
+#
+# So: one bench_sweep_run call per tier. That costs one extra model load (~1 min) and is the only
+# way to get 5 samples where a measurement is ~1s and 1 sample where it is ~330s.
+SCORED_REPS_TIERS = [([128, 512], 5), ([4096, 16384, 32768], 1), ([65536], 1)]
+SCORED_REPS = {c: r for ctxs, r in SCORED_REPS_TIERS for c in ctxs}
+# The GUARDS deliberately keep BENCH_REPS (5) even at 32k, and that is not an inconsistency with
+# SCORED_REPS above. Repeat count should follow how long ONE measurement takes, and that is a
+# property of the model, not of the context: Muse prefills 32k in ~356s (self-averaging, reps=1 is
+# fine), while Qwen3.6 and the ModelOpt checkpoint prefill the same 32k in seconds -- short,
+# jitter-prone, and exactly the shape that made PR #790's guard REJECT on a single bogus 6501
+# reading when two re-runs of the same binary both returned ~8477. A guard that can hard-REJECT a
+# real PR is the last place to economise on samples.
+SCORED_CTX_LABEL = {128: "128", 512: "512", 4096: "4k", 16384: "16k", 32768: "32k",
+                    65536: "64k"}
+# Order matters only for display; every entry is both a scored dimension AND a no-regression
+# floor, so a PR cannot buy a win at one context by giving one away at another.
+SCORING_DIMS = [f"muse-{phase}@{SCORED_CTX_LABEL[c]}"
+                for c in SCORED_CTXS for phase in ("decode", "prefill")]
+SCORING_DIM = SCORING_DIMS[0]
+
+# Cross-model no-regression guards, decode AND prefill, at 32k only (2026-09-09). Narrowed from
+# the previous 0/512/4k/16k/32k Qwen3.6 sweep: those five points cost five model loads per run on
+# a model this bot does not score, and 32k is where shared prefill/KV code actually breaks. The
+# time that buys is spent on Muse's own five scored contexts instead.
+Q36_GUARD_CTXS = [32768]
+MODELOPT_GUARD_CTXS = [32768]
+# The ModelOpt Qwen3.8-27B NVFP4 checkpoint -- the one pr_dspark_bot.py SCORES. Guarding it here
+# means a Muse PR that regresses shared code (qwen35.cpp, the prefill/KV kernels) is caught by
+# this bot before it lands, rather than showing up later as a mystery regression in the DSpark
+# bot's own numbers. Same env var name as that bot uses, so one .env.eval entry serves both.
+MODELOPT_GUARD_MODEL_DIR = os.environ.get("MODELOPT_MODEL_DIR", "/root/workspace/models_q38_modelopt")
 
 # Auto-merge is wired (mirrors pr_dflash_bot.py's auto_merge_ok_dflash/try_auto_merge_dflash
 # shape) but OFF unless this exact env var is set — NOT set in .env.eval, so it stays fully
@@ -232,15 +360,21 @@ def tier_from_gain(pr_tps: float, main_tps: float, metric: str = "decode"):
 _TIER_RANK = {"REJECT": -1, "none": 0, "XS": 1, "S": 2, "M": 3, "L": 4, "XL": 5}
 
 
-def check_q36_guard(pr: dict, main: dict, tol: float = REGRESS_TOL):
-    """No-regression check: PR vs same-box main, Qwen3.6 only, decode + prefill, every measured
-    context. Adapted from pr_dflash_bot.py's check_qwen_guard (its qwen3.5/Qwythos half dropped —
-    scoped to qwen3.6 only per explicit instruction, module docstring pt. 3). Returns
-    (ok, [human-readable regression/failure strings])."""
+def _check_model_guard(pr: dict, main: dict, key: str, model: str, tol: float = REGRESS_TOL):
+    """No-regression check for ONE guarded model: PR vs same-box main, decode + prefill, every
+    measured context. Adapted from pr_dflash_bot.py's check_qwen_guard.
+
+    Parameterised by `key` (the _parse_remote dict key holding that model's per-context numbers)
+    and `model` (its display name) so the Qwen3.6 and ModelOpt guards are the SAME code rather
+    than two copies that can drift apart -- the failure mode of a duplicated guard is that one of
+    them quietly stops guarding and nobody notices, which is exactly how the DSpark bot's Qwen3.8
+    guard spent its whole life benching the scored checkpoint against itself.
+
+    Returns (ok, [human-readable regression/failure strings])."""
     problems = []
-    if pr.get("guard36_failed") or main.get("guard36_failed") or not pr.get("guard36") or not main.get("guard36"):
-        problems.append("qwen3.6 guard measurement unavailable")
-    pr_ctxs, main_ctxs = pr.get("guard36") or {}, main.get("guard36") or {}
+    if pr.get(f"{key}_failed") or main.get(f"{key}_failed") or not pr.get(key) or not main.get(key):
+        problems.append(f"{model} guard measurement unavailable")
+    pr_ctxs, main_ctxs = pr.get(key) or {}, main.get(key) or {}
     # Iterate over MAIN's contexts (the reference set) — a PR build that crashes partway through
     # its own sweep must not make that context silently uncheckable. Fail closed: a real main
     # baseline (base > 0) with a missing/zero PR measurement (cur <= 0) is a regression, not a skip.
@@ -254,17 +388,29 @@ def check_q36_guard(pr: dict, main: dict, tol: float = REGRESS_TOL):
             cur = pr_vals.get(metric, 0)
             if cur <= 0:
                 problems.append(
-                    f"qwen3.6 {metric}@{label}: PR measurement missing/zero "
+                    f"{model} {metric}@{label}: PR measurement missing/zero "
                     f"(main {base:.1f}) — treated as regression"
                 )
                 continue
             if cur < base * tol:
                 pct = 100.0 * (cur - base) / base
                 problems.append(
-                    f"qwen3.6 {metric}@{label}: {cur:.1f} < {100 * tol:.0f}% of main "
+                    f"{model} {metric}@{label}: {cur:.1f} < {100 * tol:.0f}% of main "
                     f"{base:.1f} ({pct:+.1f}%)"
                 )
     return (len(problems) == 0, problems)
+
+
+def check_q36_guard(pr: dict, main: dict, tol: float = REGRESS_TOL):
+    """Qwen3.6 no-regression guard (module docstring pt. 3), decode + prefill @ 32k."""
+    return _check_model_guard(pr, main, "guard36", "qwen3.6", tol)
+
+
+def check_modelopt_guard(pr: dict, main: dict, tol: float = REGRESS_TOL):
+    """ModelOpt Qwen3.8-27B NVFP4 no-regression guard, decode + prefill @ 32k. Same discipline as
+    the Qwen3.6 guard and the same hard-REJECT consequence -- this is the checkpoint the DSpark
+    bot scores, so a Muse PR that regresses it via shared code must not land."""
+    return _check_model_guard(pr, main, "guardmo", "modelopt", tol)
 
 
 def museglimmer_evaluated_commits(repo, num):
@@ -467,6 +613,38 @@ def _remote_script(ref: str) -> str:
     q36_file = shlex.quote(Q36_GUARD_MODEL_FILE)
     q36_repo = shlex.quote(Q36_GUARD_MODEL_REPO)
     q36_tok = shlex.quote(Q36_GUARD_TOK_REPO)
+    mo_dir = shlex.quote(MODELOPT_GUARD_MODEL_DIR)
+    # bench_sweep_run takes alternating "<ctx> <reps>" pairs; the ctx-only list drives the shell
+    # for-loop that reads the results back out. Both are derived from the same SCORED_CTXS /
+    # *_GUARD_CTXS constants so the sweep and the read-back can never disagree about which
+    # contexts were measured.
+    #
+    # reps=5 everywhere, for the reason the long comments below record: this box cannot pin GPU
+    # clocks ("current user does not have permission to change clocks"), so median-of-N is the
+    # only defence against a single noisy sample hard-REJECTing a real PR.
+    # One shell block per reps tier; see SCORED_REPS_TIERS for why this cannot be a single call.
+    scored_blocks = []
+    for ctxs, reps in SCORED_REPS_TIERS:
+        args = " ".join(f"{c} {reps}" for c in ctxs)
+        lst = " ".join(str(c) for c in ctxs)
+        scored_blocks.append(
+            f'wait_gpu_clear\n'
+            f'if bench_sweep_run "$GGUF" "$NTOK" {args}; then\n'
+            f'  for ctx in {lst}; do\n'
+            f'    echo "MUSE $ctx $(_bench_sweep_get $ctx decode_tps) $(_bench_sweep_get $ctx prefill_pp)"\n'
+            f'    if [ "$ctx" = "128" ]; then\n'
+            f'      BC_DECODE=$(_bench_sweep_get 128 decode_tps)\n'
+            f'      BC_PREFILL=$(_bench_sweep_get 128 prefill_pp)\n'
+            f'    fi\n'
+            f'  done\n'
+            f'else\n'
+            f'  MUSE_OK=0\n'
+            f'fi')
+    scored_sweep_blocks = "\n".join(scored_blocks)
+    q36_sweep_args = " ".join(f"{c} {BENCH_REPS}" for c in Q36_GUARD_CTXS)
+    q36_ctx_list = " ".join(str(c) for c in Q36_GUARD_CTXS)
+    mo_sweep_args = " ".join(f"{c} {BENCH_REPS}" for c in MODELOPT_GUARD_CTXS)
+    mo_ctx_list = " ".join(str(c) for c in MODELOPT_GUARD_CTXS)
     return f"""
 set -euo pipefail
 # Surface *why* a crash happened instead of dying silently — same diagnostic trap as
@@ -508,6 +686,7 @@ Q36_GUARD_MODELS_DIR={q36_dir}
 Q36_GUARD_MODEL_FILE={q36_file}
 Q36_GUARD_MODEL_REPO={q36_repo}
 Q36_GUARD_TOK_REPO={q36_tok}
+MODELOPT_GUARD_MODEL_DIR={mo_dir}
 
 cd "$REPO"
 git remote set-url origin https://github.com/gittensor-ai-lab/sparkinfer.git 2>/dev/null || true
@@ -560,16 +739,33 @@ test -x build/runtime/qwen3_gguf_score
 source bench/scripts/_common.sh
 source bench/scripts/_eval_speed.sh
 SI_BIN="$PWD/build/runtime"; SI_LD=""
-wait_gpu_clear
-if bench_sweep_run "$GGUF" "$NTOK" 0 5 128 5; then
-  DECODE_TPS=$(_bench_sweep_get 0 decode_tps)
-  PREFILL128_PP=$(_bench_sweep_get 128 prefill_pp)
-else
-  DECODE_TPS=0
-  PREFILL128_PP=0
+# Fail loudly and immediately on a missing checkpoint. Without this the sweep just returns no
+# rows, the baseline comes back empty, and the round reports a measurement problem several
+# minutes later with no hint that the PATH was the issue -- which is exactly how a stale
+# MUSEGLIMMER_GGUF hid for as long as it did.
+if [ ! -f "$GGUF" ]; then
+  echo "FAIL Muse Glimmer checkpoint not found at $GGUF" >&2
+  echo "     (set MUSEGLIMMER_GGUF, or place the model in MUSEGLIMMER_MODELS_DIR)" >&2
+  ls -la "$(dirname "$GGUF")" 2>&1 | head -10 >&2
+  exit 1
 fi
-echo "RESULT_DECODE_TPS ${{DECODE_TPS:-0}}"
-echo "RESULT_PREFILL128_PP ${{PREFILL128_PP:-0}}"
+wait_gpu_clear
+# Five contexts, decode AND prefill at each, in ONE model load (bench_sweep_run sweeps all the
+# ctx points per load). Emitting one MUSE line per context rather than two fixed RESULT_ lines
+# keeps the wire format the same shape as the guards' and lets SCORED_CTXS change without
+# touching the parser.
+MUSE_OK=1
+BC_DECODE=0
+BC_PREFILL=0
+{scored_sweep_blocks}
+[ "$MUSE_OK" = "1" ] || echo "MUSE_FAILED"
+# Back-compat: decode@128 / prefill@128 also go out under their old names. The PR comment
+# renderer, the Polaris payload and the published dashboard all read these two keys, and none of
+# them should have to change because the scoring matrix grew.
+# Captured during the tier that measured 128 -- _bench_sweep_get reads the LAST sweep's JSON, and
+# 128 is not in the last tier.
+echo "RESULT_DECODE_TPS ${{BC_DECODE:-0}}"
+echo "RESULT_PREFILL128_PP ${{BC_PREFILL:-0}}"
 
 # --- accuracy gate: sparkinfer teacher-forced score vs a live llama-server reference, same
 # GGUF, same eval_text.txt corpus this session already validated by hand (6d911d4) ---
@@ -678,20 +874,50 @@ Q36_GGUF="$Q36_GUARD_MODELS_DIR/$Q36_GUARD_MODEL_FILE"
 
 echo "GUARD_START"
 wait_gpu_clear
-if bench_sweep_run "$Q36_GGUF" 128 0 5 512 5 4096 5 16384 5 32768 5; then
-  for ctx in 0 512 4096 16384 32768; do
+if bench_sweep_run "$Q36_GGUF" 128 {q36_sweep_args}; then
+  for ctx in {q36_ctx_list}; do
     echo "GUARD36 $ctx $(_bench_sweep_get $ctx decode_tps) $(_bench_sweep_get $ctx prefill_pp)"
   done
 else
   echo "GUARD36_FAILED"
 fi
+
+# --- ModelOpt Qwen3.8-27B NVFP4 no-regression guard (decode + prefill @ 32k) ---
+# A compressed-tensors DIRECTORY, not a GGUF -- qwen3_gguf_bench accepts either (see its usage
+# line). This is the checkpoint pr_dspark_bot.py scores; guarding it here catches a shared-code
+# regression at Muse-PR time instead of leaving the other bot to discover it after the merge.
+# Skipped, not failed, when the checkpoint is absent: a box without it must not turn every PR
+# into a REJECT, and check_modelopt_guard reports SKIPPED so "guarded" is never claimed when
+# nothing was.
+if [ -d "$MODELOPT_GUARD_MODEL_DIR" ]; then
+  wait_gpu_clear
+  if bench_sweep_run "$MODELOPT_GUARD_MODEL_DIR" 128 {mo_sweep_args}; then
+    for ctx in {mo_ctx_list}; do
+      echo "GUARDMO $ctx $(_bench_sweep_get $ctx decode_tps) $(_bench_sweep_get $ctx prefill_pp)"
+    done
+  else
+    echo "GUARDMO_FAILED"
+  fi
+else
+  echo "GUARDMO_UNAVAILABLE"
+fi
 echo "GUARD_END"
 """
+
+
+def _at(res: dict, ctx: int, phase: str) -> float:
+    """One measurement out of a parsed run's matrix, 0.0 when that context/phase is missing.
+    Every consumer reads through this rather than indexing, so a sweep that dropped one context
+    degrades to a zero (which tier_from_gain scores as a regression) instead of a KeyError that
+    would fail the whole round."""
+    return float(((res.get("muse") or {}).get(ctx) or {}).get(phase, 0.0) or 0.0)
 
 
 def _parse_remote(stdout: str) -> dict:
     out = {}
     guard36 = {}
+    guardmo = {}
+    muse = {}
     for line in (stdout or "").splitlines():
         if line.startswith("REMOTE_HEAD "):
             out["head"] = line.split()[1]
@@ -730,6 +956,15 @@ def _parse_remote(stdout: str) -> dict:
                 out["token_count"] = int(line.split()[1])
             except ValueError:
                 pass
+        elif line.startswith("MUSE "):
+            parts = line.split()
+            if len(parts) >= 4:
+                try:
+                    muse[int(parts[1])] = {"decode": float(parts[2]), "prefill": float(parts[3])}
+                except ValueError:
+                    pass
+        elif line.strip() == "MUSE_FAILED":
+            out["muse_failed"] = True
         elif line.startswith("GUARD36 "):
             parts = line.split()
             if len(parts) >= 4:
@@ -739,7 +974,20 @@ def _parse_remote(stdout: str) -> dict:
                     pass
         elif line.strip() == "GUARD36_FAILED":
             out["guard36_failed"] = True
+        elif line.startswith("GUARDMO "):
+            parts = line.split()
+            if len(parts) >= 4:
+                try:
+                    guardmo[int(parts[1])] = {"decode": float(parts[2]), "prefill": float(parts[3])}
+                except ValueError:
+                    pass
+        elif line.strip() == "GUARDMO_FAILED":
+            out["guardmo_failed"] = True
+        elif line.strip() == "GUARDMO_UNAVAILABLE":
+            out["guardmo_unavailable"] = True
     out["guard36"] = guard36
+    out["guardmo"] = guardmo
+    out["muse"] = muse
     return out
 
 
@@ -904,10 +1152,14 @@ def measure_main_baseline(host, port):
         reason = "main run failed" + (f" — {crash}" if crash else " (no crash diagnostic captured, possible hard kill — retried once)")
         return {"ok": False, "reason": reason, "log": tail}
     main = _parse_remote(r.stdout or "")
-    if "decode_tps" not in main:
-        return {"ok": False, "reason": "main bench missing decode tok/s", "log": (r.stdout or "")[-1500:]}
-    if "prefill128_pp" not in main:
-        return {"ok": False, "reason": "main bench missing prefill@128 pp tok/s", "log": (r.stdout or "")[-1500:]}
+    # Fail the ROUND, not the PR, when the baseline is incomplete: comparing a PR against a
+    # partial baseline silently turns a missing context into a "regression".
+    missing = [SCORED_CTX_LABEL[c] for c in SCORED_CTXS
+               if not ((main.get("muse") or {}).get(c) or {}).get("decode")]
+    if main.get("muse_failed") or missing:
+        return {"ok": False,
+                "reason": "main bench missing Muse Glimmer measurements at ctx " + ",".join(missing or ["(sweep failed)"]),
+                "log": (r.stdout or "")[-1500:]}
     main["ok"] = True
     return main
 
@@ -923,38 +1175,61 @@ def eval_museglimmer_on_box(host, port, pr_ref: str, main: dict):
         reason = "PR speed/accuracy run failed" + (f" — {crash}" if crash else " (no crash diagnostic captured, possible hard kill — retried once)")
         return {"ok": False, "reason": reason, "log": tail}
     pr = _parse_remote(r.stdout or "")
-    if "decode_tps" not in pr:
-        return {"ok": False, "reason": "PR bench missing decode tok/s", "log": (r.stdout or "")[-1500:]}
-    if "prefill128_pp" not in pr:
-        return {"ok": False, "reason": "PR bench missing prefill@128 pp tok/s", "log": (r.stdout or "")[-1500:]}
+    # A missing PR-side context is NOT treated as an infra failure here -- it is scored as a
+    # regression by tier_from_gain (cur=0 against a real main baseline), which is the fail-closed
+    # direction. Only a wholesale sweep failure is reported as a run failure.
+    if pr.get("muse_failed") or not (pr.get("muse") or {}):
+        return {"ok": False, "reason": "PR bench produced no Muse Glimmer measurements",
+                "log": (r.stdout or "")[-1500:]}
     if "top1" not in pr or "kl" not in pr:
         return {"ok": False, "reason": "PR run missing accuracy METRIC line", "log": (r.stdout or "")[-1500:]}
-    print(f">> PR decode={pr['decode_tps']:.2f} prefill128={pr['prefill128_pp']:.2f} "
-          f"top1={pr.get('top1', 0):.3f} kl={pr.get('kl', 99):.4f}")
+    for ctx in SCORED_CTXS:
+        pv = (pr.get("muse") or {}).get(ctx) or {}
+        mv = (main.get("muse") or {}).get(ctx) or {}
+        print(f">> PR @{SCORED_CTX_LABEL[ctx]:>4}: decode {pv.get('decode', 0):9.2f} "
+              f"(main {mv.get('decode', 0):9.2f})   prefill {pv.get('prefill', 0):10.2f} "
+              f"(main {mv.get('prefill', 0):10.2f})")
+    print(f">> PR accuracy top1={pr.get('top1', 0):.3f} kl={pr.get('kl', 99):.4f}")
 
-    decode_label, decode_delta_pct, decode_passed, decode_reason = tier_from_gain(
-        pr["decode_tps"], main["decode_tps"], metric="decode")
-    prefill_label, prefill_delta_pct, prefill_passed, prefill_reason = tier_from_gain(
-        pr["prefill128_pp"], main["prefill128_pp"], metric="prefill@128")
+    # Ten scored axes: decode and prefill at each of SCORED_CTXS. Every one is ALSO a
+    # no-regression floor -- any single axis regressing is a hard REJECT, so a PR cannot buy a
+    # headline win at one context by giving away another. Otherwise the tier is the best measured
+    # delta across the whole set, which preserves the previous behaviour that a PR improving one
+    # phase with the other merely flat still earns credit for the real improvement it made.
+    #
+    # Iterating SCORED_CTXS rather than restating the contexts keeps this in step with the
+    # constant; the DSpark bot's equivalent comment once named a dimension its list did not hold.
+    scored = []
+    for ctx in SCORED_CTXS:
+        clabel = SCORED_CTX_LABEL[ctx]
+        pr_vals = (pr.get("muse") or {}).get(ctx) or {}
+        main_vals = (main.get("muse") or {}).get(ctx) or {}
+        for phase, unit in (("decode", "decode"), ("prefill", "prefill")):
+            name = f"muse-{unit}@{clabel}"
+            lab, dlt, ok, why = tier_from_gain(
+                pr_vals.get(phase, 0.0), main_vals.get(phase, 0.0), metric=name)
+            scored.append({"dim": name, "label": lab, "delta": dlt, "passed": ok, "reason": why})
+    by_dim = {x["dim"]: x for x in scored}
 
-    # Shared regression floor, best-of-the-rest: either dimension regressing is a hard REJECT
-    # regardless of the other (same conservative, fail-closed philosophy as the accuracy gate and
-    # Q36 guard below, module docstring pt. 4) — but a PR that improves ONE dimension with the
-    # OTHER merely flat (not regressed) still earns credit for the real improvement it made. A
-    # pure prefill@128 optimization with unchanged decode should score on its own merits, not get
-    # dragged down to "none" just because decode wasn't also touched — no different from how a
-    # decode-only PR was never expected to also move prefill.
-    if decode_label == "REJECT" and prefill_label == "REJECT":
-        label, delta_pct, passed = "REJECT", min(decode_delta_pct, prefill_delta_pct), False
-        speed_reason = f"{decode_reason} | {prefill_reason}"
-    elif decode_label == "REJECT":
-        label, delta_pct, passed, speed_reason = "REJECT", decode_delta_pct, False, decode_reason
-    elif prefill_label == "REJECT":
-        label, delta_pct, passed, speed_reason = "REJECT", prefill_delta_pct, False, prefill_reason
-    elif _TIER_RANK[decode_label] >= _TIER_RANK[prefill_label]:
-        label, delta_pct, passed, speed_reason = decode_label, decode_delta_pct, decode_passed, decode_reason
+    regressed = [x for x in scored if x["label"] == "REJECT"]
+    if regressed:
+        worst = min(regressed, key=lambda x: x["delta"])
+        label, delta_pct, passed = "REJECT", worst["delta"], False
+        speed_reason = " | ".join(x["reason"] for x in regressed)
     else:
-        label, delta_pct, passed, speed_reason = prefill_label, prefill_delta_pct, prefill_passed, prefill_reason
+        # max() over measured deltas, not over tier letters: two axes can share a bucket while
+        # one is clearly the larger win, and the delta is what the tier came from anyway.
+        best = max((by_dim[d] for d in SCORING_DIMS if d in by_dim),
+                   key=lambda x: x["delta"], default=by_dim[SCORING_DIM])
+        label, delta_pct, passed, speed_reason = (
+            best["label"], best["delta"], best["passed"], best["reason"])
+
+    # Back-compat names for the report/dashboard/Polaris payload, taken from the 128 axes that
+    # used to be the only two dimensions this bot had.
+    decode_delta_pct = by_dim["muse-decode@128"]["delta"]
+    decode_label = by_dim["muse-decode@128"]["label"]
+    prefill_delta_pct = by_dim["muse-prefill@128"]["delta"]
+    prefill_label = by_dim["muse-prefill@128"]["label"]
 
     pr_top1 = pr.get("top1", 0.0)
     pr_kl = pr.get("kl", 99.0)
@@ -967,6 +1242,18 @@ def eval_museglimmer_on_box(host, port, pr_ref: str, main: dict):
         acc_reason = (f"accuracy gate failed: top1={pr_top1:.3f} (bar >={ACC_TOP1_BAR}) "
                       f"kl={pr_kl:.4f} (bar <={ACC_KL_BAR})")
         reason = f"{acc_reason} | speed: {speed_reason}"
+        label = "REJECT"
+        passed = False
+
+    mo_ok, mo_problems = check_modelopt_guard(pr, main)
+    if pr.get("guardmo_unavailable") or main.get("guardmo_unavailable"):
+        # Absent checkpoint is a SKIP, not a REJECT -- but say so, so a round that guarded
+        # nothing never reads as a round that guarded successfully.
+        mo_ok, mo_problems = True, []
+        print(">> modelopt guard SKIPPED — checkpoint not installed (MODELOPT_MODEL_DIR)")
+    if not mo_ok:
+        mo_reason = "modelopt no-regression guard failed: " + "; ".join(mo_problems[:6])
+        reason = f"{mo_reason} | {reason}"
         label = "REJECT"
         passed = False
 
@@ -986,16 +1273,27 @@ def eval_museglimmer_on_box(host, port, pr_ref: str, main: dict):
         "pass": passed and label != "REJECT",
         "reason": reason,
         "delta_pct": delta_pct,
-        "pr_decode_tps": pr["decode_tps"],
-        "main_decode_tps": main["decode_tps"],
+        "pr_decode_tps": _at(pr, 128, "decode"),
+        "main_decode_tps": _at(main, 128, "decode"),
         "decode_delta_pct": decode_delta_pct,
         "decode_regressed": decode_label == "REJECT",
-        "speedup_vs_main": round(pr["decode_tps"] / main["decode_tps"], 3) if main.get("decode_tps") else 0,
-        "pr_prefill128_pp": pr["prefill128_pp"],
-        "main_prefill128_pp": main["prefill128_pp"],
+        "speedup_vs_main": (round(_at(pr, 128, "decode") / _at(main, 128, "decode"), 3)
+                            if _at(main, 128, "decode") else 0),
+        "pr_prefill128_pp": _at(pr, 128, "prefill"),
+        "main_prefill128_pp": _at(main, 128, "prefill"),
         "prefill_delta_pct": prefill_delta_pct,
         "prefill_regressed": prefill_label == "REJECT",
-        "prefill_speedup_vs_main": round(pr["prefill128_pp"] / main["prefill128_pp"], 3) if main.get("prefill128_pp") else 0,
+        "prefill_speedup_vs_main": (round(_at(pr, 128, "prefill") / _at(main, 128, "prefill"), 3)
+                                    if _at(main, 128, "prefill") else 0),
+        # Every scored axis, so the PR comment and the published log can show the whole matrix
+        # rather than just the tier-winning row.
+        "scored_dims": scored,
+        "best_dim": (best["dim"] if not regressed else worst["dim"]),
+        "modelopt_guard_ok": mo_ok,
+        "modelopt_guard_problems": mo_problems,
+        "muse_pr": (pr.get("muse") or {}),
+        "muse_main": (main.get("muse") or {}),
+        "guardmo_skipped": bool(pr.get("guardmo_unavailable") or main.get("guardmo_unavailable")),
         "pr_top1": pr_top1,
         "pr_kl": pr_kl,
         "pr_ppl_spark": pr.get("ppl_spark"),
@@ -1016,6 +1314,35 @@ def eval_museglimmer_on_box(host, port, pr_ref: str, main: dict):
     return res
 
 
+def _ctx_list_str() -> str:
+    """"128/512/4k/16k/32k/64k" from SCORED_CTXS. Derived rather than written out: the PR comment
+    twice named a context list that had gone stale behind the constant."""
+    return "/".join(SCORED_CTX_LABEL[c] for c in SCORED_CTXS)
+
+
+def _matrix_table(res: dict) -> str:
+    """The full PR-vs-main matrix. Rendered from res["scored_dims"] rather than from named keys so
+    it stays correct when SCORED_CTXS changes -- the previous comment hard-coded two rows and would
+    have silently kept showing two after the matrix grew to ten."""
+    dims = res.get("scored_dims") or []
+    if not dims:
+        return ""
+    pr_m, main_m = res.get("muse_pr") or {}, res.get("muse_main") or {}
+    rows = ["| ctx | phase | main | PR | delta |", "|---|---|---|---|---|"]
+    for ctx in SCORED_CTXS:
+        for phase in ("decode", "prefill"):
+            name = f"muse-{phase}@{SCORED_CTX_LABEL[ctx]}"
+            d = next((x for x in dims if x["dim"] == name), None)
+            if not d:
+                continue
+            mv = float((main_m.get(ctx) or {}).get(phase, 0) or 0)
+            pv = float((pr_m.get(ctx) or {}).get(phase, 0) or 0)
+            flag = " **REJECT**" if d["label"] == "REJECT" else ""
+            rows.append(f"| {SCORED_CTX_LABEL[ctx]} | {phase} | {mv:.2f} | {pv:.2f} | "
+                        f"{d['delta']:+.1f}%{flag} |")
+    return "\n".join(rows) + "\n\n"
+
+
 def format_comment(commit: str, res: dict) -> str:
     meta = {
         "label": res.get("label"),
@@ -1027,6 +1354,17 @@ def format_comment(commit: str, res: dict) -> str:
         "pass": res.get("pass"),
         "accuracy_ok": res.get("accuracy_ok"),
         "q36_guard_ok": res.get("q36_guard_ok"),
+        "modelopt_guard_ok": res.get("modelopt_guard_ok"),
+        "modelopt_guard_skipped": res.get("guardmo_skipped"),
+        # WHICH axis produced delta_pct. Necessary now that the tier comes from ten axes while the
+        # marker still carries only the 128 numbers for the dashboard: without this a reader sees
+        # a headline delta that does not match either number next to it (e.g. +3900% from
+        # prefill@4k printed beside a flat decode@128).
+        "best_dim": res.get("best_dim"),
+        # The whole matrix, so a consumer that wants more than the 128 pair does not have to
+        # re-scrape the rendered table.
+        "dims": {d["dim"]: {"delta": d["delta"], "label": d["label"]}
+                 for d in (res.get("scored_dims") or [])},
     }
     marker = (
         f"<!-- sparkinfer-museglimmer-eval:{EVAL_SCHEMA_VERSION}:{commit} "
@@ -1052,11 +1390,22 @@ def format_comment(commit: str, res: dict) -> str:
                           f"kl={res.get('main_kl'):.4f} — main ALSO misses the bar (informational; "
                           "not gated on main, but check the box/corpus if this persists) |\n")
     if res.get("q36_guard_ok"):
-        q36_row = "| qwen3.6 guard | ✅ no regression (decode+prefill, ctx 0/512/4k/16k/32k) |\n"
+        q36_row = "| qwen3.6 guard | ✅ no regression (decode+prefill @ 32k) |\n"
     else:
         problems = "; ".join((res.get("q36_guard_problems") or [])[:4])
         q36_row = (f"| qwen3.6 guard | ❌ **FAILED** — {problems} — "
                     "**verdict forced to REJECT regardless of speed/accuracy** |\n")
+    if res.get("guardmo_skipped"):
+        # Say SKIPPED explicitly. A guard that silently reports nothing reads identical to one
+        # that passed, which is how an unnoticed vacuous guard survives for months.
+        mo_row = ("| modelopt guard | ⚠️ SKIPPED — checkpoint not installed on the box "
+                  "(`MODELOPT_MODEL_DIR`); shared-code regressions on Qwen3.8 were NOT checked |\n")
+    elif res.get("modelopt_guard_ok"):
+        mo_row = "| modelopt guard | ✅ no regression (decode+prefill @ 32k, Qwen3.8-27B NVFP4) |\n"
+    else:
+        mo_problems = "; ".join((res.get("modelopt_guard_problems") or [])[:4])
+        mo_row = (f"| modelopt guard | ❌ **FAILED** — {mo_problems} — "
+                  "**verdict forced to REJECT regardless of speed/accuracy** |\n")
     polaris = res.get("polaris") or {}
     receipt = polaris.get("receipt")
     if receipt:
@@ -1071,30 +1420,29 @@ def format_comment(commit: str, res: dict) -> str:
         f"{marker}\n## sparkinfer museglimmer auto-eval — `eval-museglimmer:{lab}`\n\n"
         f"| metric | value |\n|---|---|\n"
         f"| **label** | `eval-museglimmer:{lab}` |\n"
-        f"| scored at | 128-token decode (ctx=0) + 128-ctx prefill — shared regression floor, best of the two |\n"
-        f"| PR decode tok/s | {res['pr_decode_tps']:.2f} |\n"
-        f"| main decode tok/s | {res['main_decode_tps']:.2f} |\n"
-        f"| decode speedup vs main | **{res.get('speedup_vs_main', 0):.2f}×** ({res.get('decode_delta_pct', 0):+.1f}%) |\n"
-        f"| PR prefill@128 pp tok/s | {res.get('pr_prefill128_pp', 0):.2f} |\n"
-        f"| main prefill@128 pp tok/s | {res.get('main_prefill128_pp', 0):.2f} |\n"
-        f"| prefill speedup vs main | **{res.get('prefill_speedup_vs_main', 0):.2f}×** ({res.get('prefill_delta_pct', 0):+.1f}%) |\n"
+        f"| scored at | decode + prefill @ {_ctx_list_str()} — every axis is also a regression floor, label is the best |\n"
+        f"| tier from | `{res.get('best_dim') or '?'}` ({res.get('delta_pct', 0):+.1f}%) |\n"
         f"{acc_row}"
         f"{main_acc_note}"
         f"{q36_row}"
+        f"{mo_row}"
         f"| PPL sparkinfer / llama.cpp | {res.get('pr_ppl_spark') or '?'} / {res.get('pr_ppl_llama') or '?'} |\n"
         f"{polaris_row}"
         f"| commit | `{commit[:9]}` |\n\n"
+        f"{_matrix_table(res)}"
         f"{res.get('reason') or ''}\n\n"
-        "<sub>Scored on the pinned eval box vs same-box `origin/main` — 128-token AR decode "
-        "(ctx=0) AND 128-ctx prefill throughput, from one model load; either dimension regressing "
-        "is a hard REJECT, but otherwise the reported label is the **better** of the two tiers — "
-        "a PR that improves just one, with the other flat, still earns credit for that "
-        "(no DFlash, no long-context beyond 128) — Muse Glimmer's narrow, deliberately "
-        "strict eval scope. This is informational, not a judgment on your PR: a `none` label just "
+        f"<sub>Scored on the pinned eval box vs same-box `origin/main` — AR decode AND prefill at "
+        f"ctx {_ctx_list_str()}; ANY axis regressing is a hard REJECT, but "
+        f"otherwise the reported label is the **best** measured delta across the "
+        f"{len(SCORING_DIMS)} — "
+        "a PR that improves just one, with the rest flat, still earns credit for that. "
+        "Cross-model no-regression guards run at 32k on Qwen3.6 and the ModelOpt Qwen3.8-27B "
+        "NVFP4 checkpoint. This is informational, not a judgment on your PR: a `none` label just "
         "means no measurable Muse Glimmer speedup was verified on either metric, which is expected "
         "and fine if that isn't what your change is about. "
-        "Correctness gated against a live llama.cpp reference on the same GGUF. Also gated on a "
-        "Qwen3.6 no-regression guard (decode+prefill, ctx 0/512/4k/16k/32k, same box vs main) — "
+        "Correctness gated against a live llama.cpp reference on the same GGUF. Also gated on two "
+        "cross-model no-regression guards at 32k (decode+prefill, same box vs main): "
+        "Qwen3.6-35B-A3B and the ModelOpt Qwen3.8-27B NVFP4 checkpoint — "
         "Muse Glimmer PRs can touch code shared with other models. "
         "Automated — **not merged**; merge manually after review.</sub>\n"
     )
@@ -1319,7 +1667,7 @@ def apply_result(repo, num, commit, res, title="", dry_run=False):
             "updated": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         }
         _save_scores(scores)
-        # Auto-close on "none"/"REJECT" -- same policy as pr_dflash_bot.py. Re-enabled 2026-08-11
+        # Auto-close on "REJECT" ONLY (narrowed 2026-09-09; was none/REJECT). Re-enabled 2026-08-11
         # after an explicit, informed decision: the very first supervised run of this bot closed a
         # real external contributor's unrelated PR (#768) this exact same way, since
         # arb.greenlight_status() is generic (any PR with a checked "tested" box + a decode/
@@ -1330,7 +1678,23 @@ def apply_result(repo, num, commit, res, title="", dry_run=False):
         # (broad scope, matching pr_dflash_bot.py) rather than narrow evaluation to only
         # Muse-Glimmer-relevant PRs. If this causes another wrongful close, reopen + apologize the
         # same way, and reconsider the scope-narrowing alternative that was declined here.
-        if label in ("none", "REJECT"):
+        # AUTO-CLOSE ONLY ON REJECT, NEVER ON "none" (changed 2026-09-09).
+        #
+        # "none" means THIS bot measured no change on ITS axes. For a PR aimed at a different
+        # model that is the expected, uninformative outcome -- not a verdict on the PR. Closing on
+        # it destroys good work: this bot is currently the only one on cron, so every PR in the
+        # repo is scored against one model's metrics, and a genuine improvement to another model
+        # measures "none" here by construction. PR #1008 (a 15x Muse prefill win) was minutes away
+        # from being auto-closed by the DSpark bot for exactly this reason and had to be caught by
+        # hand; the same trap now points the other way.
+        #
+        # "REJECT" is different in kind and still closes: it means a measured REGRESSION on a
+        # scored axis, an accuracy-gate failure, or a cross-model guard failure. That is real,
+        # attributable harm and is worth acting on no matter what the PR was aiming at.
+        #
+        # Abandoned PRs are still handled -- by the age-based stale close, which is about
+        # inactivity rather than about a measurement.
+        if label == "REJECT":
             if not res.get("q36_guard_ok", True):
                 fail_clause = "and regressed the Qwen3.6 no-regression guard (decode/prefill on shared code)"
             elif not res.get("accuracy_ok"):
@@ -1339,7 +1703,7 @@ def apply_result(repo, num, commit, res, title="", dry_run=False):
                 fail_clause = "and regressed 128-ctx prefill throughput specifically"
             elif res.get("decode_regressed"):
                 fail_clause = "(decode regression)"
-            elif label == "none":
+            elif label == "none":   # unreachable: see the REJECT-only guard above
                 fail_clause = "with no verified improvement on both decode and prefill"
             else:
                 fail_clause = "(regression)"
