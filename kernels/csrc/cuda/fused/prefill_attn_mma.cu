@@ -1262,6 +1262,45 @@ bool launch_prefill_attn_mma_muse_hd128(
     if (n_kv_heads <= 0 || n_q_heads % n_kv_heads != 0) return false;
     if (n_q_heads % 4 != 0) return false;                  // RQH=4 owns 4 q-heads per block
     if ((n_q_heads / n_kv_heads) % 4 != 0) return false;   // ...all sharing one kv-head
+    // A block stages one kv-head's K/V tile and feeds it to RQH q-heads, so the group's K/V is
+    // re-read (GQA / RQH) times per query tile. Muse Glimmer is 16:1 -- the widest group in the
+    // tree -- and at RQH=4 that is four passes over the same keys. Widening it is what the rolling
+    // score plane (PLANES) exists for: it holds PLANES heads at a time instead of RQH, so the
+    // plane stops being what caps RQH.
+    //
+    // But RQH also DIVIDES the grid: blocks = ceil(n/BM) * (n_q_heads/RQH). A short prompt has few
+    // query tiles, so widening the group empties the machine -- at n=128 RQH=16 leaves 16 blocks
+    // for 170 SMs. Measured on Muse Glimmer, prefill pp against the RQH=4 default:
+    //
+    //     n      128     512    4096   16384   32768   65536
+    //     RQH16 -11.7%  -7.3%  +2.8%  +5.8%   +9.6%  +15.6%
+    //
+    // So take the widest group that still fills the device, and keep the shipped shape below that.
+    // Two waves of blocks is the threshold that separates the measured win from the measured loss.
+    // Bit-identical either way: RQH changes only how many heads share a staged tile, not the
+    // per-row arithmetic or its order (verified at prefix=4096: TOP1 11/16, KL 0.04134, seed 220
+    // on both).
+    const int gqa = n_q_heads / n_kv_heads;
+    int sms = 0;
+    if (cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, 0) != cudaSuccess || sms <= 0)
+        sms = 1;
+    const long tiles  = (n_tokens + 15) / 16;
+    const long want   = 2L * sms;
+    auto fills = [&](int rqh) { return tiles * (long)(n_q_heads / rqh) >= want; };
+    // Descending, and NEVER falling through to the caller's scalar path on a refusal: an
+    // over-budget shape costs ~4x (measured: the 113 KB RQH=16/PLANES=4 shape drops 11667 -> 2677
+    // pp because the smem opt-in fails and no mma tier runs at all). A refusal here just tries the
+    // next narrower tier, and RQH=4 is the shape that ships today.
+    #define MUSE_ATTN_TIER(RQH, PL)                                                               \
+        if (gqa % (RQH) == 0 && n_q_heads % (RQH) == 0 && fills(RQH) &&                           \
+            launch_attn_gqa<128, 8, (RQH), (PL), false, false, 1, false>(                         \
+                q, k_pool, v_pool, k_scale, v_scale, block_table, attn, n_tokens, n_q_heads,      \
+                n_kv_heads, block_size, max_blocks_per_seq, scale, win_blocks, stream, q_pos0))   \
+            return true;                                                                          \
+        cudaGetLastError();   /* a refused opt-in must not poison the next tier's peek */
+    MUSE_ATTN_TIER(16, 2)
+    MUSE_ATTN_TIER(8, 2)
+    #undef MUSE_ATTN_TIER
     return launch_attn_gqa<128, /*GROUP_BLKS=*/8, /*RQH=*/4, /*PLANES=*/0,
                            /*VT=*/false, /*WIDEK=*/false, /*PVU=*/1, /*SINK=*/false>(
         q, k_pool, v_pool, k_scale, v_scale, block_table, attn, n_tokens, n_q_heads, n_kv_heads,
