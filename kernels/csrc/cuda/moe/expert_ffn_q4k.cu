@@ -628,6 +628,60 @@ __device__ __forceinline__ float si_vec_dot_q3_A(const si_block_q3_A* bq3, const
     return dm3f.x * sumf_d - dm3f.y * sumf_m;
 }
 
+// Weight-stationary form of si_vec_dot_q3_A: unpack the Q3_A super-block ONCE and dot it against
+// up to MMAX activation rows. Per row this is the same v0/v1/dot1/dot2 arithmetic in the same
+// order as the one-row helper above, so a row accumulates exactly what it would on its own -- what
+// changes is that the block's qs/qh/scales/dm are read and unpacked once for all of them instead
+// of once per row.
+template <int MMAX>
+__device__ __forceinline__ void si_vec_dot_q3_A_rows(
+    const si_block_q3_A* __restrict__ bq3, const si_block_q8_1* __restrict__ bq8_1,
+    int row_blocks, int iqs, int M, float* __restrict__ acc)
+{
+    const int L = iqs >> 1;
+    const int j = L >> 2, m4 = L & 3;
+    const int vl  = *(const int*)(bq3->qs + 16 * j + 4 * m4);
+    const int hlo = *(const int*)(bq3->qh + 8 * m4);
+    const int hhi = *(const int*)(bq3->qh + 8 * m4 + 4);
+    const unsigned short* scales = (const unsigned short*)bq3->scales;
+    unsigned short aux[2];
+    if (j < 2) { aux[0] = scales[j] & 0x3f3f; aux[1] = scales[j + 2] & 0x3f3f; }
+    else { aux[0] = ((scales[j + 2] >> 0) & 0x0f0f) | ((scales[j - 2] & 0xc0c0) >> 2);
+           aux[1] = ((scales[j + 2] >> 4) & 0x0f0f) | ((scales[j]     & 0xc0c0) >> 2); }
+    const unsigned char* sc = (const unsigned char*)aux; const unsigned char* mn = sc + 2;
+    const float2 dm3f = __half22float2(bq3->dm);
+    int v[2][2];
+    #pragma unroll
+    for (int i = 0; i < 2; i++) {
+        const int s = 2 * j + i;
+        v[i][0] = ((vl >> (2 * i))     & 0x03030303) | (((hlo >> s) & 0x01010101) << 2);
+        v[i][1] = ((vl >> (2 * i + 4)) & 0x03030303) | (((hhi >> s) & 0x01010101) << 2);
+    }
+    #pragma unroll
+    for (int r = 0; r < MMAX; r++) {
+        if (r >= M) break;
+        const si_block_q8_1* base = bq8_1 + (size_t)r * row_blocks;
+        float sumf_d = 0.f, sumf_m = 0.f;
+        #pragma unroll
+        for (int i = 0; i < 2; i++) {
+            const si_block_q8_1* bq8i = base + 2 * j + i;
+            const float d8 = __low2float(bq8i->ds);
+            const int* q8 = (const int*)bq8i->qs;
+            const int u0 = q8[2 * m4], u1 = q8[2 * m4 + 1];
+            const int dot1 = __dp4a(v[i][0], u0, __dp4a(v[i][1], u1, 0));
+            const int dot2 = __dp4a(0x01010101, u0, __dp4a(0x01010101, u1, 0));
+            sumf_d += d8 * (dot1 * sc[i]);
+            sumf_m += d8 * (dot2 * mn[i]);
+        }
+        // Materialize the block's contribution before adding it, so the expression tree is the
+        // one the one-row helper hands its caller (`tg += si_vec_dot_q3_A(...)`). Folding the
+        // accumulator into the first product instead lets the compiler contract
+        // `acc + dm.x*sumf_d` into an FMA and rounds the pair differently.
+        const float part = dm3f.x * sumf_d - dm3f.y * sumf_m;
+        acc[r] += part;
+    }
+}
+
 // One CTA per output row, weights read as Q3_A. Same tiling, same accumulation order and same
 // 4-warp reduction as gate_up_mmvq2_kernel below -- only the block format differs.
 __global__ void gate_up_q3a_kernel(
@@ -689,6 +743,62 @@ __global__ void gate_up_q3a_muse_kernel(
     #pragma unroll
     for (int m = 16; m > 0; m >>= 1) { tg += __shfl_xor_sync(0xffffffff, tg, m); tu += __shfl_xor_sync(0xffffffff, tu, m); }
     if (lane == 0) h_scratch[f] = q4kf_silu(tg) * tu;
+    if (pdl) si_pdl_lc();
+}
+
+// MULTI-ROW form of gate_up_q3a_muse_kernel. gate_up_q3a_kernel grids (token, f) as
+// `row = blockIdx.x; ts = row / F; f = row % F`, so f is the FAST index and the N CTAs that share
+// an output row's weights sit F = 19968 blocks apart in the grid -- they never co-reside, and
+// gate+up's ~100 MB per layer is streamed once PER TOKEN. Here one CTA owns the output row and
+// walks the token rows inside, so those bytes are read once for the whole batch.
+//
+// Per row the accumulation is unchanged: the same kbx sequence, the same two dots per super-block
+// in the same order, and the same 4-warp shared-memory fold, so every row computes the bits the
+// one-row kernel computes. Dense (top_k == 1) only, which is what expert_ids[0] assumes -- the
+// shape gate below pins it to Muse Glimmer's single-expert FFN.
+template <int H, int F, int MMAX>
+__global__ void gate_up_q3a_muse_rows_kernel(
+    const si_block_q8_1* __restrict__ vy, const unsigned char* __restrict__ gate_q,
+    const unsigned char* __restrict__ up_q, const int* __restrict__ expert_ids,
+    float* __restrict__ h_scratch, int M, int pdl
+) {
+    constexpr int NW = 4, NB = H >> 8, RB = H >> 5;
+    const int f = blockIdx.x;
+    const int e = expert_ids[0];
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, tid = threadIdx.x;
+    const int kbx0 = tid >> 4, kqs = 2 * (tid & 15);
+    const si_block_q3_A* g_row = reinterpret_cast<const si_block_q3_A*>(gate_q + ((size_t)e * F + f) * NB * sizeof(si_block_q3_A));
+    const si_block_q3_A* u_row = reinterpret_cast<const si_block_q3_A*>(up_q + ((size_t)e * F + f) * NB * sizeof(si_block_q3_A));
+    float tg[MMAX], tu[MMAX];
+    #pragma unroll
+    for (int r = 0; r < MMAX; r++) { tg[r] = 0.f; tu[r] = 0.f; }
+    #pragma unroll
+    for (int kbx = kbx0; kbx < NB; kbx += 8) {
+        si_vec_dot_q3_A_rows<MMAX>(g_row + kbx, vy + (size_t)kbx * 8, RB, kqs, M, tg);
+        si_vec_dot_q3_A_rows<MMAX>(u_row + kbx, vy + (size_t)kbx * 8, RB, kqs, M, tu);
+    }
+    __shared__ float sg[MMAX][NW - 1][32], su[MMAX][NW - 1][32];
+    if (warp > 0) {
+        #pragma unroll
+        for (int r = 0; r < MMAX; r++) {
+            if (r >= M) break;
+            sg[r][warp - 1][lane] = tg[r]; su[r][warp - 1][lane] = tu[r];
+        }
+    }
+    __syncthreads();
+    if (warp > 0) return;
+    #pragma unroll
+    for (int r = 0; r < MMAX; r++) {
+        if (r >= M) break;
+        #pragma unroll
+        for (int w = 0; w < NW - 1; ++w) { tg[r] += sg[r][w][lane]; tu[r] += su[r][w][lane]; }
+        #pragma unroll
+        for (int s = 16; s > 0; s >>= 1) {
+            tg[r] += __shfl_xor_sync(0xffffffff, tg[r], s);
+            tu[r] += __shfl_xor_sync(0xffffffff, tu[r], s);
+        }
+        if (lane == 0) h_scratch[(size_t)r * F + f] = q4kf_silu(tg[r]) * tu[r];
+    }
     if (pdl) si_pdl_lc();
 }
 
@@ -2012,10 +2122,27 @@ void launch_moe_expert_ffn_q4k(
         if (gate_type == SI_QTYPE_Q3A) {
             static int q3_spec = -1;
             if (q3_spec < 0) { const char* e = getenv("SPARKINFER_MUSE_Q3A_SPEC"); q3_spec = (e && e[0] == '0') ? 0 : 1; }
+            // SPARKINFER_MUSE_Q3A_ROWS=0 sends a multi-row batch back to the per-token grid.
+            static int q3_rows = -1;
+            if (q3_rows < 0) { const char* e = getenv("SPARKINFER_MUSE_Q3A_ROWS"); q3_rows = (e && e[0] == '0') ? 0 : 1; }
             if (q3_spec && num_tokens == 1 && top_k == 1 && hidden == 6656 && ffn == 19968)
                 launch_pdl_kernel(gu_pdl, dim3(19968), dim3(4 * 32), 0, stream, gate_up_q3a_muse_kernel<6656, 19968>,
                     q, reinterpret_cast<const unsigned char*>(gate_q), reinterpret_cast<const unsigned char*>(up_q), expert_ids, h_scratch, gu_pdl);
-            else
+            else if (q3_rows && num_tokens > 1 && top_k == 1 && hidden == 6656 && ffn == 19968) {
+                // Chunked at the register width the multi-row body carries. Wider than 8 rows the
+                // per-row accumulators start to spill, and 8 already turns the per-token weight
+                // stream into one pass for a batch that size.
+                constexpr int MMAX = 8;
+                for (int t0 = 0; t0 < num_tokens; t0 += MMAX) {
+                    const int m = (num_tokens - t0) < MMAX ? (num_tokens - t0) : MMAX;
+                    launch_pdl_kernel(gu_pdl, dim3(19968), dim3(4 * 32), 0, stream,
+                        gate_up_q3a_muse_rows_kernel<6656, 19968, MMAX>,
+                        q + (size_t)t0 * (6656 >> 5),
+                        reinterpret_cast<const unsigned char*>(gate_q),
+                        reinterpret_cast<const unsigned char*>(up_q), expert_ids,
+                        h_scratch + (size_t)t0 * 19968, m, gu_pdl);
+                }
+            } else
                 launch_pdl_kernel(gu_pdl, dim3(num_tokens * top_k * ffn), dim3(4 * 32), 0, stream, gate_up_q3a_kernel,
                     q, reinterpret_cast<const unsigned char*>(gate_q), reinterpret_cast<const unsigned char*>(up_q), expert_ids, h_scratch,
                     hidden, ffn, top_k, gu_pdl);
