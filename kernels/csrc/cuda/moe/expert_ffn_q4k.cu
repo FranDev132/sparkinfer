@@ -2336,12 +2336,38 @@ void launch_moe_expert_ffn_q4k(
             // down_q4k_mmvq_splitk_rows_kernel. SPARKINFER_DOWN_ROWS=0 restores the per-token grid.
             static int down_rows = -1;
             if (down_rows < 0) { const char* e = getenv("SPARKINFER_DOWN_ROWS"); down_rows = (e && e[0] == '0') ? 0 : 1; }
-            if (down_rows && num_tokens >= 2 && num_tokens <= 8 && top_k == 1) {
+            // Chunked rather than capped. The rows kernel is instantiated for 2..8 rows, and a
+            // batch wider than that used to decline outright and hand the WHOLE batch to the
+            // per-token grid below -- which reads the down projection once per token, so 16
+            // concurrent rows re-read it 16 times instead of twice. Walk it in 8-row chunks
+            // instead: ceil(M/8) passes over the weights, exactly what the gate/up rows arm beside
+            // it already does with its own MMAX. Each chunk is an independent set of output rows
+            // (output[t*H+hh] is a pure store, no accumulation across rows), so the split changes
+            // nothing a row computes.
+            //
+            // A one-row tail has no instantiation (the launcher declines M < 2), so when the
+            // remainder would be 1 the preceding chunk gives up a row and the tail runs as 2.
+            if (down_rows && num_tokens >= 2 && top_k == 1) {
+                constexpr int DMAX = 8;
                 dim3 dnr(1, (hidden + RPB - 1) / RPB);
-                if (launch_down_q4k_mmvq_splitk_rows(S, num_tokens, pdl, dnr,
-                        reinterpret_cast<const unsigned char*>(down_q), expert_ids, expert_weights, hq8,
-                        reinterpret_cast<__nv_bfloat16*>(output), hidden, ffn, top_k, stream))
-                    return;
+                const size_t q8pb = (size_t)(ffn >> 5);
+                bool rows_ok = true;
+                for (int t0 = 0; t0 < num_tokens && rows_ok; ) {
+                    int m = num_tokens - t0;
+                    if (m > DMAX) { m = DMAX; if (num_tokens - t0 - m == 1) m = DMAX - 1; }
+                    rows_ok = launch_down_q4k_mmvq_splitk_rows(S, m, pdl, dnr,
+                        reinterpret_cast<const unsigned char*>(down_q),
+                        expert_ids + (size_t)t0 * top_k,
+                        expert_weights + (size_t)t0 * top_k,
+                        hq8 + (size_t)t0 * q8pb,
+                        reinterpret_cast<__nv_bfloat16*>(output) + (size_t)t0 * hidden,
+                        hidden, ffn, top_k, stream);
+                    t0 += m;
+                }
+                // A chunk that declined leaves the rows it already wrote correct, and the
+                // per-token grid below recomputes every row to the same values, so falling
+                // through is safe.
+                if (rows_ok) return;
             }
             dim3 dns(num_tokens, (hidden + RPB - 1) / RPB);
             if (launch_down_q4k_mmvq_splitk(S, pdl, dns,

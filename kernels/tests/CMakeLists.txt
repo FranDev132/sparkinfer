@@ -13,3 +13,14 @@ if(BUILD_NVFP4_KERNELS)
   add_test(NAME prefill_nvfp4_gpu_test COMMAND prefill_nvfp4_gpu_test)
   set_tests_properties(prefill_nvfp4_gpu_test PROPERTIES SKIP_RETURN_CODE 77)
 endif()
+
+# The chunked row-batched down projection against the same rows run as their own batch. The rows
+# kernel is instantiated for 2..8, so a wider decode batch is walked in chunks and every chunk past
+# the first reads its inputs at an offset -- this pins that arithmetic.
+add_executable(down_rows_chunk_gpu_test down_rows_chunk_gpu_test.cpp)
+# sparkinfer_kernels, not the individual archives: it wraps them in --start-group so the
+# single-pass linker scan cannot drop a member (see the note in kernels/CMakeLists.txt).
+target_link_libraries(down_rows_chunk_gpu_test PRIVATE sparkinfer_kernels CUDA::cudart)
+set_target_properties(down_rows_chunk_gpu_test PROPERTIES CXX_STANDARD 17)
+add_test(NAME down_rows_chunk_gpu_test COMMAND down_rows_chunk_gpu_test)
+set_tests_properties(down_rows_chunk_gpu_test PROPERTIES SKIP_RETURN_CODE 77)
