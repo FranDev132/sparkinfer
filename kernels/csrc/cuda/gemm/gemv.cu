@@ -3813,6 +3813,158 @@ void launch_mmvq_q4k_f32(const void* q81, const void* W, float* y, int N, int K,
     else if (K == 5120) si_mmvq_q4k_kfixed_kernel<float, 20><<<N, 4 * 32, 0, stream>>>(q, w, y, N);
     else                si_mmvq_q4k_kernel<float><<<N, 4 * 32, 0, stream>>>(q, w, y, N, K);
 }
+// ---- Q4_K attention projections on the int8 tensor cores ----
+// The rows MMVQ below redoes its dot product once per row, so a 32-row packed batch is chunked into
+// four 8-row launches and re-reads the weights four times. This dequantises inside the mainloop
+// instead: m16n8k32 spans exactly 32 K, which is exactly one Q4_K scale group, so the group scales
+// fold in per-mma with the accumulator still in registers. Same arithmetic as si_vec_dot_q4_K.
+// Not bit-identical to the MMVQ (different reduction order), so it is gated to wide batches.
+namespace {
+constexpr int SI_AM_BN = 32, SI_AM_MMAX = 32, SI_AM_NW = 4;
+
+__device__ __forceinline__ int si_am_swz(int k, int row) {
+    return (((k >> 4) ^ (row & 3)) << 4) | (k & 15);
+}
+__device__ __forceinline__ void si_am_ldm(unsigned& r0, unsigned& r1, unsigned& r2, unsigned& r3,
+                                          const signed char* p) {
+    const unsigned a = (unsigned)__cvta_generic_to_shared(p);
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                 : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3) : "r"(a));
+}
+__device__ __forceinline__ void si_am_scales(const unsigned char* sc12, int j,
+                                             unsigned char& a0, unsigned char& a1,
+                                             unsigned char& b0, unsigned char& b1) {
+    const unsigned short* s = reinterpret_cast<const unsigned short*>(sc12);
+    unsigned short aux[2];
+    if (j < 2) { aux[0] = s[j] & 0x3f3f; aux[1] = s[j + 2] & 0x3f3f; }
+    else       { aux[0] = ((s[j + 2] >> 0) & 0x0f0f) | ((s[j - 2] & 0xc0c0) >> 2);
+                 aux[1] = ((s[j + 2] >> 4) & 0x0f0f) | ((s[j]     & 0xc0c0) >> 2); }
+    const unsigned char* u = reinterpret_cast<const unsigned char*>(aux);
+    a0 = u[0]; a1 = u[1]; b0 = u[2]; b1 = u[3];
+}
+}  // namespace
+
+__global__ __launch_bounds__(SI_AM_NW * 32, 8)
+void si_mmvq_q4k_mma_kernel(const si_block_q8_1* __restrict__ q, const unsigned char* __restrict__ W,
+                            __nv_bfloat16* __restrict__ y, int M, int N, int K) {
+    const int nblk = K >> 8;
+    const int n0 = blockIdx.x * SI_AM_BN;
+    const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+    const int grp = lane >> 2, tig = lane & 3, sub = lane >> 3, lrow = lane & 7;
+
+    __shared__ signed char As[SI_AM_MMAX][256];
+    __shared__ signed char Bs[SI_AM_BN][256];
+    __shared__ unsigned char Ssc[SI_AM_BN][8], Smn[SI_AM_BN][8];
+    __shared__ float2 Wdm[SI_AM_BN];
+    __shared__ float Ad[SI_AM_MMAX][8], Asum[SI_AM_MMAX][8];
+
+    float facc[2][4];
+    #pragma unroll
+    for (int i = 0; i < 2; i++)
+        #pragma unroll
+        for (int e = 0; e < 4; e++) facc[i][e] = 0.f;
+
+    for (int sb = 0; sb < nblk; sb++) {
+        for (int u = tid; u < SI_AM_BN * 16; u += SI_AM_NW * 32) {
+            const int r = u >> 4, c = u & 15;
+            const int gn = n0 + r;
+            const si_block_q4_K* b = reinterpret_cast<const si_block_q4_K*>(
+                W + (size_t)(gn < N ? gn : N - 1) * (size_t)nblk * 144) + sb;
+            const int j = c >> 2, sc_ = c & 3;
+            const bool hi = (sc_ >> 1) & 1;
+            const unsigned* src = reinterpret_cast<const unsigned*>(b->qs + 32 * j + (sc_ & 1) * 16);
+            signed char out[16];
+            #pragma unroll
+            for (int v = 0; v < 4; v++) {
+                const unsigned x = src[v];
+                #pragma unroll
+                for (int t = 0; t < 4; t++) {
+                    const unsigned char qq = (unsigned char)((x >> (8 * t)) & 0xFF);
+                    out[4 * v + t] = (signed char)(hi ? (qq >> 4) : (qq & 0xF));
+                }
+            }
+            const int kb = 64 * j + (sc_ >> 1) * 32 + (sc_ & 1) * 16;
+            *reinterpret_cast<uint4*>(&Bs[r][si_am_swz(kb, r)]) = *reinterpret_cast<const uint4*>(out);
+            if (c == 0) {
+                Wdm[r] = __half22float2(b->dm);
+                #pragma unroll
+                for (int jj = 0; jj < 4; jj++) {
+                    unsigned char x0, x1, y0, y1;
+                    si_am_scales(b->scales, jj, x0, x1, y0, y1);
+                    Ssc[r][2 * jj] = x0; Ssc[r][2 * jj + 1] = x1;
+                    Smn[r][2 * jj] = y0; Smn[r][2 * jj + 1] = y1;
+                }
+            }
+        }
+        // q8_1's qs is at offset 4 of a 36B struct: 4B-aligned, never 16B. Read four uints.
+        for (int u = tid; u < M * 16; u += SI_AM_NW * 32) {
+            const int r = u >> 4, c = u & 15;
+            const si_block_q8_1* a = q + (size_t)r * (K >> 5) + sb * 8 + (c >> 1);
+            const unsigned* src = reinterpret_cast<const unsigned*>(a->qs + (c & 1) * 16);
+            uint4 v; v.x = src[0]; v.y = src[1]; v.z = src[2]; v.w = src[3];
+            *reinterpret_cast<uint4*>(&As[r][si_am_swz(16 * c, r)]) = v;
+            if ((c & 1) == 0) {
+                const float2 ds = __half22float2(a->ds);
+                Ad[r][c >> 1] = ds.x; Asum[r][c >> 1] = ds.y;
+            }
+        }
+        __syncthreads();
+
+        #pragma unroll 1
+        for (int g = 0; g < 8; g++) {
+            const int kk = g * 32;
+            unsigned af[2][4], bf0, bf1, bx, by;
+            #pragma unroll
+            for (int i = 0; i < 2; i++) {
+                const int row = i * 16 + (sub & 1) * 8 + lrow;
+                si_am_ldm(af[i][0], af[i][1], af[i][2], af[i][3],
+                          &As[row < SI_AM_MMAX ? row : 0][si_am_swz(kk + (sub >> 1) * 16, row)]);
+            }
+            const int col = warp * 8 + lrow;
+            si_am_ldm(bf0, bf1, bx, by, &Bs[col][si_am_swz(kk + (sub & 1) * 16, col)]);
+            (void)bx; (void)by;
+            #pragma unroll
+            for (int i = 0; i < 2; i++) {
+                int acc[4] = {0, 0, 0, 0};
+                asm volatile(
+                    "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
+                    "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+                    : "+r"(acc[0]), "+r"(acc[1]), "+r"(acc[2]), "+r"(acc[3])
+                    : "r"(af[i][0]), "r"(af[i][1]), "r"(af[i][2]), "r"(af[i][3]),
+                      "r"(bf0), "r"(bf1));
+                #pragma unroll
+                for (int e = 0; e < 4; e++) {
+                    const int lm = i * 16 + grp + (e >> 1) * 8;
+                    const int ln = warp * 8 + tig * 2 + (e & 1);
+                    if (lm >= M) continue;
+                    const float2 dm = Wdm[ln];
+                    facc[i][e] += dm.x * (float)Ssc[ln][g] * Ad[lm][g] * (float)acc[e]
+                                - dm.y * (float)Smn[ln][g] * Asum[lm][g];
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+    #pragma unroll
+    for (int i = 0; i < 2; i++)
+        #pragma unroll
+        for (int e = 0; e < 4; e++) {
+            const int lm = i * 16 + grp + (e >> 1) * 8;
+            const int gn = n0 + warp * 8 + tig * 2 + (e & 1);
+            if (lm < M && gn < N) y[(size_t)lm * N + gn] = __float2bfloat16(facc[i][e]);
+        }
+}
+
+static inline bool launch_mmvq_q4k_mma_rows(const void* q81, const void* W, void* y,
+                                            int M, int N, int K, cudaStream_t stream) {
+    if (M < 2 || M > SI_AM_MMAX || (K & 255) || (N % SI_AM_BN)) return false;
+    si_mmvq_q4k_mma_kernel<<<dim3(N / SI_AM_BN), dim3(SI_AM_NW * 32), 0, stream>>>(
+        reinterpret_cast<const si_block_q8_1*>(q81), reinterpret_cast<const unsigned char*>(W),
+        reinterpret_cast<__nv_bfloat16*>(y), M, N, K);
+    return true;
+}
+
 bool launch_mmvq_q4k_rows(const void* q81, const void* W, void* y,
                           int M, int N, int K, cudaStream_t stream) {
     // K is templated (KB = K/256 bounds the per-thread accumulators), so only instantiated widths
@@ -3896,6 +4048,22 @@ bool launch_mmvq_rows(int qtype, const void* q81, const void* W, void* y,
     // Chunk instead, exactly as launch_mmvq_rows_f32 already does: MMAX bounds the scratch and
     // the number of predicated row bodies, not the per-row dot or its reduction order, so a row
     // computes the same bits whichever chunk carries it.
+    // A wide batch goes to the tensor cores instead of being chunked: chunking still re-reads the
+    // weights once per chunk and still pays the per-row dot, while the mma kernel reads them once
+    // for the whole batch. It loses at narrow widths, so 24 is a floor and not a preference.
+    // SPARKINFER_MMVQ_MMA=0 keeps every width on the chunked MMVQ.
+    static int mmvq_mma = -1;
+    if (mmvq_mma < 0) { const char* e = getenv("SPARKINFER_MMVQ_MMA"); mmvq_mma = (e && e[0] == '0') ? 0 : 1; }
+    // N is the block count: at N=32 per block, k and v (N=256 on this checkpoint) would launch
+    // eight blocks onto 170 SMs and the per-launch cost swamps the saved weight reads. Only the
+    // wide projections -- q and the attention output -- have enough work to fill the device.
+    static int mmvq_mma_minn = -1;
+    if (mmvq_mma_minn < 0) {
+        const char* e = getenv("SPARKINFER_MMVQ_MMA_MINN");
+        mmvq_mma_minn = e ? atoi(e) : 2048;
+    }
+    if (mmvq_mma && M >= 24 && qtype == 12 && N >= mmvq_mma_minn &&
+        launch_mmvq_q4k_mma_rows(q81, W, y, M, N, K, stream)) return true;
     if (M > 8) {
         for (int r0 = 0; r0 < M; r0 += 8) {
             const int m = (M - r0) < 8 ? (M - r0) : 8;
