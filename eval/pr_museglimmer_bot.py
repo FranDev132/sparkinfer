@@ -367,6 +367,17 @@ def tier_from_gain(pr_tps: float, main_tps: float, metric: str = "decode"):
         return "REJECT", round(pct, 1), False, (
             f"{metric} regression: {pr_tps:.2f} < {100 * REGRESS_TOL:.0f}% of main {main_tps:.2f}"
         )
+    # A measurement wildly above main is a broken forward pass, not a speedup. #1037 reported
+    # muse-decode@128 at 352,667 tok/s against main's 106 (3,300x) while emitting garbage
+    # (top-1 0.000, KL 11.29): a pass that stops computing also stops taking time. Scoring that
+    # as XL would be the worst possible outcome, so it fails closed with a reason that says what
+    # it is. The bound is a RATIO against the same-box baseline, not an absolute ceiling, so it
+    # keeps working as the model gets faster.
+    if pr_tps > IMPLAUSIBLE_GAIN * main_tps:
+        return "REJECT", round(100.0 * (pr_tps - main_tps) / main_tps, 1), False, (
+            f"{metric} implausible: {pr_tps:.2f} is {pr_tps / main_tps:.0f}x main {main_tps:.2f} "
+            f"— treated as a broken measurement, not a speedup"
+        )
     g = (pr_tps - main_tps) / main_tps
     pct = round(100.0 * g, 1)
     if g < SIG:
@@ -376,6 +387,11 @@ def tier_from_gain(pr_tps: float, main_tps: float, metric: str = "decode"):
             return name, pct, True, "ok"
     return "none", pct, True, "ok"
 
+
+# Above this multiple of the same-box main baseline a measurement is treated as broken rather
+# than fast. 20x is far outside anything a real optimization has produced here (the largest to
+# date is ~2.0x on a concurrency axis) and far below #1037's 3,300x.
+IMPLAUSIBLE_GAIN = float(os.environ.get("MUSEGLIMMER_IMPLAUSIBLE_GAIN", "20"))
 
 _TIER_RANK = {"REJECT": -1, "none": 0, "XS": 1, "S": 2, "M": 3, "L": 4, "XL": 5}
 
@@ -1262,8 +1278,18 @@ def eval_museglimmer_on_box(host, port, pr_ref: str, main: dict):
     # regression by tier_from_gain (cur=0 against a real main baseline), which is the fail-closed
     # direction. Only a wholesale sweep failure is reported as a run failure.
     if pr.get("muse_failed") or not (pr.get("muse") or {}):
-        return {"ok": False, "reason": "PR bench produced no Muse Glimmer measurements",
-                "log": (r.stdout or "")[-1500:]}
+        # Lead with the accuracy result when it was measured and failed. A sweep that dropped
+        # contexts is usually the SYMPTOM; "your change makes the model emit garbage" is the
+        # cause, and it is already in hand. #1037 was told only "produced no measurements" while
+        # the same log carried top-1 0.000 / KL 11.29 — sending its author hunting for a harness
+        # problem instead of a correctness bug in their own diff.
+        why = "PR bench produced no Muse Glimmer measurements"
+        t1, kl = pr.get("top1"), pr.get("kl")
+        if t1 is not None and kl is not None and (t1 < ACC_TOP1_BAR or kl > ACC_KL_BAR):
+            why = (f"PR output is incorrect — top-1 {t1:.3f} (bar >={ACC_TOP1_BAR}), "
+                   f"KL {kl:.4f} (bar <={ACC_KL_BAR}); the incomplete speed sweep is a symptom "
+                   f"of that, not a harness fault")
+        return {"ok": False, "reason": why, "log": (r.stdout or "")[-1500:]}
     if "top1" not in pr or "kl" not in pr:
         return {"ok": False, "reason": "PR run missing accuracy METRIC line", "log": (r.stdout or "")[-1500:]}
     for ctx in SCORED_CTXS:
