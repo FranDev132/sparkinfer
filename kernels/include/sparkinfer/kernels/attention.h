@@ -209,6 +209,11 @@ void launch_fa_kv_compact_view(const int* seq_lens, const int* block_table, int*
 // not an optional long-context approximation.
 void launch_fa_kv_compact_view_pure(const int* seq_lens, const int* block_table, int* view_table,
     int* view_len, int block_size, int window_w, int n_view, cudaStream_t stream = nullptr);
+// Per-ROW form for packed continuous-batch decode: N sequences, N compact windows, one launch.
+// block_table is the row-gathered table (stride max_blocks); outputs are [rows][n_view]/[rows].
+void launch_fa_kv_compact_view_pure_rows(const int* seq_lens, const int* block_table,
+    int* view_table, int* view_len, int block_size, int window_w, int n_view, int max_blocks,
+    int rows, cudaStream_t stream = nullptr);
 void launch_flash_decode_split_sparse(const void* q, const void* k_pool_layer, const void* v_pool_layer,
     const int* block_table, const int* seq_lens, const int* sel_blk, float* part_m, float* part_l,
     float* part_acc, int num_q_heads, int num_kv_heads, int head_dim, int block_size, int max_blocks,

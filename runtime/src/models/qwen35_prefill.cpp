@@ -30,6 +30,7 @@
 #include "sparkinfer/kernels/moe.h"
 #include "sparkinfer/kernels/attention.h"
 #include "sparkinfer/models/dflash_kernels.h"
+#include "sparkinfer/kv_ops.h"
 
 #include <cuda_runtime.h>
 #include <algorithm>
@@ -3034,6 +3035,15 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
     return seed;
 }
 
+// SPARKINFER_MUSE_PACKED=0 forces Muse Glimmer back to one-sequence-at-a-time decoding, for an
+// A/B out of one binary.
+static bool muse_packed_on() {
+    static const bool v = [] {
+        const char* e = getenv("SPARKINFER_MUSE_PACKED");
+        return !(e && e[0] == '0');
+    }();
+    return v;
+}
 int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int n, int start_pos,
                             const int* capture_layers, int n_capture, void* capture_dst,
                             int* out_argmax, bool capture_only) {
@@ -3055,7 +3065,15 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
                 n, (int)s.gguf, (int)c.hybrid);
         return -1;
     }
-    if (c.head_dim != 256 || c.linear_head_dim != 128 || c.top_k <= 0 ||
+    // Muse Glimmer takes its own layer body below (`muse`): 128-wide heads, a separate attn_gate
+    // tensor, NORM-convention RoPE on the windowed layers and none at all on the global ones, a
+    // per-layer sliding-window view, and sandwich norms around both blocks. None of that is a
+    // variation on the Qwen3.5/3.6/3.8 layer this function was written for, so it is a branch
+    // rather than a widening -- exactly as prefill_batched_run carries it.
+    const bool muse = c.muse_glimmer && dense && c.head_dim == 128 &&
+                      c.sliding_window > 0 && muse_packed_on();
+    const bool hd_ok = (c.head_dim == 256) || muse;
+    if (!hd_ok || c.linear_head_dim != 128 || c.top_k <= 0 ||
         (!dense && c.n_experts != 256)) {
         fprintf(stderr, "[dflash-verify] shape unsupported hd=%d lhd=%d experts=%d topk=%d dense=%d\n",
                 c.head_dim, c.linear_head_dim, c.n_experts, c.top_k, (int)dense);
@@ -3272,17 +3290,49 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
     int* out_ids = a.alloc<int>(NA);
     const size_t q81_stride_max = kernels::llama_q8_1_bytes(std::max(H, lvdim));
     void* q81 = a.alloc<unsigned char>((size_t)NA * q81_stride_max);
+    // Muse Glimmer's windowed layers score against a compact sliding-window view, and the split
+    // count that view wants is chosen for the VIEW's length rather than the sequence's -- 64 at a
+    // 2048-token window against the model's adaptive n_splits. Both are per-model constants, so
+    // sizing the partials for the larger keeps the arena layout identical across graph tiers.
+    const int swa_bs = s.kv->block_size();
+    const int swa_budget = muse ? (c.sliding_window + swa_bs - 1) / swa_bs : 0;
+    int swa_vsplits = 1;
+    if (muse) {
+        swa_vsplits = (swa_budget * swa_bs) / 32;   // same rule as qwen35.cpp's swa_vsplits
+        if (swa_vsplits > 256) swa_vsplits = 256;
+        if (swa_vsplits < 1) swa_vsplits = 1;
+    }
     const int ns = std::max(1, s.n_splits);
-    float* fa_m = a.alloc<float>((size_t)NA * c.n_q_heads * ns);
-    float* fa_l = a.alloc<float>((size_t)NA * c.n_q_heads * ns);
-    float* fa_acc = a.alloc<float>((size_t)NA * c.n_q_heads * ns * c.head_dim);
-    // Compact recurrence records retained until posterior selection.
-    bf16* rec_qkv = a.alloc<bf16>((size_t)c.n_layers * NA * lqkv);
-    bf16* rec_k = a.alloc<bf16>((size_t)c.n_layers * NA * s.linear_qdim);
-    bf16* rec_v = a.alloc<bf16>((size_t)c.n_layers * NA * lvdim);
-    bf16* rec_a = a.alloc<bf16>((size_t)c.n_layers * NA * vh);
-    bf16* rec_b = a.alloc<bf16>((size_t)c.n_layers * NA * vh);
-    if (!a.ok) { fprintf(stderr, "[dflash-verify] scratch allocation failed\n"); return -1; }
+    const int nsa = ns > swa_vsplits ? ns : swa_vsplits;
+    float* fa_m = a.alloc<float>((size_t)NA * c.n_q_heads * nsa);
+    float* fa_l = a.alloc<float>((size_t)NA * c.n_q_heads * nsa);
+    float* fa_acc = a.alloc<float>((size_t)NA * c.n_q_heads * nsa * c.head_dim);
+    // One compact window per row: the packed rows are independent sequences, so each needs its
+    // own logical->physical map and its own view length.
+    int* swa_vtbl = muse ? a.alloc<int>((size_t)NA * swa_budget) : nullptr;
+    int* swa_vlen = muse ? a.alloc<int>(NA) : nullptr;
+    // Compact recurrence records retained until posterior selection. Only the Gated-DeltaNet
+    // branch writes or reads them, so a stack with no linear-attention layer (Muse Glimmer, whose
+    // full_attn_interval is 0) allocates ~48 MB of arena it can never touch -- and this arena is
+    // sized for the WIDEST tier, so it is 48 MB claimed on every model that carries the flag
+    // without carrying the layers. At c=32 on a full card that is the difference between the
+    // packed forward running and declining outright.
+    bool any_linear = false;
+    for (int L = 0; L < c.n_layers && !any_linear; ++L) any_linear = s.w.layers[L].linear_attn != 0;
+    bf16* rec_qkv = any_linear ? a.alloc<bf16>((size_t)c.n_layers * NA * lqkv) : nullptr;
+    bf16* rec_k = any_linear ? a.alloc<bf16>((size_t)c.n_layers * NA * s.linear_qdim) : nullptr;
+    bf16* rec_v = any_linear ? a.alloc<bf16>((size_t)c.n_layers * NA * lvdim) : nullptr;
+    bf16* rec_a = any_linear ? a.alloc<bf16>((size_t)c.n_layers * NA * vh) : nullptr;
+    bf16* rec_b = any_linear ? a.alloc<bf16>((size_t)c.n_layers * NA * vh) : nullptr;
+    if (!a.ok) {
+        // Name the size. "allocation failed" alone reads as a bug; on a full card it is the card
+        // being full, and the prefill path's own fallback message already reports it that way.
+        size_t vfree = 0, vtot = 0;
+        cudaMemGetInfo(&vfree, &vtot);
+        fprintf(stderr, "[dflash-verify] scratch allocation failed (arena=%zu MB, free=%zu/%zu MB)\n",
+                a.total() >> 20, vfree >> 20, vtot >> 20);
+        return -1;
+    }
 
     static thread_local int* ph_ids = nullptr;
     static thread_local int* ph_pos = nullptr;
@@ -3688,6 +3738,18 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
             dflash_kernels::launch_broadcast_rows_i32(btable, btab_rows, mbs, N, st);
     }
     kernels::launch_embedding(ids, s.w.embed_tokens, x, N, H, st);
+    if (muse) {
+        // Unweighted RMSNorm of the embedding before layer 0 (emb_norm_ones is a constant-1.0
+        // "weight"), exactly as AR decode and the batched prefill do.
+        if (s.emb_norm_ones)
+            kernels::launch_rmsnorm(x, s.emb_norm_ones, x, N, H, c.rms_eps, st);
+        // Materialize every row's pure sliding-window view once per step: the logical->physical
+        // block map and the view length are shared by all 39 windowed layers, only the per-layer
+        // K/V pool rows differ. Inside the capture, so a replay tracks each sequence as it grows.
+        kernels::launch_fa_kv_compact_view_pure_rows(
+            seq, btab_rows ? btab_rows : btable, swa_vtbl, swa_vlen,
+            bs, swa_budget, swa_budget, mbs, N, st);
+    }
     kernels::launch_rmsnorm(x, s.w.layers[0].input_norm, xn, N, H, c.rms_eps, st);
     for (int L = 0; L < c.n_layers && supported; ++L) {
         // Reset the dp4a activation cache every layer. `xn` is the SAME buffer at every layer, so
@@ -3710,6 +3772,96 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
         vdbg_snapshot(xn, L);
         if (L == 0) vdbg_snapshot2(x, 4);   // raw pre-norm residual stream (h = x + ao)
         const Qwen35LayerWeights& w = s.w.layers[L];
+        if (muse) {
+            // ---- MUSE GLIMMER LAYER (packed continuous-batch decode) ----
+            // Every kernel here is the one AR decode already drives for this architecture
+            // (qwen35.cpp's c.muse_glimmer branches), taken at N rows instead of one. The rows
+            // are N independent sequences, so each carries its own position and its own KV block
+            // table, and the row-indexed forms of the append/attention kernels are exactly the
+            // ones that read those per row.
+            //
+            // Muse keeps attn_gate as its OWN [qdim, H] tensor rather than the [q|gate] interleave
+            // every other architecture here ships, so Q goes straight to qb and the gate straight
+            // to qg. Projecting w.wq as one 2*qdim-wide matrix would read qdim rows PAST it.
+            supported = proj(xn, w.wq, w.wq_type, qb, qdim, H) &&
+                        w.wgate && proj(xn, w.wgate, w.wgate_type, qg, qdim, H) &&
+                        proj(xn, w.wk, w.wk_type, kf, kvdim, H) &&
+                        proj(xn, w.wv, w.wv_type, vf, kvdim, H);
+            if (!supported) break;
+            // QK-norm is per HEAD vector, so N tokens is just N*heads rows of the same kernel.
+            kernels::launch_rmsnorm(qb, w.q_norm, qb, N * c.n_q_heads,  c.head_dim, c.rms_eps, st);
+            kernels::launch_rmsnorm(kf, w.k_norm, kf, N * c.n_kv_heads, c.head_dim, c.rms_eps, st);
+            char* kp = static_cast<char*>(s.kv->k_pool()) +
+                       s.kv->layer_base_elems(L) * kv_elem;
+            char* vp = static_cast<char*>(s.kv->v_pool()) +
+                       s.kv->layer_base_elems(L) * kv_elem;
+            char* ks = kv8 ? static_cast<char*>(s.kv->k_scale_pool()) +
+                             s.kv->scale_layer_base_elems(L) * 2 : nullptr;
+            char* vs = kv8 ? static_cast<char*>(s.kv->v_scale_pool()) +
+                             s.kv->scale_layer_base_elems(L) * 2 : nullptr;
+            // Windowed layers rotate the CONSECUTIVE pair (LLAMA_ROPE_TYPE_NORM, not the NeoX
+            // split-half pairing the rest of this file uses); the every-4th global layers are
+            // NoPE and append K/V unrotated. Both flavours index block_table[row*max_blocks+blk]
+            // and positions[row], which is what makes them correct for packed rows unchanged.
+            const int* rtab = btab_rows ? btab_rows : btable;
+            if (kv8) {
+                kernels::launch_muse_kv_append_int8(
+                    qb, kf, vf, kp, vp, ks, vs, rtab, pos, N,
+                    c.n_q_heads, c.n_kv_heads, c.head_dim, c.rope_theta,
+                    /*rope_normal=*/w.swa != 0, bs, mbs, st);
+            } else if (w.swa) {
+                kernels::launch_rope_kv_append_normal(
+                    qb, kf, vf, kp, vp, rtab, pos, N,
+                    c.n_q_heads, c.n_kv_heads, c.head_dim, c.rope_theta, bs, mbs, st);
+            } else {
+                launch_kv_append(kp, vp, kf, vf, rtab, pos, N,
+                                 c.n_kv_heads, c.head_dim, bs, mbs, st);
+            }
+            // Windowed layer: same flash-decode entry point, pointed at this row's compact view
+            // instead of the full KV. Global layer: full causal over the real table.
+            if (w.swa) {
+                kernels::launch_flash_decode_split(
+                    qb, kp, vp, swa_vtbl, swa_vlen, att, fa_m, fa_l, fa_acc,
+                    N, c.n_q_heads, c.n_kv_heads, c.head_dim, bs, swa_budget, swa_vsplits,
+                    1.f / sqrtf((float)c.head_dim), st, nullptr, swa_budget * bs,
+                    ks, vs, kv8 ? 1 : 0);
+            } else {
+                kernels::launch_flash_decode_split(
+                    qb, kp, vp, rtab, seq, att, fa_m, fa_l, fa_acc,
+                    N, c.n_q_heads, c.n_kv_heads, c.head_dim, bs, mbs, ns,
+                    1.f / sqrtf((float)c.head_dim), st, nullptr,
+                    packed ? packed_seq_hint : start_pos + N,
+                    ks, vs, kv8 ? 1 : 0);
+            }
+            kernels::launch_qwen36_mul_sigmoid(att, qg, N * qdim, st);
+            supported = proj(att, w.wo, w.wo_type, ao, H, qdim);
+            if (!supported) break;
+            if (L == 0) vdbg_snapshot2(ao, 0);
+            // Sandwich norm (post-attn): h = x + RMSNorm(ao) * post_attn_norm -- the attention
+            // output is normed ALONE and then added, and that norm uses its own 1e-8 post_norm_eps
+            // rather than the model's rms_eps. ffn_norm is a genuine separate pre-FFN norm here,
+            // not post_attn_norm doing double duty like every other architecture in this file.
+            kernels::launch_norm_then_add(x, ao, w.post_attn_norm, h, N, H, 1e-8f, st);
+            kernels::launch_rmsnorm(h, w.ffn_norm, hn, N, H, c.rms_eps, st);
+            if (L == 0) { vdbg_snapshot2(h, 1); vdbg_snapshot2(hn, 2); }
+            // Dense SwiGLU through the same one-expert call AR decode makes, at N rows.
+            quant_rows(hn, H);
+            kernels::launch_moe_expert_ffn_q4k(hn, w.gate_q, w.up_q, w.down_q,
+                                               w.gate_qtype, w.up_qtype, w.down_qtype,
+                                               expert_ids, expert_w, routed, moe_h, moe_out,
+                                               N, topk, H, ffn, q81, st);
+            if (L == 0) vdbg_snapshot2(routed, 3);
+            // Sandwich norm (post-FFN): x = h + RMSNorm(routed) * post_ffn_norm, same 1e-8.
+            kernels::launch_norm_then_add(h, routed, w.post_ffn_norm, x, N, H, 1e-8f, st);
+            const void* nn = (L + 1 < c.n_layers) ? s.w.layers[L + 1].input_norm : s.w.final_norm;
+            kernels::launch_rmsnorm(x, nn, xn, N, H, c.rms_eps, st);
+            // The Q8_1 memo is keyed on the buffer that produced it; xn is a fresh value in the
+            // SAME buffer, so leaving the key set would hand the next layer's projections the
+            // PREVIOUS layer's quantization. Nothing here emits Q8_1(xn), so clear it outright.
+            q81_src = nullptr; q81_k = 0;
+            capture(L);
+            continue;
+        }
         if (w.linear_attn) {
             bf16* rq = rec_qkv + (size_t)L * N * lqkv;
             bf16* rk = rec_k + (size_t)L * N * s.linear_qdim;
@@ -4440,6 +4592,12 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
         abandon_capture();
         return -1;
     }
+    // Muse Glimmer softcaps the logits before the argmax (decode qwen35.cpp:2322, batched
+    // prefill above). Skipping it here would let a row pick a different token than AR decode
+    // would for the same state.
+    if (muse && c.final_logit_softcapping > 0.f)
+        kernels::launch_logit_softcap(logits, N, c.vocab, c.logit_scale,
+                                      c.final_logit_softcapping, st);
     kernels::launch_argmax(logits, out_ids, N, c.vocab, st);
     pf_cu(cudaMemcpyAsync(ph_out, out_ids, (size_t)N * sizeof(int), cudaMemcpyDeviceToHost, st),
           "verify argmax");

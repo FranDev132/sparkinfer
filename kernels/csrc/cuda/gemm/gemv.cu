@@ -3822,7 +3822,11 @@ bool launch_mmvq_q4k_rows(const void* q81, const void* W, void* y,
     // the token loop, and DFlash speculation could never engage on Qwen3.8 at all. 20 (5120) and
     // 24 (6144) are added for exactly that.
     if (M < 1 || M > 8 || N < 1) return false;
-    if (K != 2048 && K != 4096 && K != 5120 && K != 6144) return false;
+    // 26 (6656) is Muse Glimmer's hidden size, added for the same reason 20/24 were: every Q4_K
+    // projection off xn -- wq, the separate q-gate wgate, wk, wv -- is K=6656 there, so without it
+    // this launcher refuses the whole model and any multi-row Muse path (packed continuous-batch
+    // decode, speculation) silently falls back to one row at a time.
+    if (K != 2048 && K != 4096 && K != 5120 && K != 6144 && K != 6656) return false;
     // Dispatch the tightest instantiated row width: MMAX bounds tmp[]/partial[] and the
     // number of predicated row bodies, so a 6-row block should not pay an 8-row footprint.
     const auto* q = reinterpret_cast<const si_block_q8_1*>(q81);
@@ -3837,23 +3841,30 @@ bool launch_mmvq_q4k_rows(const void* q81, const void* W, void* y,
     if      (K == 2048) SI_Q4K_ROWS_DISPATCH(8);
     else if (K == 4096) SI_Q4K_ROWS_DISPATCH(16);
     else if (K == 5120) SI_Q4K_ROWS_DISPATCH(20);
-    else                SI_Q4K_ROWS_DISPATCH(24);
+    else if (K == 6144) SI_Q4K_ROWS_DISPATCH(24);
+    else                SI_Q4K_ROWS_DISPATCH(26);
     #undef SI_Q4K_ROWS_DISPATCH
     return true;
 }
 bool launch_mmvq_q6k_rows(const void* q81, const void* W, void* y,
                           int M, int N, int K, cudaStream_t stream) {
-    if (M < 1 || M > 8 || N < 1 || (K != 2048 && K != 4096)) return false;
+    // 26 (6656) is Muse Glimmer's hidden size. A Q4_K_M file gives half its layers a Q6_K
+    // attn_v, so without this width every one of those layers refuses the multi-row path -- and
+    // refuses it SILENTLY, since a false here is indistinguishable at the call site from "this
+    // weight type is not implemented". Same reason 20/24 were added to the Q4_K launcher above.
+    if (M < 1 || M > 8 || N < 1 || (K != 2048 && K != 4096 && K != 6656)) return false;
     const auto* q = reinterpret_cast<const si_block_q8_1*>(q81);
     const auto* w = reinterpret_cast<const unsigned char*>(W);
     auto* out = reinterpret_cast<__nv_bfloat16*>(y);
-    if (K == 2048) {
-        if (M <= 6) si_mmvq_q6k_rows_exact_kernel<__nv_bfloat16, 8, 6><<<N, 4 * 32, 0, stream>>>(q, w, out, M, N);
-        else        si_mmvq_q6k_rows_exact_kernel<__nv_bfloat16, 8, 8><<<N, 4 * 32, 0, stream>>>(q, w, out, M, N);
-    } else {
-        if (M <= 6) si_mmvq_q6k_rows_exact_kernel<__nv_bfloat16, 16, 6><<<N, 4 * 32, 0, stream>>>(q, w, out, M, N);
-        else        si_mmvq_q6k_rows_exact_kernel<__nv_bfloat16, 16, 8><<<N, 4 * 32, 0, stream>>>(q, w, out, M, N);
-    }
+    #define SI_Q6K_ROWS_DISPATCH(KB) \
+        do { \
+            if (M <= 6) si_mmvq_q6k_rows_exact_kernel<__nv_bfloat16, KB, 6><<<N, 4 * 32, 0, stream>>>(q, w, out, M, N); \
+            else        si_mmvq_q6k_rows_exact_kernel<__nv_bfloat16, KB, 8><<<N, 4 * 32, 0, stream>>>(q, w, out, M, N); \
+        } while (0)
+    if      (K == 2048) SI_Q6K_ROWS_DISPATCH(8);
+    else if (K == 4096) SI_Q6K_ROWS_DISPATCH(16);
+    else                SI_Q6K_ROWS_DISPATCH(26);
+    #undef SI_Q6K_ROWS_DISPATCH
     return true;
 }
 bool launch_mmvq_q80_rows(const void* q81, const void* W, void* y,
@@ -3879,6 +3890,23 @@ bool launch_mmvq_q80_rows(const void* q81, const void* W, void* y,
 }
 bool launch_mmvq_rows(int qtype, const void* q81, const void* W, void* y,
                       int M, int N, int K, cudaStream_t stream) {
+    // Every rows kernel below carries exact, compile-time-bounded row bodies only to M=8, so a
+    // wider batch used to be refused outright -- and a refusal here declines the WHOLE packed
+    // forward, which then decodes its rows one at a time and re-reads every weight once per row.
+    // Chunk instead, exactly as launch_mmvq_rows_f32 already does: MMAX bounds the scratch and
+    // the number of predicated row bodies, not the per-row dot or its reduction order, so a row
+    // computes the same bits whichever chunk carries it.
+    if (M > 8) {
+        for (int r0 = 0; r0 < M; r0 += 8) {
+            const int m = (M - r0) < 8 ? (M - r0) : 8;
+            if (!launch_mmvq_rows(qtype,
+                                  reinterpret_cast<const si_block_q8_1*>(q81)
+                                      + (size_t)r0 * (size_t)(K >> 5),
+                                  W, reinterpret_cast<__nv_bfloat16*>(y) + (size_t)r0 * N,
+                                  m, N, K, stream)) return false;
+        }
+        return true;
+    }
     if (qtype == 12) return launch_mmvq_q4k_rows(q81, W, y, M, N, K, stream);
     if (qtype == 14) return launch_mmvq_q6k_rows(q81, W, y, M, N, K, stream);
     if (qtype == 8)  return launch_mmvq_q80_rows(q81, W, y, M, N, K, stream);
@@ -3902,7 +3930,7 @@ bool launch_mmvq_rows_f32(int qtype, const void* q81, const void* W, float* y,
     // Same instantiated-width limit as launch_mmvq_q4k_rows above, and the same consequence:
     // this is the LM-head path, so K=5120 (Qwen3.8's hidden) refused here made the verify decline
     // AFTER every layer had already succeeded -- "unsupported LM head type=12 H=5120".
-    if (qtype == 12 && (K == 2048 || K == 4096 || K == 5120 || K == 6144)) {
+    if (qtype == 12 && (K == 2048 || K == 4096 || K == 5120 || K == 6144 || K == 6656)) {
         const int grid = (N + SI_Q4K_OROWS - 1) / SI_Q4K_OROWS;
         // The verify's LM head is the one call here that runs at a width the planner chooses, so it
         // is the one that pays for a loose MMAX. SPARKINFER_Q4K_OROWS pins the weight-rows-per-CTA
@@ -3928,7 +3956,8 @@ bool launch_mmvq_rows_f32(int qtype, const void* q81, const void* W, float* y,
         if      (K == 2048) SI_Q4K_ROWS_F32_DISPATCH(8);
         else if (K == 4096) SI_Q4K_ROWS_F32_DISPATCH(16);
         else if (K == 5120) SI_Q4K_ROWS_F32_DISPATCH(20);
-        else                SI_Q4K_ROWS_F32_DISPATCH(24);
+        else if (K == 6144) SI_Q4K_ROWS_F32_DISPATCH(24);
+        else                SI_Q4K_ROWS_F32_DISPATCH(26);   // 6656: Muse Glimmer's LM head
         #undef SI_Q4K_ROWS_F32_DISPATCH
         return true;
     }
