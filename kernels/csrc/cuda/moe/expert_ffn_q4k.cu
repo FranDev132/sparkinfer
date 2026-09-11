@@ -16,6 +16,10 @@
 // Portable CUDA — sm_89/90/100/120, the set CMAKE_CUDA_ARCHITECTURES actually builds.
 // sm_121 is excluded (needs CUDA 12.9+); see CMakeLists.txt.
 
+#ifndef SPARKINFER_NVRTC_DEVICE_ONLY
+#include <mutex>
+#endif
+
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #ifndef SPARKINFER_NVRTC_DEVICE_ONLY
@@ -1846,7 +1850,27 @@ static inline bool launch_down_q6k_mmvq_splitk(
 #if __CUDA_ARCH__ >= 800 || !defined(__CUDA_ARCH__)
 namespace {
 constexpr int SI_MMA_BN = 32;      // output rows per block
+// K-splits. H/BN = 208 blocks is only 1.2 per SM on 170 SMs while the kernel fits 8, so the GRID,
+// not the tile, was the limit: splitting K multiplies the block count without shrinking the tile.
+// Measured at the real shape, M=32: SK 1 -> 349.7 us, 2 -> 225.1, 4 -> 178.1, 8 -> 171.2,
+// 16 -> 168.9. Eight is the knee.
+constexpr int SI_MMA_SK = 8;
 constexpr int SI_MMA_MMAX = 32;    // decode batch ceiling
+// Split-K needs an fp32 accumulator, and neither scratch the caller hands us is free: out_scratch
+// is reinterpreted as the Q8_1 activations this kernel READS, and h_scratch holds the gate/up
+// output. Own one instead -- 32 x 6656 floats is 852 KB per slot, sized for the widths the
+// dispatch gates to.
+//
+// A slot per stream, because decode is not single-stream: it runs on the main stream while a
+// prefill chunk short enough to reach this arm can be in flight on its own, and one buffer would
+// have the two accumulate into each other. Launches within ONE stream are ordered, so a slot bound
+// to a stream is exclusively that stream's; a stream past the table declines to the MMVQ.
+//
+// Static, and deliberately not allocated on demand: decode captures CUDA graphs, and a cudaMalloc
+// during capture invalidates the graph -- which shows up as "verify graph launch: invalid
+// argument" and a step that returns without doing the work.
+constexpr int SI_MMA_SLOTS = 4;
+__device__ float si_mma_down_acc[SI_MMA_SLOTS][SI_MMA_MMAX * 6656];
 constexpr int SI_MMA_NW = 4;
 
 __device__ __forceinline__ int si_mma_swz(int k, int row) {
@@ -1877,11 +1901,17 @@ void down_q4k_mma_rows_kernel(const unsigned char* __restrict__ down_q,
                               const int* __restrict__ expert_ids,
                               const float* __restrict__ expert_weights,
                               const si_block_q8_1* __restrict__ hq8,
-                              __nv_bfloat16* __restrict__ output,
+                              float* __restrict__ acc_out,
                               int H, int F, int top_k, int M, int pdl) {
     if (pdl) si_pdl_sync();
     const int nblk = F >> 8;
     const int n0 = blockIdx.x * SI_MMA_BN;
+    // Balanced, not ceil: 78 super-blocks over 8 splits is 10,10,10,10,10,10,9,9 rather than seven
+    // 10s and an 8, and the launch waits for the longest split.
+    const int sk = (int)gridDim.y;
+    const int sb_base = nblk / sk, sb_extra = nblk % sk;
+    const int sb_lo = (int)blockIdx.y * sb_base + ((int)blockIdx.y < sb_extra ? (int)blockIdx.y : sb_extra);
+    const int sb_hi = sb_lo + sb_base + ((int)blockIdx.y < sb_extra ? 1 : 0);
     const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
     const int grp = lane >> 2, tig = lane & 3, sub = lane >> 3, lrow = lane & 7;
     const int e0 = expert_ids[0];
@@ -1898,7 +1928,7 @@ void down_q4k_mma_rows_kernel(const unsigned char* __restrict__ down_q,
         #pragma unroll
         for (int e = 0; e < 4; e++) facc[i][e] = 0.f;
 
-    for (int sb = 0; sb < nblk; sb++) {
+    for (int sb = sb_lo; sb < sb_hi; sb++) {
         // One 16B output chunk per unit: the swizzle permutes whole 16B chunks, so addresses
         // inside a chunk are contiguous and each unit is a single uint4 store.
         for (int u = tid; u < SI_MMA_BN * 16; u += SI_MMA_NW * 32) {
@@ -1989,21 +2019,58 @@ void down_q4k_mma_rows_kernel(const unsigned char* __restrict__ down_q,
         for (int e = 0; e < 4; e++) {
             const int lm = i * 16 + grp + (e >> 1) * 8;
             const int gn = n0 + warp * 8 + tig * 2 + (e & 1);
-            if (lm < M && gn < H)
-                output[(size_t)lm * H + gn] =
-                    __float2bfloat16(facc[i][e] * expert_weights[(size_t)lm * top_k]);
+            if (lm < M && gn < H) atomicAdd(&acc_out[(size_t)lm * H + gn], facc[i][e]);
         }
+}
+
+// Scales by the expert weight, narrows to bf16, and re-zeroes what it consumed so the next call
+// needs no memset of its own.
+__global__ void down_q4k_mma_epilogue_kernel(float* __restrict__ acc,
+                                            const float* __restrict__ expert_weights,
+                                            __nv_bfloat16* __restrict__ output,
+                                            int H, int top_k, int M) {
+    const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (size_t)M * H) return;
+    const int lm = (int)(i / (size_t)H);
+    output[i] = __float2bfloat16(acc[i] * expert_weights[(size_t)lm * top_k]);
+    acc[i] = 0.f;
+}
+
+// Claim this stream's slot, first call wins. The table only ever grows and holds a handful of
+// entries, so the lock is contended only on the few calls that add a stream.
+static int si_mma_down_slot_for(cudaStream_t stream) {
+    static std::mutex mu;
+    static cudaStream_t owners[SI_MMA_SLOTS] = {};
+    static int used = 0;
+    std::lock_guard<std::mutex> lk(mu);
+    for (int i = 0; i < used; i++) if (owners[i] == stream) return i;
+    if (used >= SI_MMA_SLOTS) return -1;
+    owners[used] = stream;
+    return used++;
 }
 
 static inline bool launch_down_q4k_mma_rows(
     int pdl, const unsigned char* down_q, const int* expert_ids, const float* expert_weights,
-    const si_block_q8_1* hq8, __nv_bfloat16* output, int H, int F, int top_k, int M,
-    cudaStream_t stream
+    const si_block_q8_1* hq8, __nv_bfloat16* output,
+    int H, int F, int top_k, int M, cudaStream_t stream
 ) {
     if (M < 2 || M > SI_MMA_MMAX || top_k != 1 || (F & 255) || (H % SI_MMA_BN)) return false;
-    launch_pdl_kernel(pdl, dim3(H / SI_MMA_BN), dim3(SI_MMA_NW * 32), 0, stream,
-                      down_q4k_mma_rows_kernel, down_q, expert_ids, expert_weights, hq8, output,
-                      H, F, top_k, M, pdl);
+    if ((size_t)M * (size_t)H > (size_t)SI_MMA_MMAX * 6656u) return false;
+    const int slot = si_mma_down_slot_for(stream);
+    if (slot < 0) return false;
+    float* acc_scratch = nullptr;
+    if (cudaGetSymbolAddress(reinterpret_cast<void**>(&acc_scratch), si_mma_down_acc) != cudaSuccess)
+        return false;
+    acc_scratch += (size_t)slot * SI_MMA_MMAX * 6656u;
+    const int nblk = F >> 8;
+    int sk = SI_MMA_SK; if (sk > nblk) sk = nblk;   // never launch a split with nothing to reduce
+    const size_t n = (size_t)M * (size_t)H;
+    launch_pdl_kernel(pdl, dim3(H / SI_MMA_BN, sk), dim3(SI_MMA_NW * 32), 0, stream,
+                      down_q4k_mma_rows_kernel, down_q, expert_ids, expert_weights, hq8,
+                      acc_scratch, H, F, top_k, M, pdl);
+    const int thr = 256;
+    down_q4k_mma_epilogue_kernel<<<(unsigned)((n + thr - 1) / thr), thr, 0, stream>>>(
+        acc_scratch, expert_weights, output, H, top_k, M);
     return true;
 }
 #endif
@@ -2770,7 +2837,15 @@ void launch_moe_expert_ffn_q4k(
             // SPARKINFER_DOWN_MMA=0 keeps every width on the MMVQ.
             static int down_mma = -1;
             if (down_mma < 0) { const char* e = getenv("SPARKINFER_DOWN_MMA"); down_mma = (e && e[0] == '0') ? 0 : 1; }
-            if (down_mma && num_tokens >= 24 && top_k == 1 &&
+            // Eight rows is where the tensor-core arm starts paying, and the floor is about the
+            // weight traffic rather than the arithmetic. The MMVQ chunks at eight rows, so at or
+            // below that width it already reads ffn_down exactly once -- the same as the mma
+            // kernel, which pads M to the 16 rows of an m16n8k32 tile. Below eight there is no
+            // traffic to win back and the padding is pure waste: four rows measured 5.9% slower
+            // end to end, while eight is 5.2% faster and sixteen 23% faster.
+            static int down_mma_min = -1;
+            if (down_mma_min < 0) { const char* e = getenv("SPARKINFER_DOWN_MMA_MINROWS"); down_mma_min = e ? atoi(e) : 8; }
+            if (down_mma && num_tokens >= down_mma_min && top_k == 1 &&
                 launch_down_q4k_mma_rows(pdl, reinterpret_cast<const unsigned char*>(down_q),
                                          expert_ids, expert_weights, hq8,
                                          reinterpret_cast<__nv_bfloat16*>(output),

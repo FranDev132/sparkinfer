@@ -82,6 +82,7 @@ int main(int argc, char** argv) {
     std::vector<__nv_bfloat16> out((size_t)M * H);
     cudaMemcpy(out.data(), d_out, out.size() * sizeof(__nv_bfloat16), cudaMemcpyDeviceToHost);
 
+
     double sum = 0.0, amax = 0.0;
     for (size_t i = 0; i < out.size(); i++) {
         const double v = (double)__bfloat162float(out[i]);

@@ -14,6 +14,7 @@
 #include <cuda_runtime.h>
 #include <cstdio>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <vector>
 
@@ -39,6 +40,12 @@ template <class T> T* dev(size_t n, const void* host = nullptr) {
 int main() {
     int devcount = 0;
     if (cudaGetDeviceCount(&devcount) != cudaSuccess || devcount == 0) return 77;
+
+    // Pin the arm this test is about. The tensor-core down projection now intercepts eight rows and
+    // up, so without this every width below would run there instead and the chunk arithmetic these
+    // cases exist to cover would go unexercised. It is still a live path: it serves the narrow
+    // widths, and it is the fallback whenever the mma arm declines a shape.
+    setenv("SPARKINFER_DOWN_MMA", "0", 1);
 
     // Q4_K down weights for a single expert: [1, H, F], 144 bytes per 256 values.
     const size_t down_bytes = (size_t)H * (F / 256) * 144;
