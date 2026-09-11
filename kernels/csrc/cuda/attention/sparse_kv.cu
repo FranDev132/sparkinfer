@@ -219,6 +219,43 @@ void launch_fa_kv_compact_view_pure(
         seq_lens, block_table, view_table, view_len, block_size, window_w, n_view);
 }
 
+// Per-ROW form of the above, for packed continuous-batch decode: one block builds one row's
+// view, so N independent sequences get N compact windows in a single launch. Identical
+// arithmetic per row -- the single-row launcher is exactly this with N == 1 -- so a windowed
+// layer sees the same view it would have seen decoding that sequence alone.
+//
+// `block_table` is the ROW-GATHERED table (stride max_blocks, as produced by
+// launch_gather_rows_i32), `seq_lens` is [rows], and the outputs are [rows][n_view] / [rows].
+__global__ void fa_kv_compact_view_pure_rows(
+    const int* __restrict__ seq_lens, const int* __restrict__ block_table,
+    int* __restrict__ view_table, int* __restrict__ view_len,
+    int block_size, int window_w, int n_view, int max_blocks
+) {
+    const int r = blockIdx.x;
+    const int sl = seq_lens[r];
+    const int* __restrict__ bt = block_table + (size_t)r * max_blocks;
+    int* __restrict__ vt = view_table + (size_t)r * n_view;
+    const int n_blk = (sl + block_size - 1) / block_size;
+    if (window_w >= n_blk) {
+        for (int b = threadIdx.x; b < n_blk && b < n_view; b += blockDim.x) vt[b] = bt[b];
+        if (threadIdx.x == 0) view_len[r] = sl;
+        return;
+    }
+    const int recent_start = n_blk - window_w;
+    if (threadIdx.x == 0) view_len[r] = sl - recent_start * block_size;
+    for (int i = threadIdx.x; i < window_w && i < n_view; i += blockDim.x)
+        vt[i] = bt[recent_start + i];
+}
+
+void launch_fa_kv_compact_view_pure_rows(
+    const int* seq_lens, const int* block_table, int* view_table, int* view_len,
+    int block_size, int window_w, int n_view, int max_blocks, int rows, cudaStream_t stream
+) {
+    if (rows < 1) return;
+    fa_kv_compact_view_pure_rows<<<rows, 256, 0, stream>>>(
+        seq_lens, block_table, view_table, view_len, block_size, window_w, n_view, max_blocks);
+}
+
 void launch_flash_decode_split_sparse(
     const void* q, const void* k_pool_layer, const void* v_pool_layer,
     const int* block_table, const int* seq_lens, const int* sel_blk,
