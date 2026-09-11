@@ -4601,7 +4601,22 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
         static const bool cb_head_mr = []{ const char* e = getenv("SPARKINFER_CB_HEAD_MULTIROW");
                                            return !(e && e[0] == '0'); }();
         bool mr_done = false;
-        if (cb_head_mr && packed && N > 1) {
+        // Tensor cores first, for the whole batch in one launch.
+        //
+        // What this replaces on Muse is launch_mmvq_rows_f32 further down, not the multi-row arm
+        // immediately below: that one is instantiated for K in {2048, 5120, 6144} and declines
+        // Muse's K=6656 outright, so the continuous-batch head has always fallen through to
+        // launch_mmvq_rows_f32 -- which chunks at eight rows. Either way a 32-row step walked all
+        // 756 MB of the head four times and did its 43 G MAC of dot product on the CUDA cores.
+        //
+        // The head is 202048 columns wide, which is 6314 blocks, so this fills the device without
+        // a K split and writes the logits directly. Gated on its own switch rather than
+        // cb_head_mr, which belongs to the arm below: SPARKINFER_HEAD_MMA=0 restores the previous
+        // dispatch, so both arms come out of ONE binary.
+        if (packed && N > 1 &&
+            kernels::launch_mmvq_q4k_mma_head_f32(q81, s.w.lm_head, logits, N, c.vocab, H, st))
+            mr_done = true;
+        if (!mr_done && cb_head_mr && packed && N > 1) {
             const size_t q81_row_bytes = kernels::llama_q8_1_bytes(H);
             bool mr_ok = true;
             for (int r0 = 0; r0 < N && mr_ok; r0 += 8) {
