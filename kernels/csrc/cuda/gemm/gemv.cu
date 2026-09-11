@@ -4050,6 +4050,27 @@ static inline bool launch_mmvq_q4k_mma_rows(const void* q81, const void* W, void
     return true;
 }
 
+// The packed LM head. 202048 x 6656 Q4_K is the single largest matrix in the model and the last
+// one a continuous-batch step still scored on the CUDA cores: the dp4a multi-row kernel walks it
+// once per EIGHT rows, so a 32-row step made four passes over 756 MB and did 43 G MAC of dot
+// product on the wrong units. N/BN is 6314 blocks here, which fills the device by itself, so this
+// needs neither a K split nor an fp32 scratch -- it writes the caller's logits directly.
+bool launch_mmvq_q4k_mma_head_f32(const void* q81, const void* W, float* y,
+                                  int M, int N, int K, cudaStream_t stream) {
+    static int head_mma = -1;
+    if (head_mma < 0) { const char* e = getenv("SPARKINFER_HEAD_MMA"); head_mma = (e && e[0] == '0') ? 0 : 1; }
+    if (!head_mma) return false;
+    // Same eight-row floor as the other mma arms: the tile pads M to sixteen, and below eight the
+    // dp4a kernel's cheaper setup wins back more than the tensor cores do.
+    static int head_mma_min = -1;
+    if (head_mma_min < 0) { const char* e = getenv("SPARKINFER_HEAD_MMA_MINROWS"); head_mma_min = e ? atoi(e) : 8; }
+    if (M < head_mma_min || M > SI_AM_MMAX || (K & 255) || (N % SI_AM_BN)) return false;
+    si_mmvq_q4k_mma_kernel<false, float><<<dim3(N / SI_AM_BN, 1), dim3(SI_AM_NW * 32), 0, stream>>>(
+        reinterpret_cast<const si_block_q8_1*>(q81), reinterpret_cast<const unsigned char*>(W),
+        y, M, N, K);
+    return true;
+}
+
 bool launch_mmvq_q4k_rows(const void* q81, const void* W, void* y,
                           int M, int N, int K, cudaStream_t stream) {
     // K is templated (KB = K/256 bounds the per-thread accumulators), so only instantiated widths

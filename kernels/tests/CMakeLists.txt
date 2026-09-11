@@ -42,3 +42,8 @@ set_target_properties(mmvq_mma_accuracy_gpu_test PROPERTIES CXX_STANDARD 17)
 add_executable(down_mma_accuracy_gpu_test down_mma_accuracy_gpu_test.cpp)
 target_link_libraries(down_mma_accuracy_gpu_test PRIVATE sparkinfer_kernels CUDA::cudart)
 set_target_properties(down_mma_accuracy_gpu_test PROPERTIES CXX_STANDARD 17)
+# The tensor-core LM head against the dp4a multi-row kernel it replaces. Both arms are exported
+# functions, so one process covers both. Not a ctest: it needs ~0.8 GB of device memory.
+add_executable(head_mma_accuracy_gpu_test head_mma_accuracy_gpu_test.cpp)
+target_link_libraries(head_mma_accuracy_gpu_test PRIVATE sparkinfer_kernels CUDA::cudart)
+set_target_properties(head_mma_accuracy_gpu_test PROPERTIES CXX_STANDARD 17)

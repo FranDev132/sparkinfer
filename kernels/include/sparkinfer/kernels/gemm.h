@@ -218,6 +218,12 @@ void launch_gemv_q6k_dp4a_f32(const void* q81, const void* W, float* y, int N, i
 // The weight streams from HBM once instead of M times. q81 = M contiguous llama_q8_1_bytes(K) rows,
 // y = [M, N] fp32. Returns false if the shape is unsupported so the caller can fall back.
 // Same, for a Q4_K weight (the LM-head copy the target keeps). ~280 MB vs ~417 MB at V=248k.
+// Same [M, vocab] fp32 scoring as launch_gemv_q4k_dp4a_multirow_f32, on the int8 tensor cores and
+// for the whole batch at once instead of eight rows at a time. Declines widths and shapes it does
+// not cover, so the caller keeps its dp4a loop as the fallback.
+bool launch_mmvq_q4k_mma_head_f32(const void* q81, const void* W, float* y,
+                                  int M, int N, int K, cudaStream_t stream);
+
 bool launch_gemv_q4k_dp4a_multirow_f32(const void* q81, const void* W, float* y,
                                        int N, int K, int M, cudaStream_t stream = nullptr);
 bool launch_gemv_i8_q81_multirow_f32(const void* q81, const signed char* W,
