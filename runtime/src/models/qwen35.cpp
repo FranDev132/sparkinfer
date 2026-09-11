@@ -163,6 +163,27 @@ bool is_qwen35_or_qwen36_hybrid_moe(const GGUF& g) {
 bool is_linear_layer(const Qwen35Config& c, int layer) {
     return c.hybrid && c.full_attn_interval > 0 && ((layer + 1) % c.full_attn_interval) != 0;
 }
+
+// True when the stack actually CARRIES Gated-DeltaNet layers. `hybrid` alone does not say that:
+// Muse Glimmer sets it to unlock the batched prefill and the attention-gate path while declaring
+// full_attn_interval = 0, which makes is_linear_layer() false for every layer -- it has the flag
+// and none of the layers. Anything that exists only to hold GDN state has to ask this, not
+// `hybrid`, or it allocates a recurrent state for a stack with no recurrence.
+bool has_linear_layers(const Qwen35Config& c) {
+    if (!c.hybrid || c.full_attn_interval <= 0) return false;
+    for (int L = 0; L < c.n_layers; ++L) if (is_linear_layer(c, L)) return true;
+    return false;
+}
+
+// Whether a session on this stack has to carry Gated-DeltaNet state at all.
+// SPARKINFER_MUSE_GDN_GATE=0 restores the old `cfg.hybrid` test, for an A/B out of one binary.
+bool needs_linear_state(const Qwen35Config& c) {
+    static const bool gate = [] {
+        const char* e = getenv("SPARKINFER_MUSE_GDN_GATE");
+        return !(e && e[0] == '0');
+    }();
+    return gate ? has_linear_layers(c) : c.hybrid;
+}
 }
 
 struct SessionBuffers {
@@ -1268,7 +1289,11 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
         s.graph_prefill_ready = false;
         s.graph_prefill_attn_mode = -1;
     }
-    if (c.hybrid && position == 0) {
+    // The buffers behind these two resets are allocated only for a stack that actually carries
+    // Gated-DeltaNet layers (see needs_linear_state), so a `hybrid` stack with none of them has
+    // nothing to zero and the pointers are null. The sibling reset in qwen35_prefill.cpp guards on
+    // the pointers for the same reason; match it, so this is also safe if the alloc ever fails.
+    if (c.hybrid && position == 0 && s.lin_state && s.lin_conv_state) {
         cu(cudaMemsetAsync(s.lin_state, 0,
                            (size_t)c.n_layers * c.linear_v_heads * c.linear_head_dim * c.linear_head_dim * sizeof(float), st),
            "linear state reset");
@@ -3228,7 +3253,12 @@ uint64_t Qwen35Model::open_session(int num_tokens, bool* alloc_failed) {
     buf.penalty_counts = s.alloc<int>(s.cfg.vocab);
     buf.logit_bias = s.alloc<float>(s.cfg.vocab);
     bool alloc_ok = buf.penalty_counts != nullptr && buf.logit_bias != nullptr;
-    if (s.cfg.hybrid) {
+    // Per-session recurrent state, and it is not small: n_layers * v_heads * head_dim^2 floats is
+    // 109 MB on Muse Glimmer's 52 layers. That model declares `hybrid` but has no GDN layer at
+    // all, so every concurrent request was reserving 109 MB for a recurrence it never runs -- 3.6
+    // GB at 32 requests, on a card whose FP4 prefill operands already leave it with a few hundred
+    // MB of headroom. Ask whether the stack has the layers, not whether it has the flag.
+    if (needs_linear_state(s.cfg)) {
         buf.lin_state = s.alloc<float>((size_t)s.cfg.n_layers * s.cfg.linear_v_heads *
                                        s.cfg.linear_head_dim * s.cfg.linear_head_dim);
         buf.lin_conv_state = s.alloc<bf16>((size_t)s.cfg.n_layers *
@@ -3375,7 +3405,10 @@ bool Qwen35Model::decode_packed(const int* tokens, const int* positions,
 
     for (int i = 0; i < n; i++) {
         auto it = s.sessions.find(seq_ids[i]);
-        if (it == s.sessions.end() || !it->second.lin_state || !it->second.lin_conv_state)
+        if (it == s.sessions.end()) return false;
+        // Only a stack that HAS the layers has the buffers; demanding them on one that does not
+        // refuses every row for a state the model never carried.
+        if (needs_linear_state(s.cfg) && (!it->second.lin_state || !it->second.lin_conv_state))
             return false;
         const int* tbl = s.kv->block_table(seq_ids[i]);
         if (!tbl) return false;
@@ -3407,7 +3440,7 @@ bool Qwen35Model::decode_packed(const int* tokens, const int* positions,
         return !(e && e[0] == '0');
     }();
     bool packed_state_b16 = false;
-    if (kGdnStateB16 && s.cfg.hybrid) {
+    if (kGdnStateB16 && needs_linear_state(s.cfg)) {
         const size_t st_n = (size_t)s.cfg.n_layers * s.cfg.linear_v_heads *
                             s.cfg.linear_head_dim * s.cfg.linear_head_dim;
         bool all_b16 = true;
