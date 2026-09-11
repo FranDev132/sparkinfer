@@ -3045,14 +3045,23 @@ static bool muse_packed_on() {
     return v;
 }
 // Row count from which a packed step runs the dense gate/up as ONE block-scaled NVFP4 GEMM per
-// projection instead of the row-batched dp4a GEMV. Fitted on an RTX 5090 against Muse Glimmer's
-// 6656x19968 FFN: the GEMV costs a fixed read plus ~0.76 ms per row across the model, the GEMM
-// 6.92 ms flat (0.0666 ms at 8 rows, 0.0668 at 16 -- it reads the same operand either way), so they
-// cross just under six rows.
+// projection instead of the row-batched dp4a GEMV. The crossover was FITTED rather than swept --
+// "the GEMV costs a fixed read plus ~0.76 ms per row across the model, the GEMM 6.92 ms flat, so
+// they cross just under six rows" -- and measuring it end to end puts it lower. Four packed rows
+// already pay for the GEMM; two do not:
+//
+//     c=4   min_rows 6 -> 191.6 / 191.2 tok/s     min_rows 2 -> 208.7 / 208.8   +9.0%
+//     c=2   min_rows 6 -> 137.1 / 137.1           min_rows 2 -> 126.9           -7.4%
+//
+// So the GEMM is worth taking from four rows up and not below, which is what this returns. A
+// four-row packed step is a scored continuous-batch width, and at four rows every other arm in the
+// step is still on the dp4a path -- every tensor-core arm has an eight-row floor, because an
+// m16n8k32 tile pads M to sixteen. This is the one place a narrow batch can reach the tensor cores,
+// and the fitted six was keeping it off them.
 static int gu_gemm_min_rows() {
     static const int v = [] {
         const char* e = getenv("SPARKINFER_GU_GEMM_MIN_ROWS");
-        const int x = e ? atoi(e) : 6;
+        const int x = e ? atoi(e) : 4;
         return x < 1 ? 1 : x;
     }();
     return v;
