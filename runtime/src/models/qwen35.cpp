@@ -5768,8 +5768,10 @@ bool Qwen35Model::load_gguf(const std::string& path) {
         const int qdim_a = c.n_q_heads * c.head_dim;
         const int kvdim_a = c.n_kv_heads * c.head_dim;
         const char* fp4q_env = getenv("SPARKINFER_MUSE_PREFILL_NVFP4_QKV");
-        const bool qkvg_fp4_on = (!fp4q_env || fp4q_env[0] != '0') &&
-                                 kernels::prefill_nvfp4_supported(128, 2 * qdim_a + 2 * kvdim_a, H);
+        // Not const: the VRAM budget below can drop this leg on a deployment whose concurrency
+        // leaves no room for it (see the reserve there).
+        bool qkvg_fp4_on = (!fp4q_env || fp4q_env[0] != '0') &&
+                           kernels::prefill_nvfp4_supported(128, 2 * qdim_a + 2 * kvdim_a, H);
         int down_ready = 0;
         auto convert = [&](const void* src, int qtype, int rows, int cols,
                            const void** data, const void** sf) -> bool {
@@ -5849,9 +5851,35 @@ bool Qwen35Model::load_gguf(const std::string& path) {
         // A card that genuinely cannot spare it still declines here, and declines for the real
         // reason rather than for its label.
         {
-            const size_t reserve = [] {
+            // How many sessions this deployment will actually hold. The KV pool is allocated
+            // before this point and was sized for exactly that, so it already carries the number
+            // rather than needing one plumbed in.
+            int fp4_sessions = 1;
+            if (s.kv && s.kv->block_size() > 0 && c.max_seq > 0) {
+                const int bps = c.max_seq / s.kv->block_size() + 4;   // blocks one session takes
+                if (bps > 0) fp4_sessions = s.kv->num_total_blocks() / bps;
+                if (fp4_sessions < 1)   fp4_sessions = 1;
+                if (fp4_sessions > 256) fp4_sessions = 256;
+            }
+            // A reserve that covers ONE session's prefill arena is what starved the runtime under
+            // concurrency: every live request needs its own scratch beside these weights, so at 32
+            // requests the card finished with 3 MB free -- the packed decode arena (16 MB) declined
+            // on 255 of 255 steps and the batched prefill fell back to a ~24 pp token loop, 143x
+            // below the 3485 pp it manages when it can allocate. Weights that exist to make prefill
+            // faster are worth nothing if they leave prefill unable to run.
+            // ~24 MB per live session of non-KV runtime state, measured as the rate free VRAM
+            // decays across session opens; the first session is already covered by the base.
+            // An explicit SPARKINFER_MUSE_NVFP4_RESERVE_MB is an operator decision and wins.
+            // SPARKINFER_MUSE_NVFP4_RESERVE_CONC=0 restores the flat reserve, for an A/B.
+            const size_t reserve = [&] {
                 const char* e = getenv("SPARKINFER_MUSE_NVFP4_RESERVE_MB");
-                long long mb = e ? atoll(e) : 384; if (mb < 0) mb = 0;
+                if (e) { long long mb = atoll(e); return (size_t)(mb < 0 ? 0 : mb) << 20; }
+                static const bool conc = [] {
+                    const char* q = getenv("SPARKINFER_MUSE_NVFP4_RESERVE_CONC");
+                    return !(q && q[0] == '0');
+                }();
+                long long mb = 384;
+                if (conc) mb += (long long)(fp4_sessions - 1) * 24;
                 return (size_t)mb << 20;
             }();
             const size_t want_qkvg = qkvg_fp4_on ? (size_t)c.n_layers *
@@ -5884,6 +5912,19 @@ bool Qwen35Model::load_gguf(const std::string& path) {
                         "hold it plus a %.1f GB reserve\n",
                         (double)freeb / 1e9, (double)reserve / 1e9);
                 down_fp4_on = false;
+            }
+            // Last to go, and the leg that decides high-concurrency throughput. Holding ~1.1 GB of
+            // attention-projection copies on a card that then cannot give the runtime its scratch
+            // is a bad trade: the batched prefill these weights accelerate drops to the token loop
+            // and the packed decode forward declines every step. Dropping it is 1.61x aggregate
+            // throughput at 32 concurrent requests, and costs 0.8% at 8 -- where the reserve is
+            // small enough that this never fires and every copy stays resident.
+            if (qkvg_fp4_on && !fits()) {
+                fprintf(stderr, "[prefill-muse] SM120 NVFP4 qkv-gate skipped: %.1f GB free cannot "
+                        "hold it (%.1f GB) plus a %.1f GB reserve for %d sessions\n",
+                        (double)freeb / 1e9, (double)want_qkvg / 1e9, (double)reserve / 1e9,
+                        fp4_sessions);
+                qkvg_fp4_on = false;
             }
         }
         auto release_prefill_copy = [&](const void*& p, const void* decode) {
