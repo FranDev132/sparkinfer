@@ -247,7 +247,7 @@ speculative axes carry the losslessness and τ gates:
 | **Long-context guards** | ≥ 0.98× `main`, decode **and** prefill @ ctx=16k, on Qwen3.8 **and** Qwen3.6 | DSpark work lands in `qwen35.cpp` / shared kernels, which Qwen3.6 also uses — the exact surface through which #775 regressed a model nobody was scoring at the time. |
 
 Tiers are bands of % speedup over the frontier (`XS` 2–3.5% … `XL` >18%; under 2% is noise →
-`none`). A `none` or a failed gate is **auto-closed** — reopen after a fix and it re-evaluates.
+`none`). A `none` or a failed gate is **auto-closed on the first result** — reopen after a fix and it re-evaluates. Drafts and `hold` never reach evaluation, so use one of those if the PR should stay open unscored (see *Lane 3*).
 
 ### Lane 2 — manually reviewed, not scored
 
@@ -297,10 +297,20 @@ against you.
 - **Stale.** No new commits for over a day while queued → auto-closed to keep the eval queue
   clean. This is not a judgment on the work: push a commit or reopen and it's picked straight
   back up on the next cycle. `hold` and the current round winner are exempt.
-- **Repeated `none`/REJECT.** A third consecutive unscored result auto-closes; `hold` and
-  `merge-first` are exempt. **If you are waiting on a requested axis, get the
-  [`hold`](../../labels/hold) label** — otherwise a PR that only scores `none` because nothing
-  measures it yet will be closed by this rule before the axis lands.
+- **`none` or REJECT on an evaluated PR — closed on the first result, not the third.** A `none`
+  means no verified speedup on any axis that bot measures; a REJECT means a measured regression or
+  a failed gate. Either closes the PR automatically. The close comment says which, and a `none`
+  close explicitly is **not** a finding that anything is wrong with the PR.
+
+  **Two things keep a PR out of this, and both are filtered before any evaluation runs:**
+  - **drafts** — open it as a draft while it is not seeking a score;
+  - **the [`hold`](../../labels/hold) label** — the right choice if you are waiting on a requested
+    evaluation axis, or if the PR is a correctness fix / refactor / test / docs change that scores
+    0 by design.
+
+  If nothing measures your optimization yet, do **not** simply let it be evaluated and closed —
+  [ask for an axis](#how-rewards-work-sn74-on-gittensor) and take `hold` while it is added. You get
+  one round, not three, so take the label first.
 - **Changes that redefine what a scored axis measures** — including anything that replaces the
   DSpark drafter rather than optimizing it (MTP head and equivalents). See *Do not redefine what
   a scored dimension measures* above for the #912 precedent. Note this is **not** "your

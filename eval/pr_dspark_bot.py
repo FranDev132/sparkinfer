@@ -3064,34 +3064,25 @@ def apply_result(repo, num, commit, res, title="", dry_run=False):
             "updated": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         }
         _save_scores(scores)
-        # Auto-close on "REJECT" ONLY (narrowed 2026-09-09; was none/REJECT). Re-enabled 2026-08-11
-        # after an explicit, informed decision: the very first supervised run of this bot closed a
-        # real external contributor's unrelated PR (#768) this exact same way, since
-        # arb.greenlight_status() is generic (any PR with a checked "tested" box + a decode/
-        # prefill before/after table) and matches essentially any performance PR in the repo, not
-        # just Muse-Glimmer-relevant ones -- "none" is the expected, non-judgmental outcome for
-        # most PRs this bot evaluates, not a rejection of the PR's actual purpose. That PR was
-        # reopened + apologized for. The user was told this risk explicitly and chose to accept it
-        # (broad scope, matching pr_dflash_bot.py) rather than narrow evaluation to only
-        # Muse-Glimmer-relevant PRs. If this causes another wrongful close, reopen + apologize the
-        # same way, and reconsider the scope-narrowing alternative that was declined here.
-        # AUTO-CLOSE ONLY ON REJECT, NEVER ON "none" (changed 2026-09-09).
+        # AUTO-CLOSE POLICY (user decision, 2026-09-11): a `none` closes too, not only a REJECT.
         #
-        # "none" means THIS bot measured no change on ITS axes. For a PR aimed at a different
-        # model that is the expected, uninformative outcome -- not a verdict on the PR. Closing on
-        # it destroys good work: this bot is currently the only one on cron, so every PR in the
-        # repo is scored against one model's metrics, and a genuine improvement to another model
-        # measures "none" here by construction. PR #1008 (a 15x Muse prefill win) was minutes away
-        # from being auto-closed by the DSpark bot for exactly this reason and had to be caught by
-        # hand; the same trap now points the other way.
+        # `none` means no verified speedup on any axis this bot measures. It is NOT a finding of
+        # harm, so the close comment must not read like one -- and the two legitimate ways to hold
+        # a PR open through it are named there: the `hold` label (for work waiting on a requested
+        # evaluation axis, see CONTRIBUTING "If no evaluation measures your optimization yet") and
+        # reopening with new numbers.
         #
-        # "REJECT" is different in kind and still closes: it means a measured REGRESSION on a
-        # scored axis, an accuracy-gate failure, or a cross-model guard failure. That is real,
-        # attributable harm and is worth acting on no matter what the PR was aiming at.
+        # The risk is on record: this bot's first live run wrongly auto-closed an unrelated PR
+        # (#768, reopened + apologised) precisely because `none` is the label an off-axis PR gets.
+        # `hold` and drafts never reach here -- both are filtered before evaluation -- so those
+        # remain the escape hatches.
         #
-        # Abandoned PRs are still handled -- by the age-based stale close, which is about
-        # inactivity rather than about a measurement.
-        if label == "REJECT":
+        # "REJECT" is different in kind: a measured REGRESSION, an accuracy failure, or a guard
+        # failure. Real, attributable harm, worth acting on whatever the PR was aiming at.
+        #
+        # Abandoned PRs are still handled by the age-based stale close, which is about inactivity
+        # rather than about a measurement.
+        if label in ("REJECT", "none"):
             if not res.get("lossless", True) or not res.get("lossless4", True) or not res.get("lossless32", True):
                 fail_clause = "and failed exact DSpark-vs-AR losslessness at one or more contexts"
             elif not res.get("accuracy_ok"):
@@ -3102,21 +3093,47 @@ def apply_result(repo, num, commit, res, title="", dry_run=False):
                 fail_clause = "(dspark decode@16k regression)"
             elif res.get("prefill_regressed"):
                 fail_clause = "(prefill@32k regression)"
-            elif label == "none":   # unreachable: see the REJECT-only guard above
-                fail_clause = "with no verified improvement on the scored 4k/16k/32k decode/prefill and 256k prefill axes"
+            elif label == "none":
+                fail_clause = "showing no verified improvement on any scored axis"
             else:
                 fail_clause = "(regression)"
-            close_body = (
-                "<!-- sparkinfer-qwen38-auto-close -->\n"
-                f"## Closed: sparkinfer DSpark auto-eval — `eval-dspark:{label}`\n\n"
-                f"This PR's best Qwen3.8-27B DSpark axis measured **{res.get('delta_pct')}%** "
-                f"vs main, {fail_clause} "
-                "— closing automatically. This bot evaluates every eligible PR in the repo "
-                "against Qwen3.8-27B's decode AND prefill@128 speed specifically, regardless of "
-                "what the PR is actually about — a close here isn't a judgment on the PR's purpose, "
-                "just that it didn't move these particular metrics. Reopen (or open a fresh PR) if "
-                "you have a fix or a different approach."
-            )
+
+            # A `none` is an absence of evidence, a REJECT is evidence of harm. Saying the same
+            # thing for both is how a contributor whose work simply is not measured yet reads a
+            # close as an accusation -- #768 is the precedent for getting that wrong.
+            if label == "none":
+                close_body = (
+                    "<!-- sparkinfer-qwen38-auto-close -->\n"
+                    "## Closed: no verified speedup — `eval-dspark:none`\n\n"
+                    f"Measured on the pinned RTX 5090 against the same-box `origin/main`: "
+                    f"**{res.get('delta_pct')}%** on the best scored axis (DSpark decode and "
+                    "batched prefill @ 4k/16k/32k, target prefill and decode @ 256k).\n\n"
+                    "**This is not a finding that anything is wrong with your PR.** Nothing "
+                    "regressed and every correctness gate passed — the change just did not move a "
+                    "number this bot measures. The queue is closed rather than left open so it "
+                    "reflects work that can still be scored.\n\n"
+                    "Three ways forward, depending on which applies:\n\n"
+                    "- **Targeting a different model?** Tick it under **Target model(s)** in the "
+                    "PR template — this bot only measures Qwen3.8-27B, and a PR declared for "
+                    "another model is skipped rather than scored `none` here.\n"
+                    "- **Nothing here measures your optimization yet?** Open an issue describing "
+                    "the axis you need — model, metric, context, and the command that measures it "
+                    "— with your before/after numbers, then reopen and ask for the "
+                    "[`hold`](../../labels/hold) label so it stays open while the axis is added.\n"
+                    "- **Correctness fix, refactor, test or docs?** Welcome, reviewed by hand, "
+                    "score 0 by design. Reopen as a **draft** or ask for `hold` and say so."
+                )
+            else:
+                close_body = (
+                    "<!-- sparkinfer-qwen38-auto-close -->\n"
+                    f"## Closed: regression or failed gate — `eval-dspark:{label}`\n\n"
+                    f"Measured **{res.get('delta_pct')}%** vs the same-box `origin/main`, "
+                    f"{fail_clause} — closing automatically.\n\n"
+                    "Every scored axis is also a no-regression floor, and losslessness, accuracy "
+                    "and the cross-model guards are hard gates, so one failure closes the PR "
+                    "whatever it was aiming at. The verdict comment above names which one. Reopen "
+                    "once it is addressed and it re-evaluates on the next poll."
+                )
             arb.gh(["pr", "comment", str(num), "-R", repo, "--body", close_body])
             arb.gh(["pr", "close", str(num), "-R", repo])
             print(f">> auto-closed PR #{num} (eval-dspark:{label})")
