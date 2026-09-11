@@ -132,7 +132,7 @@ MUSEGLIMMER_NEEDS_REBASE = "museglimmer-needs-rebase"
 # 128/512/4k/16k/32k, Qwen3.6 guard narrowed to 32k, ModelOpt Qwen3.8 32k guard added. A PR
 # scored under v3 must not keep a two-dimension label forever, so the version changes and every
 # open PR is re-evaluated.
-EVAL_SCHEMA_VERSION = "v4-ctx5-prefill-decode-modelopt-guard"
+EVAL_SCHEMA_VERSION = "v5-ctx6-prefill-decode-cbdecode-modelopt-guard"
 MARKER_RE = re.compile(
     r"<!-- sparkinfer-museglimmer-eval:" + re.escape(EVAL_SCHEMA_VERSION) + r":([0-9a-f]+)(?:\s+(\{.*?\}))? -->",
     re.DOTALL,
@@ -267,8 +267,28 @@ SCORED_CTX_LABEL = {128: "128", 512: "512", 4096: "4k", 16384: "16k", 32768: "32
                     65536: "64k"}
 # Order matters only for display; every entry is both a scored dimension AND a no-regression
 # floor, so a PR cannot buy a win at one context by giving one away at another.
+# Concurrent-decode axes (issue #1026, requested by FranDev132). Every one of the twelve axes
+# above drives a SINGLE request -- bench_decode runs one sequence, the prefill sweep ingests one
+# prompt -- so nothing in that set can observe a change that only moves multi-request throughput.
+# Muse gets no concurrency scaling at all on main (aggregate tok/s is flat from c=1 to c=16,
+# because each concurrent request re-reads all ~17 GB of weights on its own), which is exactly the
+# kind of headroom no scored axis was pointed at.
+#
+# Same binary, invocation shape and parser pr_dspark_bot.py already uses for its own cb-decode
+# axes; only the checkpoint differs.
+CB_CONCS = [2, 4, 8, 16, 32]
+# 256 prompt / 256 generated, matching pr_dspark_bot.py. Its comment records why this
+# cannot be shortened to save GPU: at shorter generations the run spends its time
+# measuring its own startup, and c=4/c=8 can land several percent low on UNCHANGED code
+# -- a spurious-rejection generator on an axis that is also a no-regression floor.
+CB_TOKENS = 256
+CB_DIM_FOR = {c: f"muse-cb-decode@c{c}" for c in CB_CONCS}
+CB_DIMS = [CB_DIM_FOR[c] for c in CB_CONCS]
+
+# Order matters only for display. SCORING_DIM must stay muse-decode@128 (the back-compat
+# dimension the report/dashboard/Polaris payload read), so the concurrency axes append.
 SCORING_DIMS = [f"muse-{phase}@{SCORED_CTX_LABEL[c]}"
-                for c in SCORED_CTXS for phase in ("decode", "prefill")]
+                for c in SCORED_CTXS for phase in ("decode", "prefill")] + CB_DIMS
 SCORING_DIM = SCORING_DIMS[0]
 
 # Cross-model no-regression guards, decode AND prefill, at 32k only (2026-09-09). Narrowed from
@@ -614,6 +634,8 @@ def _remote_script(ref: str) -> str:
     q36_repo = shlex.quote(Q36_GUARD_MODEL_REPO)
     q36_tok = shlex.quote(Q36_GUARD_TOK_REPO)
     mo_dir = shlex.quote(MODELOPT_GUARD_MODEL_DIR)
+    cb_concs = " ".join(str(c) for c in CB_CONCS)
+    cb_tokens = CB_TOKENS
     # bench_sweep_run takes alternating "<ctx> <reps>" pairs; the ctx-only list drives the shell
     # for-loop that reads the results back out. Both are derived from the same SCORED_CTXS /
     # *_GUARD_CTXS constants so the sweep and the read-back can never disagree about which
@@ -705,7 +727,7 @@ test -f "$GGUF" || {{ echo "FAIL missing GGUF $GGUF"; exit 1; }}
 # #693/#694 hit exactly this).
 mkdir -p build
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release >/tmp/mg_cmake.log 2>&1
-cmake --build build --target qwen3_gguf_bench qwen3_gguf_score -j"$(nproc)" >/tmp/mg_build.log 2>&1 || {{
+cmake --build build --target qwen3_gguf_bench qwen3_gguf_score qwen3_gguf_cb_bench -j"$(nproc)" >/tmp/mg_build.log 2>&1 || {{
   echo "BUILD_FAILED — tail of /tmp/mg_build.log:" >&2
   tail -80 /tmp/mg_build.log >&2
   exit 1
@@ -766,6 +788,34 @@ BC_PREFILL=0
 # 128 is not in the last tier.
 echo "RESULT_DECODE_TPS ${{BC_DECODE:-0}}"
 echo "RESULT_PREFILL128_PP ${{BC_PREFILL:-0}}"
+
+# --- concurrent decode (issue #1026) --------------------------------------------------------
+# Aggregate tok/s with N requests in flight. One model load per concurrency point, so this is
+# the expensive half of the round -- but it is the only thing here that observes the packed
+# multi-row forward, which no single-request axis enters.
+#
+# A failed or zero point emits MUSECB_FAILED for that c and the scorer DROPS that axis rather
+# than reading it as a regression to zero. A harness that did not run is not a slowdown, and on
+# a newly added axis a false REJECT would be far worse than a missing measurement -- the same
+# fail-open discipline the guards use when a checkpoint is unavailable.
+for CC in {cb_concs}; do
+  CB_OUT=/tmp/mg_cb_$CC.txt
+  wait_gpu_clear
+  if timeout 1800 build/runtime/qwen3_gguf_cb_bench "$GGUF" "$CC" {cb_tokens} {cb_tokens} 512 > "$CB_OUT" 2>&1; then
+    CB_AGG=$(sed -n 's/.*agg_tok_s=\\([0-9.]*\\).*/\\1/p' "$CB_OUT" | tail -1)
+    if [ -n "${{CB_AGG:-}}" ] && python3 -c "import sys; sys.exit(0 if float(sys.argv[1]) > 0 else 1)" "${{CB_AGG:-0}}"; then
+      echo "MUSECB $CC $CB_AGG"
+    else
+      echo "MUSECB_FAILED $CC"
+      echo "concurrent decode produced no positive metric at c=$CC" >&2
+      tail -10 "$CB_OUT" >&2 || true
+    fi
+  else
+    echo "MUSECB_FAILED $CC"
+    echo "concurrent-decode harness exited nonzero at c=$CC" >&2
+    tail -10 "$CB_OUT" >&2 || true
+  fi
+done
 
 # --- accuracy gate: sparkinfer teacher-forced score vs a live llama-server reference, same
 # GGUF, same eval_text.txt corpus this session already validated by hand (6d911d4) ---
@@ -913,11 +963,28 @@ def _at(res: dict, ctx: int, phase: str) -> float:
     return float(((res.get("muse") or {}).get(ctx) or {}).get(phase, 0.0) or 0.0)
 
 
+def _cb(res: dict, conc: int):
+    """One concurrent-decode measurement, or None when that concurrency point was not measured.
+
+    None (not 0.0) on purpose: a point the harness could not produce must DROP its axis, never be
+    scored as a regression to zero. _at() returns 0.0 for a missing single-request context because
+    those come from one sweep that either ran or did not; the concurrency points are independent
+    runs where one can fail on its own."""
+    v = (res.get("muse_cb") or {}).get(conc)
+    try:
+        v = float(v)
+    except (TypeError, ValueError):
+        return None
+    return v if v > 0 else None
+
+
 def _parse_remote(stdout: str) -> dict:
     out = {}
     guard36 = {}
     guardmo = {}
     muse = {}
+    muse_cb = {}
+    cb_failed = set()
     for line in (stdout or "").splitlines():
         if line.startswith("REMOTE_HEAD "):
             out["head"] = line.split()[1]
@@ -965,6 +1032,20 @@ def _parse_remote(stdout: str) -> dict:
                     pass
         elif line.strip() == "MUSE_FAILED":
             out["muse_failed"] = True
+        elif line.startswith("MUSECB "):
+            parts = line.split()
+            if len(parts) >= 3:
+                try:
+                    muse_cb[int(parts[1])] = float(parts[2])
+                except ValueError:
+                    pass
+        elif line.startswith("MUSECB_FAILED"):
+            parts = line.split()
+            if len(parts) >= 2:
+                try:
+                    cb_failed.add(int(parts[1]))
+                except ValueError:
+                    pass
         elif line.startswith("GUARD36 "):
             parts = line.split()
             if len(parts) >= 4:
@@ -988,6 +1069,8 @@ def _parse_remote(stdout: str) -> dict:
     out["guard36"] = guard36
     out["guardmo"] = guardmo
     out["muse"] = muse
+    out["muse_cb"] = muse_cb
+    out["cb_failed"] = sorted(cb_failed)
     return out
 
 
@@ -1209,6 +1292,28 @@ def eval_museglimmer_on_box(host, port, pr_ref: str, main: dict):
             lab, dlt, ok, why = tier_from_gain(
                 pr_vals.get(phase, 0.0), main_vals.get(phase, 0.0), metric=name)
             scored.append({"dim": name, "label": lab, "delta": dlt, "passed": ok, "reason": why})
+
+    # Concurrent decode (issue #1026). An axis is scored only when BOTH sides produced a positive
+    # measurement; a point either run could not produce is DROPPED, not scored as a regression.
+    # These are five independent processes, any one of which can fail on its own (OOM at the
+    # widest concurrency is the expected case -- at c=32 the KV pool for 33 sequences leaves the
+    # card with almost nothing, and that is a property of the box, not of the PR). Reading a
+    # missing run as 0.0 would hard-REJECT an innocent PR, since every axis is also a
+    # no-regression floor.
+    cb_skipped = []
+    for conc in CB_CONCS:
+        name = CB_DIM_FOR[conc]
+        pr_v, main_v = _cb(pr, conc), _cb(main, conc)
+        if pr_v is None or main_v is None:
+            cb_skipped.append(f"{name} (pr={'-' if pr_v is None else f'{pr_v:.1f}'} "
+                              f"main={'-' if main_v is None else f'{main_v:.1f}'})")
+            continue
+        lab, dlt, ok, why = tier_from_gain(pr_v, main_v, metric=name)
+        scored.append({"dim": name, "label": lab, "delta": dlt, "passed": ok, "reason": why})
+    if cb_skipped:
+        print(f">> concurrent-decode axes not scored (no paired measurement): "
+              f"{', '.join(cb_skipped)}")
+
     by_dim = {x["dim"]: x for x in scored}
 
     regressed = [x for x in scored if x["label"] == "REJECT"]
