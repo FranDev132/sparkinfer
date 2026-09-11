@@ -47,8 +47,9 @@ void launch_prefill_split_q_gate(const void* qraw, void* q, void* gate,
                                  cudaStream_t stream = nullptr);
 
 // Batched attn *= sigmoid(gate), elementwise over n_tokens*dim (Qwen3.6 q-gate).
+// gate_ld: row pitch of `gate` in elements when it is a column slice of a wider packed buffer.
 void launch_prefill_mul_sigmoid(void* attn, const void* gate, int n_tokens, int dim,
-                                cudaStream_t stream = nullptr);
+                                cudaStream_t stream = nullptr, int gate_ld = 0);
 
 // Gated-DeltaNet causal depthwise conv (conv_kernel taps) + split(q,k,v) + SiLU + L2-norm(q,k),
 // over all N tokens. Leaves the last conv_kernel-1 raw qkv rows in conv_state (decode layout).
@@ -187,13 +188,18 @@ bool launch_prefill_attn_mma_bf16_vi8(
     int head_dim, int block_size, int max_blocks_per_seq, float scale,
     cudaStream_t stream, int q_pos0 = 0);
 
+// q_out/src_ld: when the caller already holds q|gate|k|v as ONE packed [n_tokens, src_ld] GEMM
+// output, pass each column base plus that row pitch and this kernel reads it in place -- the
+// separate copies out to tight arrays are then pure duplicated traffic. q still lands tight in
+// q_out (the attention wants that stride); k and v go straight to the pools and need no tight
+// form at all. Defaults keep the three-tight-arrays contract every other caller has.
 void launch_prefill_qknorm_ropenorm_kv_bf16(
     void* q, void* k, const void* v, const void* q_w, const void* k_w,
     void* k_pool, void* v_pool,
     const int* block_table, int n_tokens, int n_q_heads, int n_kv_heads, int head_dim,
     int rotary_dim, float theta, float eps, int block_size, int max_blocks_per_seq,
     cudaStream_t stream = nullptr,
-    int pos0 = 0);
+    int pos0 = 0, void* q_out = nullptr, int src_ld = 0);
 
 // int8-KV twin of the above (Muse Glimmer at ctx >= 4096): same QK-norm + NORMAL RoPE, K/V
 // quantised to int8 with one fp16 scale per (token, kv_head).
@@ -202,7 +208,7 @@ void launch_prefill_qknorm_ropenorm_kv_int8(
     void* k_pool, void* v_pool, void* k_scale, void* v_scale,
     const int* block_table, int n_tokens, int n_q_heads, int n_kv_heads, int head_dim,
     int rotary_dim, float theta, float eps, int block_size, int max_blocks_per_seq,
-    cudaStream_t stream, int pos0 = 0);
+    cudaStream_t stream, int pos0 = 0, void* q_out = nullptr, int src_ld = 0);
 
 // Full-attention prefill: causal attention over the paged int8 KV pool just filled above.
 // One warp per (token, q-head); online softmax over keys 0..q_pos0+token (causal). q is the rope'd
