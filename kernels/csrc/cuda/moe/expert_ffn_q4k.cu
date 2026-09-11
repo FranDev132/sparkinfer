@@ -16,6 +16,10 @@
 // Portable CUDA — sm_89/90/100/120, the set CMAKE_CUDA_ARCHITECTURES actually builds.
 // sm_121 is excluded (needs CUDA 12.9+); see CMakeLists.txt.
 
+#ifndef SPARKINFER_NVRTC_DEVICE_ONLY
+#include <mutex>
+#endif
+
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #ifndef SPARKINFER_NVRTC_DEVICE_ONLY
@@ -1831,6 +1835,246 @@ static inline bool launch_down_q6k_mmvq_splitk(
         default: return false;
     }
 }
+// ---- Q4_K straight into the int8 tensor cores, for batches the MMVQ cannot amortise ----
+// The per-row MMVQ below re-does the dot product once per row, so its cost is ~21.7 + 14.9*M us
+// per layer -- at 32 rows that is ~520 us against a 74.8 MB / 1792 GB/s = 41.7 us weight-read
+// floor. This is the Marlin shape instead: dequantise inside the mainloop and let mma.sync do the
+// arithmetic, so the weights are read once for the whole batch. m16n8k32 spans exactly 32 K, which
+// is exactly one Q4_K scale group, so the group scales fold in per-mma with the accumulator still
+// in registers.
+//
+// Same arithmetic as si_vec_dot_q4_K, per 32-group:
+//     sum(w*a) = (d * sc_j * d8) * sum(q_w*q_a) - (dmin * m_j) * s
+// with s the Q8_1 ds.y, so sum(q_a) needs no second mma. NOT bit-identical to the MMVQ -- the
+// reduction order differs -- so it is gated to batches where it is a clear win.
+#if __CUDA_ARCH__ >= 800 || !defined(__CUDA_ARCH__)
+namespace {
+constexpr int SI_MMA_BN = 32;      // output rows per block
+// K-splits. H/BN = 208 blocks is only 1.2 per SM on 170 SMs while the kernel fits 8, so the GRID,
+// not the tile, was the limit: splitting K multiplies the block count without shrinking the tile.
+// Measured at the real shape, M=32: SK 1 -> 349.7 us, 2 -> 225.1, 4 -> 178.1, 8 -> 171.2,
+// 16 -> 168.9. Eight is the knee.
+constexpr int SI_MMA_SK = 8;
+constexpr int SI_MMA_MMAX = 32;    // decode batch ceiling
+// Split-K needs an fp32 accumulator, and neither scratch the caller hands us is free: out_scratch
+// is reinterpreted as the Q8_1 activations this kernel READS, and h_scratch holds the gate/up
+// output. Own one instead -- 32 x 6656 floats is 852 KB per slot, sized for the widths the
+// dispatch gates to.
+//
+// A slot per stream, because decode is not single-stream: it runs on the main stream while a
+// prefill chunk short enough to reach this arm can be in flight on its own, and one buffer would
+// have the two accumulate into each other. Launches within ONE stream are ordered, so a slot bound
+// to a stream is exclusively that stream's; a stream past the table declines to the MMVQ.
+//
+// Static, and deliberately not allocated on demand: decode captures CUDA graphs, and a cudaMalloc
+// during capture invalidates the graph -- which shows up as "verify graph launch: invalid
+// argument" and a step that returns without doing the work.
+constexpr int SI_MMA_SLOTS = 4;
+__device__ float si_mma_down_acc[SI_MMA_SLOTS][SI_MMA_MMAX * 6656];
+constexpr int SI_MMA_NW = 4;
+
+__device__ __forceinline__ int si_mma_swz(int k, int row) {
+    return (((k >> 4) ^ (row & 3)) << 4) | (k & 15);
+}
+__device__ __forceinline__ void si_mma_ldm(unsigned& r0, unsigned& r1, unsigned& r2, unsigned& r3,
+                                           const signed char* p) {
+    const unsigned a = (unsigned)__cvta_generic_to_shared(p);
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                 : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3) : "r"(a));
+}
+// The 6-bit (sc, m) pair for sub-blocks 2j and 2j+1, exactly as si_vec_dot_q4_K unpacks them.
+__device__ __forceinline__ void si_mma_q4k_scales(const unsigned char* sc12, int j,
+                                                  unsigned char& a0, unsigned char& a1,
+                                                  unsigned char& b0, unsigned char& b1) {
+    const unsigned short* s = reinterpret_cast<const unsigned short*>(sc12);
+    unsigned short aux[2];
+    if (j < 2) { aux[0] = s[j] & 0x3f3f; aux[1] = s[j + 2] & 0x3f3f; }
+    else       { aux[0] = ((s[j + 2] >> 0) & 0x0f0f) | ((s[j - 2] & 0xc0c0) >> 2);
+                 aux[1] = ((s[j + 2] >> 4) & 0x0f0f) | ((s[j]     & 0xc0c0) >> 2); }
+    const unsigned char* u = reinterpret_cast<const unsigned char*>(aux);
+    a0 = u[0]; a1 = u[1]; b0 = u[2]; b1 = u[3];
+}
+}  // namespace
+
+__global__ __launch_bounds__(SI_MMA_NW * 32, 8)
+void down_q4k_mma_rows_kernel(const unsigned char* __restrict__ down_q,
+                              const int* __restrict__ expert_ids,
+                              const float* __restrict__ expert_weights,
+                              const si_block_q8_1* __restrict__ hq8,
+                              float* __restrict__ acc_out,
+                              int H, int F, int top_k, int M, int pdl) {
+    if (pdl) si_pdl_sync();
+    const int nblk = F >> 8;
+    const int n0 = blockIdx.x * SI_MMA_BN;
+    // Balanced, not ceil: 78 super-blocks over 8 splits is 10,10,10,10,10,10,9,9 rather than seven
+    // 10s and an 8, and the launch waits for the longest split.
+    const int sk = (int)gridDim.y;
+    const int sb_base = nblk / sk, sb_extra = nblk % sk;
+    const int sb_lo = (int)blockIdx.y * sb_base + ((int)blockIdx.y < sb_extra ? (int)blockIdx.y : sb_extra);
+    const int sb_hi = sb_lo + sb_base + ((int)blockIdx.y < sb_extra ? 1 : 0);
+    const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+    const int grp = lane >> 2, tig = lane & 3, sub = lane >> 3, lrow = lane & 7;
+    const int e0 = expert_ids[0];
+
+    __shared__ signed char As[SI_MMA_MMAX][256];
+    __shared__ signed char Bs[SI_MMA_BN][256];
+    __shared__ unsigned char Ssc[SI_MMA_BN][8], Smn[SI_MMA_BN][8];
+    __shared__ float2 Wdm[SI_MMA_BN];
+    __shared__ float Ad[SI_MMA_MMAX][8], Asum[SI_MMA_MMAX][8];
+
+    float facc[2][4];
+    #pragma unroll
+    for (int i = 0; i < 2; i++)
+        #pragma unroll
+        for (int e = 0; e < 4; e++) facc[i][e] = 0.f;
+
+    for (int sb = sb_lo; sb < sb_hi; sb++) {
+        // One 16B output chunk per unit: the swizzle permutes whole 16B chunks, so addresses
+        // inside a chunk are contiguous and each unit is a single uint4 store.
+        for (int u = tid; u < SI_MMA_BN * 16; u += SI_MMA_NW * 32) {
+            const int r = u >> 4, c = u & 15;
+            const si_block_q4_K* b = reinterpret_cast<const si_block_q4_K*>(
+                down_q + ((size_t)e0 * H + (n0 + r)) * (size_t)nblk * 144) + sb;
+            const int j = c >> 2, sc_ = c & 3;
+            const bool hi = (sc_ >> 1) & 1;
+            const unsigned* src = reinterpret_cast<const unsigned*>(b->qs + 32 * j + (sc_ & 1) * 16);
+            signed char out[16];
+            #pragma unroll
+            for (int v = 0; v < 4; v++) {
+                const unsigned x = src[v];
+                #pragma unroll
+                for (int t = 0; t < 4; t++) {
+                    const unsigned char q = (unsigned char)((x >> (8 * t)) & 0xFF);
+                    out[4 * v + t] = (signed char)(hi ? (q >> 4) : (q & 0xF));
+                }
+            }
+            const int kb = 64 * j + (sc_ >> 1) * 32 + (sc_ & 1) * 16;
+            *reinterpret_cast<uint4*>(&Bs[r][si_mma_swz(kb, r)]) = *reinterpret_cast<const uint4*>(out);
+            if (c == 0) {
+                Wdm[r] = __half22float2(b->dm);
+                #pragma unroll
+                for (int jj = 0; jj < 4; jj++) {
+                    unsigned char x0, x1, y0, y1;
+                    si_mma_q4k_scales(b->scales, jj, x0, x1, y0, y1);
+                    Ssc[r][2 * jj] = x0; Ssc[r][2 * jj + 1] = x1;
+                    Smn[r][2 * jj] = y0; Smn[r][2 * jj + 1] = y1;
+                }
+            }
+        }
+        // hq8's qs sits at offset 4 of a 36B struct: 4B-aligned, never 16B. Read four uints.
+        for (int u = tid; u < M * 16; u += SI_MMA_NW * 32) {
+            const int r = u >> 4, c = u & 15;
+            const si_block_q8_1* a = hq8 + (size_t)r * (F >> 5) + sb * 8 + (c >> 1);
+            const unsigned* src = reinterpret_cast<const unsigned*>(a->qs + (c & 1) * 16);
+            uint4 v; v.x = src[0]; v.y = src[1]; v.z = src[2]; v.w = src[3];
+            *reinterpret_cast<uint4*>(&As[r][si_mma_swz(16 * c, r)]) = v;
+            if ((c & 1) == 0) {
+                const float2 ds = __half22float2(a->ds);
+                Ad[r][c >> 1] = ds.x; Asum[r][c >> 1] = ds.y;
+            }
+        }
+        __syncthreads();
+
+        #pragma unroll 1
+        for (int g = 0; g < 8; g++) {
+            const int kk = g * 32;
+            unsigned af[2][4], bf[2];
+            #pragma unroll
+            for (int i = 0; i < 2; i++) {
+                const int row = i * 16 + (sub & 1) * 8 + lrow;
+                si_mma_ldm(af[i][0], af[i][1], af[i][2], af[i][3],
+                           &As[row < SI_MMA_MMAX ? row : 0][si_mma_swz(kk + (sub >> 1) * 16, row)]);
+            }
+            unsigned bx, by;
+            const int col = warp * 8 + lrow;
+            si_mma_ldm(bf[0], bf[1], bx, by, &Bs[col][si_mma_swz(kk + (sub & 1) * 16, col)]);
+            (void)bx; (void)by;
+
+            #pragma unroll
+            for (int i = 0; i < 2; i++) {
+                int acc[4] = {0, 0, 0, 0};
+                asm volatile(
+                    "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
+                    "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+                    : "+r"(acc[0]), "+r"(acc[1]), "+r"(acc[2]), "+r"(acc[3])
+                    : "r"(af[i][0]), "r"(af[i][1]), "r"(af[i][2]), "r"(af[i][3]),
+                      "r"(bf[0]), "r"(bf[1]));
+                #pragma unroll
+                for (int e = 0; e < 4; e++) {
+                    const int lm = i * 16 + grp + (e >> 1) * 8;
+                    const int ln = warp * 8 + tig * 2 + (e & 1);
+                    if (lm >= M) continue;
+                    const float2 dm = Wdm[ln];
+                    facc[i][e] += dm.x * (float)Ssc[ln][g] * Ad[lm][g] * (float)acc[e]
+                                - dm.y * (float)Smn[ln][g] * Asum[lm][g];
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+    #pragma unroll
+    for (int i = 0; i < 2; i++)
+        #pragma unroll
+        for (int e = 0; e < 4; e++) {
+            const int lm = i * 16 + grp + (e >> 1) * 8;
+            const int gn = n0 + warp * 8 + tig * 2 + (e & 1);
+            if (lm < M && gn < H) atomicAdd(&acc_out[(size_t)lm * H + gn], facc[i][e]);
+        }
+}
+
+// Scales by the expert weight, narrows to bf16, and re-zeroes what it consumed so the next call
+// needs no memset of its own.
+__global__ void down_q4k_mma_epilogue_kernel(float* __restrict__ acc,
+                                            const float* __restrict__ expert_weights,
+                                            __nv_bfloat16* __restrict__ output,
+                                            int H, int top_k, int M) {
+    const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (size_t)M * H) return;
+    const int lm = (int)(i / (size_t)H);
+    output[i] = __float2bfloat16(acc[i] * expert_weights[(size_t)lm * top_k]);
+    acc[i] = 0.f;
+}
+
+// Claim this stream's slot, first call wins. The table only ever grows and holds a handful of
+// entries, so the lock is contended only on the few calls that add a stream.
+static int si_mma_down_slot_for(cudaStream_t stream) {
+    static std::mutex mu;
+    static cudaStream_t owners[SI_MMA_SLOTS] = {};
+    static int used = 0;
+    std::lock_guard<std::mutex> lk(mu);
+    for (int i = 0; i < used; i++) if (owners[i] == stream) return i;
+    if (used >= SI_MMA_SLOTS) return -1;
+    owners[used] = stream;
+    return used++;
+}
+
+static inline bool launch_down_q4k_mma_rows(
+    int pdl, const unsigned char* down_q, const int* expert_ids, const float* expert_weights,
+    const si_block_q8_1* hq8, __nv_bfloat16* output,
+    int H, int F, int top_k, int M, cudaStream_t stream
+) {
+    if (M < 2 || M > SI_MMA_MMAX || top_k != 1 || (F & 255) || (H % SI_MMA_BN)) return false;
+    if ((size_t)M * (size_t)H > (size_t)SI_MMA_MMAX * 6656u) return false;
+    const int slot = si_mma_down_slot_for(stream);
+    if (slot < 0) return false;
+    float* acc_scratch = nullptr;
+    if (cudaGetSymbolAddress(reinterpret_cast<void**>(&acc_scratch), si_mma_down_acc) != cudaSuccess)
+        return false;
+    acc_scratch += (size_t)slot * SI_MMA_MMAX * 6656u;
+    const int nblk = F >> 8;
+    int sk = SI_MMA_SK; if (sk > nblk) sk = nblk;   // never launch a split with nothing to reduce
+    const size_t n = (size_t)M * (size_t)H;
+    launch_pdl_kernel(pdl, dim3(H / SI_MMA_BN, sk), dim3(SI_MMA_NW * 32), 0, stream,
+                      down_q4k_mma_rows_kernel, down_q, expert_ids, expert_weights, hq8,
+                      acc_scratch, H, F, top_k, M, pdl);
+    const int thr = 256;
+    down_q4k_mma_epilogue_kernel<<<(unsigned)((n + thr - 1) / thr), thr, 0, stream>>>(
+        acc_scratch, expert_weights, output, H, top_k, M);
+    return true;
+}
+#endif
+
 // Row-batched counterpart of launch_down_q4k_mmvq_splitk. Only the generic (non shape-specialized)
 // split-K kernel has a rows form, so this declines anything it does not cover and the caller falls
 // back to the per-token grid.
@@ -2585,6 +2829,28 @@ void launch_moe_expert_ffn_q4k(
             //
             // A one-row tail has no instantiation (the launcher declines M < 2), so when the
             // remainder would be 1 the preceding chunk gives up a row and the tail runs as 2.
+            // Wide batches go to the tensor-core path instead of being chunked: the MMVQ costs
+            // ~21.7 + 14.9*M us per layer, so at 32 rows four (or two) chunks re-read the weights
+            // and still pay the per-row arithmetic, while the mma kernel reads them once for the
+            // whole batch. It loses below ~24 rows, where the MMVQ's cheaper setup still wins, so
+            // the crossover is a floor and not a preference.
+            // SPARKINFER_DOWN_MMA=0 keeps every width on the MMVQ.
+            static int down_mma = -1;
+            if (down_mma < 0) { const char* e = getenv("SPARKINFER_DOWN_MMA"); down_mma = (e && e[0] == '0') ? 0 : 1; }
+            // Eight rows is where the tensor-core arm starts paying, and the floor is about the
+            // weight traffic rather than the arithmetic. The MMVQ chunks at eight rows, so at or
+            // below that width it already reads ffn_down exactly once -- the same as the mma
+            // kernel, which pads M to the 16 rows of an m16n8k32 tile. Below eight there is no
+            // traffic to win back and the padding is pure waste: four rows measured 5.9% slower
+            // end to end, while eight is 5.2% faster and sixteen 23% faster.
+            static int down_mma_min = -1;
+            if (down_mma_min < 0) { const char* e = getenv("SPARKINFER_DOWN_MMA_MINROWS"); down_mma_min = e ? atoi(e) : 8; }
+            if (down_mma && num_tokens >= down_mma_min && top_k == 1 &&
+                launch_down_q4k_mma_rows(pdl, reinterpret_cast<const unsigned char*>(down_q),
+                                         expert_ids, expert_weights, hq8,
+                                         reinterpret_cast<__nv_bfloat16*>(output),
+                                         hidden, ffn, top_k, num_tokens, stream))
+                return;
             if (down_rows && num_tokens >= 2 && top_k == 1) {
                 // One pass over ffn_down per chunk, so the chunk width IS the number of times
                 // a packed step re-reads 3.9 GB. Eight was the widest instantiation; the arm now

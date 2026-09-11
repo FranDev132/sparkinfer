@@ -37,3 +37,8 @@ set_tests_properties(sparse_gate_up_rows_gpu_test PROPERTIES SKIP_RETURN_CODE 77
 add_executable(mmvq_mma_accuracy_gpu_test mmvq_mma_accuracy_gpu_test.cpp)
 target_link_libraries(mmvq_mma_accuracy_gpu_test PRIVATE sparkinfer_kernels CUDA::cudart)
 set_target_properties(mmvq_mma_accuracy_gpu_test PROPERTIES CXX_STANDARD 17)
+# The tensor-core down projection against the MMVQ, dumped per process so the two can be diffed.
+# Not a ctest: it needs two runs with different env to be meaningful, and ~1 GB of device memory.
+add_executable(down_mma_accuracy_gpu_test down_mma_accuracy_gpu_test.cpp)
+target_link_libraries(down_mma_accuracy_gpu_test PRIVATE sparkinfer_kernels CUDA::cudart)
+set_target_properties(down_mma_accuracy_gpu_test PROPERTIES CXX_STANDARD 17)
