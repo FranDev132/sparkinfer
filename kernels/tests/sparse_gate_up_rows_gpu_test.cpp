@@ -1,5 +1,5 @@
 // The row-batched contextual-sparsity gate/up must be BIT-IDENTICAL, per row, to the per-token
-// kernel it replaces. That is the whole basis on which a packed continuous-batch step is allowed
+// kernel it replaces, at every width -- including the widths served by more than one chunk. That is the whole basis on which a packed continuous-batch step is allowed
 // to share one weight read across its rows: the batch changes how the weights are fetched, never
 // what any row computes -- and in particular never which neurons a row gates off.
 //
@@ -21,7 +21,10 @@
 namespace {
 
 constexpr int H = 6656, F = 19968;     // Muse Glimmer's dense FFN
-constexpr int MAXROWS = 16;
+// kQwen35MaxPackedRows, not the kernel's widest instantiation: past that width the dispatch walks
+// the batch in chunks, and the chunk pointer arithmetic is the part that is new. 17..32 are the
+// cases where a row is served by a chunk that does not start at row 0.
+constexpr int MAXROWS = 32;
 
 // Deterministic byte fill. Any byte pattern is a structurally valid Q4_K super-block -- the
 // formats have no reserved encodings -- so random bytes exercise the decode paths without needing

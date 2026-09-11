@@ -2064,12 +2064,17 @@ __global__ void swiglu_rows_bf16_f32_kernel(const __nv_bfloat16* __restrict__ g,
     if (i < n) h[i] = q4kf_silu(__bfloat162float(g[i])) * __bfloat162float(u[i]);
 }
 
-// Widest packed batch the row-batched sparse gate/up is instantiated for. Sixteen, because the
-// continuous-batch scheduler hands the packed forward its whole live set and sixteen is the
-// widest that fits alongside Muse Glimmer's weights on a 32 GB card.
+// Widest packed batch the row-batched sparse gate/up is instantiated for, and so the width this
+// arm walks a batch in -- a CHUNK width, not a cap.
+//
+// The continuous-batch scheduler hands the packed forward its whole live set, up to
+// kQwen35MaxPackedRows = 32, and a batch wider than this used to decline outright and give the
+// WHOLE batch to the per-token grid. That grid is token-major, so 32 rows walked all 149 MB of a
+// layer's gate/up thirty-two times with nothing left in L2 between rows -- the exact cost this arm
+// exists to remove, reintroduced in full at the width the scheduler actually reaches.
 static constexpr int kMuseGuRowsMax = 16;
 
-// SPARKINFER_MUSE_GU_ROWS_MAX caps that width at runtime so both arms come out of ONE binary.
+// SPARKINFER_MUSE_GU_ROWS_MAX sets that width at runtime so both arms come out of ONE binary.
 // =1 declines every packed width and is exactly the per-token behaviour this replaces.
 static inline int muse_gu_rows_max() {
     static int v = -1;
@@ -2416,22 +2421,37 @@ void launch_moe_expert_ffn_q4k(
             // come out of ONE binary.
             static int gu_sparse_rows = -1;
             if (gu_sparse_rows < 0) { const char* e = getenv("SPARKINFER_MUSE_GU_SPARSE_ROWS"); gu_sparse_rows = (e && e[0] == '0') ? 0 : 1; }
-#define SI_GU_SPARSE_ROWS_MG(MM) launch_pdl_kernel(gu_pdl, dim3(ffn), dim3(4 * 32), 0, stream, \
+// Each chunk is an independent set of token rows -- h_scratch[r*F+f] is a pure store and the mask
+// is per row -- so walking the batch in chunks changes nothing any row computes, exactly as the
+// down projection beside it is chunked over its own widest instantiation.
+#define SI_GU_SPARSE_ROWS_MG(MM, T0) launch_pdl_kernel(gu_pdl, dim3(ffn), dim3(4 * 32), 0, stream, \
                 gate_up_mmvq2_qwen_sparse_rows_kernel<6656, 19968, 1, MM>, \
-                q, reinterpret_cast<const unsigned char*>(gate_q), \
-                reinterpret_cast<const unsigned char*>(up_q), expert_ids, h_scratch, \
-                g_mg_sparse_tau, gu_pdl)
-            if (g_mg_sparse_tau > 0.f && gu_sparse_rows && num_tokens >= 2
-                && num_tokens <= muse_gu_rows_max()) {
-                switch (num_tokens) {
-                    case 2:  SI_GU_SPARSE_ROWS_MG(2);  break;  case 3:  SI_GU_SPARSE_ROWS_MG(3);  break;
-                    case 4:  SI_GU_SPARSE_ROWS_MG(4);  break;  case 5:  SI_GU_SPARSE_ROWS_MG(5);  break;
-                    case 6:  SI_GU_SPARSE_ROWS_MG(6);  break;  case 7:  SI_GU_SPARSE_ROWS_MG(7);  break;
-                    case 8:  SI_GU_SPARSE_ROWS_MG(8);  break;  case 9:  SI_GU_SPARSE_ROWS_MG(9);  break;
-                    case 10: SI_GU_SPARSE_ROWS_MG(10); break;  case 11: SI_GU_SPARSE_ROWS_MG(11); break;
-                    case 12: SI_GU_SPARSE_ROWS_MG(12); break;  case 13: SI_GU_SPARSE_ROWS_MG(13); break;
-                    case 14: SI_GU_SPARSE_ROWS_MG(14); break;  case 15: SI_GU_SPARSE_ROWS_MG(15); break;
-                    default: SI_GU_SPARSE_ROWS_MG(16); break;
+                q + (size_t)(T0) * (6656 >> 5), reinterpret_cast<const unsigned char*>(gate_q), \
+                reinterpret_cast<const unsigned char*>(up_q), expert_ids + (size_t)(T0), \
+                h_scratch + (size_t)(T0) * 19968, g_mg_sparse_tau, gu_pdl)
+            // SPARKINFER_MUSE_GU_ROWS_CHUNK=0 declines past one chunk instead of walking the rest,
+            // which is exactly the previous behaviour, so both arms come out of ONE binary.
+            static int gu_chunk = -1;
+            if (gu_chunk < 0) { const char* e = getenv("SPARKINFER_MUSE_GU_ROWS_CHUNK"); gu_chunk = (e && e[0] == '0') ? 0 : 1; }
+            const int GMAX = muse_gu_rows_max();
+            if (g_mg_sparse_tau > 0.f && gu_sparse_rows && num_tokens >= 2 && GMAX >= 2
+                && (gu_chunk || num_tokens <= GMAX)) {
+                for (int t0 = 0; t0 < num_tokens; ) {
+                    int m = num_tokens - t0;
+                    // A one-row tail has no instantiation, so the preceding chunk gives up a row
+                    // and the tail runs as two. GMAX >= 2 above keeps that from going below two.
+                    if (m > GMAX) { m = GMAX; if (num_tokens - t0 - m == 1) m = GMAX - 1; }
+                    switch (m) {
+                        case 2:  SI_GU_SPARSE_ROWS_MG(2, t0);  break;  case 3:  SI_GU_SPARSE_ROWS_MG(3, t0);  break;
+                        case 4:  SI_GU_SPARSE_ROWS_MG(4, t0);  break;  case 5:  SI_GU_SPARSE_ROWS_MG(5, t0);  break;
+                        case 6:  SI_GU_SPARSE_ROWS_MG(6, t0);  break;  case 7:  SI_GU_SPARSE_ROWS_MG(7, t0);  break;
+                        case 8:  SI_GU_SPARSE_ROWS_MG(8, t0);  break;  case 9:  SI_GU_SPARSE_ROWS_MG(9, t0);  break;
+                        case 10: SI_GU_SPARSE_ROWS_MG(10, t0); break;  case 11: SI_GU_SPARSE_ROWS_MG(11, t0); break;
+                        case 12: SI_GU_SPARSE_ROWS_MG(12, t0); break;  case 13: SI_GU_SPARSE_ROWS_MG(13, t0); break;
+                        case 14: SI_GU_SPARSE_ROWS_MG(14, t0); break;  case 15: SI_GU_SPARSE_ROWS_MG(15, t0); break;
+                        default: SI_GU_SPARSE_ROWS_MG(16, t0); break;
+                    }
+                    t0 += m;
                 }
             }
             else if (g_mg_sparse_tau > 0.f)   // Muse Glimmer contextual-sparsity FFN (skip gated-off up reads)
