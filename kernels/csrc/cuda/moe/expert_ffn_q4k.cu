@@ -1839,7 +1839,7 @@ static inline bool launch_down_q4k_mmvq_splitk_rows(
     const float* expert_weights, const si_block_q8_1* hq8, __nv_bfloat16* output,
     int H, int F, int top_k, cudaStream_t stream
 ) {
-    if (M < 2 || M > 8) return false;
+    if (M < 2 || M > 16) return false;
     const dim3 block(WPB * 32);
 #define SI_DOWN_ROWS(S_, M_) do { \
         launch_mmvq_down_kernel(pdl, grid, block, stream, down_q4k_mmvq_splitk_rows_kernel<S_, M_>, \
@@ -1851,7 +1851,11 @@ static inline bool launch_down_q4k_mmvq_splitk_rows(
             case 2: SI_DOWN_ROWS(S_, 2); case 3: SI_DOWN_ROWS(S_, 3); \
             case 4: SI_DOWN_ROWS(S_, 4); case 5: SI_DOWN_ROWS(S_, 5); \
             case 6: SI_DOWN_ROWS(S_, 6); case 7: SI_DOWN_ROWS(S_, 7); \
-            default: SI_DOWN_ROWS(S_, 8); \
+            case 8: SI_DOWN_ROWS(S_, 8); case 9: SI_DOWN_ROWS(S_, 9); \
+            case 10: SI_DOWN_ROWS(S_, 10); case 11: SI_DOWN_ROWS(S_, 11); \
+            case 12: SI_DOWN_ROWS(S_, 12); case 13: SI_DOWN_ROWS(S_, 13); \
+            case 14: SI_DOWN_ROWS(S_, 14); case 15: SI_DOWN_ROWS(S_, 15); \
+            default: SI_DOWN_ROWS(S_, 16); \
         } \
     } while (0)
     if (S == 2)      SI_DOWN_ROWS_M(2);
@@ -2348,7 +2352,9 @@ void launch_moe_expert_ffn_q4k(
             // A one-row tail has no instantiation (the launcher declines M < 2), so when the
             // remainder would be 1 the preceding chunk gives up a row and the tail runs as 2.
             if (down_rows && num_tokens >= 2 && top_k == 1) {
-                constexpr int DMAX = 8;
+                static int dw16 = -1;
+                if (dw16 < 0) { const char* e = getenv("SPARKINFER_DOWN_W16"); dw16 = (e && e[0] == '0') ? 0 : 1; }
+                const int DMAX = dw16 ? 16 : 8;
                 dim3 dnr(1, (hidden + RPB - 1) / RPB);
                 const size_t q8pb = (size_t)(ffn >> 5);
                 bool rows_ok = true;
