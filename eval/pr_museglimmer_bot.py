@@ -1398,6 +1398,8 @@ def eval_museglimmer_on_box(host, port, pr_ref: str, main: dict):
         "modelopt_guard_problems": mo_problems,
         "muse_pr": (pr.get("muse") or {}),
         "muse_main": (main.get("muse") or {}),
+        "cb_pr": (pr.get("muse_cb") or {}),
+        "cb_main": (main.get("muse_cb") or {}),
         "guardmo_skipped": bool(pr.get("guardmo_unavailable") or main.get("guardmo_unavailable")),
         "pr_top1": pr_top1,
         "pr_kl": pr_kl,
@@ -1425,6 +1427,11 @@ def _ctx_list_str() -> str:
     return "/".join(SCORED_CTX_LABEL[c] for c in SCORED_CTXS)
 
 
+def _cb_list_str() -> str:
+    """'c2/c4/c8/c16/c32' — the concurrency points, formatted like _ctx_list_str()'s contexts."""
+    return "/".join(f"c{c}" for c in CB_CONCS)
+
+
 def _matrix_table(res: dict) -> str:
     """The full PR-vs-main matrix. Rendered from res["scored_dims"] rather than from named keys so
     it stays correct when SCORED_CTXS changes -- the previous comment hard-coded two rows and would
@@ -1445,7 +1452,35 @@ def _matrix_table(res: dict) -> str:
             flag = " **REJECT**" if d["label"] == "REJECT" else ""
             rows.append(f"| {SCORED_CTX_LABEL[ctx]} | {phase} | {mv:.2f} | {pv:.2f} | "
                         f"{d['delta']:+.1f}%{flag} |")
-    return "\n".join(rows) + "\n\n"
+    out = "\n".join(rows) + "\n\n"
+
+    # Concurrent decode, its own table -- different units (aggregate tok/s over N in-flight
+    # requests) and a different x-axis (concurrency, not context), so folding it into the ctx
+    # table above would mislabel both. Rendered from scored_dims for the reason the docstring
+    # gives: a hard-coded row list silently goes stale the next time the matrix grows.
+    cb_pr, cb_main = res.get("cb_pr") or {}, res.get("cb_main") or {}
+    cb_rows = []
+    for conc in CB_CONCS:
+        d = next((x for x in dims if x["dim"] == CB_DIM_FOR[conc]), None)
+        if not d:
+            continue
+        mv, pv = cb_main.get(conc), cb_pr.get(conc)
+        flag = " **REJECT**" if d["label"] == "REJECT" else ""
+        cb_rows.append(f"| c{conc} | {float(mv or 0):.2f} | {float(pv or 0):.2f} | "
+                       f"{d['delta']:+.1f}%{flag} |")
+    if cb_rows:
+        out += ("**Concurrent decode** — aggregate tok/s with N requests in flight\n\n"
+                "| concurrency | main | PR | delta |\n|---|---|---|---|\n"
+                + "\n".join(cb_rows) + "\n\n")
+    # Name the axes that were requested but produced no paired measurement, so a reader is never
+    # left wondering why c32 is missing rather than zero.
+    missing = [f"c{c}" for c in CB_CONCS
+               if not any(x["dim"] == CB_DIM_FOR[c] for x in dims)]
+    if missing:
+        out += (f"<sub>Concurrency {', '.join(missing)} not scored this round — no paired "
+                f"measurement (a point that fails to run is dropped, never counted as a "
+                f"regression).</sub>\n\n")
+    return out
 
 
 def format_comment(commit: str, res: dict) -> str:
@@ -1525,7 +1560,8 @@ def format_comment(commit: str, res: dict) -> str:
         f"{marker}\n## sparkinfer museglimmer auto-eval — `eval-museglimmer:{lab}`\n\n"
         f"| metric | value |\n|---|---|\n"
         f"| **label** | `eval-museglimmer:{lab}` |\n"
-        f"| scored at | decode + prefill @ {_ctx_list_str()} — every axis is also a regression floor, label is the best |\n"
+        f"| scored at | decode + prefill @ {_ctx_list_str()} · concurrent decode @ "
+        f"{_cb_list_str()} — {len(SCORING_DIMS)} axes, each also a regression floor; the label is the best |\n"
         f"| tier from | `{res.get('best_dim') or '?'}` ({res.get('delta_pct', 0):+.1f}%) |\n"
         f"{acc_row}"
         f"{main_acc_note}"
@@ -1537,8 +1573,9 @@ def format_comment(commit: str, res: dict) -> str:
         f"{_matrix_table(res)}"
         f"{res.get('reason') or ''}\n\n"
         f"<sub>Scored on the pinned eval box vs same-box `origin/main` — AR decode AND prefill at "
-        f"ctx {_ctx_list_str()}; ANY axis regressing is a hard REJECT, but "
-        f"otherwise the reported label is the **best** measured delta across the "
+        f"ctx {_ctx_list_str()}, plus concurrent decode (aggregate tok/s) at "
+        f"{_cb_list_str()}; ANY axis regressing is a hard REJECT, but "
+        f"otherwise the reported label is the **best** measured delta across all "
         f"{len(SCORING_DIMS)} — "
         "a PR that improves just one, with the rest flat, still earns credit for that. "
         "Cross-model no-regression guards run at 32k on Qwen3.6 and the ModelOpt Qwen3.8-27B "
@@ -1549,7 +1586,8 @@ def format_comment(commit: str, res: dict) -> str:
         "cross-model no-regression guards at 32k (decode+prefill, same box vs main): "
         "Qwen3.6-35B-A3B and the ModelOpt Qwen3.8-27B NVFP4 checkpoint — "
         "Muse Glimmer PRs can touch code shared with other models. "
-        "Automated — **not merged**; merge manually after review.</sub>\n"
+        "Automated. The round's best-scoring PR may be auto-merged as `merge-first` once every "
+        "gate above passes; a separate comment says so explicitly when that happens.</sub>\n"
     )
 
 
