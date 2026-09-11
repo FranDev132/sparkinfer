@@ -1938,18 +1938,18 @@ void down_q4k_mma_rows_kernel(const unsigned char* __restrict__ down_q,
             const int j = c >> 2, sc_ = c & 3;
             const bool hi = (sc_ >> 1) & 1;
             const unsigned* src = reinterpret_cast<const unsigned*>(b->qs + 32 * j + (sc_ & 1) * 16);
-            signed char out[16];
-            #pragma unroll
-            for (int v = 0; v < 4; v++) {
-                const unsigned x = src[v];
-                #pragma unroll
-                for (int t = 0; t < 4; t++) {
-                    const unsigned char q = (unsigned char)((x >> (8 * t)) & 0xFF);
-                    out[4 * v + t] = (signed char)(hi ? (q >> 4) : (q & 0xF));
-                }
-            }
+            // A Q4_K nibble expands with one mask, not a byte loop: `x & 0x0F0F0F0F` already IS
+            // the four low nibbles as four int8s in the same byte positions, and `(x >> 4) & mask`
+            // the four high ones. Byte-for-byte what the scalar loop produced, at a shift and an
+            // AND per word instead of four extracts, four selects and four byte stores.
+            uint4 out;
+            constexpr unsigned kNib = 0x0F0F0F0Fu;
+            out.x = hi ? ((src[0] >> 4) & kNib) : (src[0] & kNib);
+            out.y = hi ? ((src[1] >> 4) & kNib) : (src[1] & kNib);
+            out.z = hi ? ((src[2] >> 4) & kNib) : (src[2] & kNib);
+            out.w = hi ? ((src[3] >> 4) & kNib) : (src[3] & kNib);
             const int kb = 64 * j + (sc_ >> 1) * 32 + (sc_ & 1) * 16;
-            *reinterpret_cast<uint4*>(&Bs[r][si_mma_swz(kb, r)]) = *reinterpret_cast<const uint4*>(out);
+            *reinterpret_cast<uint4*>(&Bs[r][si_mma_swz(kb, r)]) = out;
             if (c == 0) {
                 Wdm[r] = __half22float2(b->dm);
                 #pragma unroll
