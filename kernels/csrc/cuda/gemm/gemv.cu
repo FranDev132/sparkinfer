@@ -10,6 +10,10 @@
 // consumer Blackwell). sm_121 is NOT built -- see kernels/CMakeLists.txt, which
 // excludes it as unsupported by the CUDA toolkit in use.
 
+#ifndef SPARKINFER_NVRTC_DEVICE_ONLY
+#include <mutex>
+#endif
+
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
@@ -3821,6 +3825,24 @@ void launch_mmvq_q4k_f32(const void* q81, const void* W, float* y, int N, int K,
 // Not bit-identical to the MMVQ (different reduction order), so it is gated to wide batches.
 namespace {
 constexpr int SI_AM_BN = 32, SI_AM_MMAX = 32, SI_AM_NW = 4;
+// K-splits, as a grid dimension rather than a constant so it can be swept without a rebuild.
+// N/BN alone is 128 blocks for a 4096-wide projection and 208 for the 6656-wide output, i.e. under
+// 1.3 per SM on 170 SMs while the kernel fits 8 -- the GRID, not the tile, was the limit here.
+constexpr int SI_AM_SK_DEF = 8;
+// Split-K needs an fp32 accumulator that survives across blocks, and y is bf16 and the caller's.
+// Own one: 32 x 6656 floats is 852 KB per slot, which covers every width the dispatch gates to.
+// The epilogue re-zeroes what it consumed, so no call needs a memset of its own.
+//
+// A slot per stream, because decode is not single-stream: the K/V-side projections and the GDN
+// gate are forked onto side streams, so two calls here can be in flight at once and one buffer
+// would have them accumulate into each other. Launches within ONE stream are ordered, so a slot
+// bound to a stream is exclusively that stream's; a stream past the table declines to the MMVQ.
+//
+// Static, and deliberately not allocated on demand: decode captures CUDA graphs, and a cudaMalloc
+// reached during capture invalidates the graph -- which surfaces as "verify graph launch: invalid
+// argument" and a step that returns without doing the work.
+constexpr int SI_AM_SLOTS = 4;
+__device__ float si_am_acc[SI_AM_SLOTS][SI_AM_MMAX * 6656];
 
 __device__ __forceinline__ int si_am_swz(int k, int row) {
     return (((k >> 4) ^ (row & 3)) << 4) | (k & 15);
@@ -3844,11 +3866,22 @@ __device__ __forceinline__ void si_am_scales(const unsigned char* sc12, int j,
 }
 }  // namespace
 
+// SPLITK=true accumulates across blockIdx.y into an fp32 scratch, which is what a narrow output
+// needs to fill the grid. SPLITK=false is the single-split case and writes the caller's buffer
+// directly, so one K split costs exactly what it did before this change -- no scratch, no second
+// pass over the output.
+template <bool SPLITK, class OutT>
 __global__ __launch_bounds__(SI_AM_NW * 32, 8)
 void si_mmvq_q4k_mma_kernel(const si_block_q8_1* __restrict__ q, const unsigned char* __restrict__ W,
-                            __nv_bfloat16* __restrict__ y, int M, int N, int K) {
+                            OutT* __restrict__ acc_out, int M, int N, int K) {
     const int nblk = K >> 8;
     const int n0 = blockIdx.x * SI_AM_BN;
+    // Balanced, not ceil: 26 super-blocks over 8 splits is 4,4,3,3,3,3,3,3 rather than seven 4s and
+    // an idle block, and the longest split is what the launch waits for.
+    const int sb_base = nblk / (int)gridDim.y, sb_extra = nblk % (int)gridDim.y;
+    const int sb_lo = (int)blockIdx.y * sb_base + ((int)blockIdx.y < sb_extra ? (int)blockIdx.y : sb_extra);
+    const int sb_hi = sb_lo + sb_base + ((int)blockIdx.y < sb_extra ? 1 : 0);
+    if (sb_lo >= sb_hi) return;
     const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
     const int grp = lane >> 2, tig = lane & 3, sub = lane >> 3, lrow = lane & 7;
 
@@ -3864,7 +3897,7 @@ void si_mmvq_q4k_mma_kernel(const si_block_q8_1* __restrict__ q, const unsigned 
         #pragma unroll
         for (int e = 0; e < 4; e++) facc[i][e] = 0.f;
 
-    for (int sb = 0; sb < nblk; sb++) {
+    for (int sb = sb_lo; sb < sb_hi; sb++) {
         for (int u = tid; u < SI_AM_BN * 16; u += SI_AM_NW * 32) {
             const int r = u >> 4, c = u & 15;
             const int gn = n0 + r;
@@ -3952,16 +3985,68 @@ void si_mmvq_q4k_mma_kernel(const si_block_q8_1* __restrict__ q, const unsigned 
         for (int e = 0; e < 4; e++) {
             const int lm = i * 16 + grp + (e >> 1) * 8;
             const int gn = n0 + warp * 8 + tig * 2 + (e & 1);
-            if (lm < M && gn < N) y[(size_t)lm * N + gn] = __float2bfloat16(facc[i][e]);
+            if (lm < M && gn < N) {
+                if (SPLITK) atomicAdd(reinterpret_cast<float*>(acc_out) + (size_t)lm * N + gn,
+                                      facc[i][e]);
+                else        acc_out[(size_t)lm * N + gn] = (OutT)facc[i][e];
+            }
         }
+}
+
+// Narrows the split-K accumulator into the caller's bf16 output and re-zeroes what it consumed,
+// which is what lets the accumulator be a static buffer with no per-call memset.
+__global__ void si_mmvq_q4k_mma_epilogue_kernel(float* __restrict__ acc,
+                                                __nv_bfloat16* __restrict__ y, size_t n) {
+    const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    y[i] = __float2bfloat16(acc[i]);
+    acc[i] = 0.f;
+}
+
+// Claim this stream's slot, first call wins. The table only ever grows and holds a handful of
+// entries, so the lock is contended only on the few calls that add a stream.
+static int si_am_slot_for(cudaStream_t stream) {
+    static std::mutex mu;
+    static cudaStream_t owners[SI_AM_SLOTS] = {};
+    static int used = 0;
+    std::lock_guard<std::mutex> lk(mu);
+    for (int i = 0; i < used; i++) if (owners[i] == stream) return i;
+    if (used >= SI_AM_SLOTS) return -1;
+    owners[used] = stream;
+    return used++;
 }
 
 static inline bool launch_mmvq_q4k_mma_rows(const void* q81, const void* W, void* y,
                                             int M, int N, int K, cudaStream_t stream) {
     if (M < 2 || M > SI_AM_MMAX || (K & 255) || (N % SI_AM_BN)) return false;
-    si_mmvq_q4k_mma_kernel<<<dim3(N / SI_AM_BN), dim3(SI_AM_NW * 32), 0, stream>>>(
+    if ((size_t)M * (size_t)N > (size_t)SI_AM_MMAX * 6656u) return false;
+    static int sk = -1;
+    if (sk < 0) { const char* e = getenv("SPARKINFER_MMVQ_MMA_SPLITK"); sk = e ? atoi(e) : SI_AM_SK_DEF; }
+    int nsk = sk; const int nblk = K >> 8;
+    if (nsk < 1) nsk = 1;
+    if (nsk > nblk) nsk = nblk;                  // never launch a split with nothing to reduce
+    // One split needs no accumulator and no epilogue: straight into the caller's bf16, which is
+    // what this arm did before split-K existed. SPARKINFER_MMVQ_MMA_SPLITK=1 therefore reproduces
+    // the previous behaviour exactly, so both arms of an A/B come out of ONE binary.
+    if (nsk == 1) {
+        si_mmvq_q4k_mma_kernel<false, __nv_bfloat16>
+            <<<dim3(N / SI_AM_BN, 1), dim3(SI_AM_NW * 32), 0, stream>>>(
+            reinterpret_cast<const si_block_q8_1*>(q81), reinterpret_cast<const unsigned char*>(W),
+            reinterpret_cast<__nv_bfloat16*>(y), M, N, K);
+        return true;
+    }
+    const int slot = si_am_slot_for(stream);
+    if (slot < 0) return false;
+    float* acc = nullptr;
+    if (cudaGetSymbolAddress(reinterpret_cast<void**>(&acc), si_am_acc) != cudaSuccess) return false;
+    acc += (size_t)slot * SI_AM_MMAX * 6656u;
+    si_mmvq_q4k_mma_kernel<true, float><<<dim3(N / SI_AM_BN, nsk), dim3(SI_AM_NW * 32), 0, stream>>>(
         reinterpret_cast<const si_block_q8_1*>(q81), reinterpret_cast<const unsigned char*>(W),
-        reinterpret_cast<__nv_bfloat16*>(y), M, N, K);
+        acc, M, N, K);
+    const size_t n = (size_t)M * (size_t)N;
+    const int thr = 256;
+    si_mmvq_q4k_mma_epilogue_kernel<<<(unsigned)((n + thr - 1) / thr), thr, 0, stream>>>(
+        acc, reinterpret_cast<__nv_bfloat16*>(y), n);
     return true;
 }
 
@@ -4062,7 +4147,15 @@ bool launch_mmvq_rows(int qtype, const void* q81, const void* W, void* y,
         const char* e = getenv("SPARKINFER_MMVQ_MMA_MINN");
         mmvq_mma_minn = e ? atoi(e) : 2048;
     }
-    if (mmvq_mma && M >= 24 && qtype == 12 && N >= mmvq_mma_minn &&
+    // Eight rows, because the floor is about weight traffic rather than arithmetic: the chunked
+    // MMVQ below reads the weights once per eight rows, so at or under eight it already reads them
+    // as few times as the mma arm, which still pads M to the sixteen rows of an m16n8k32 tile.
+    static int mmvq_mma_minm = -1;
+    if (mmvq_mma_minm < 0) {
+        const char* e = getenv("SPARKINFER_MMVQ_MMA_MINM");
+        mmvq_mma_minm = e ? atoi(e) : 8;
+    }
+    if (mmvq_mma && M >= mmvq_mma_minm && qtype == 12 && N >= mmvq_mma_minn &&
         launch_mmvq_q4k_mma_rows(q81, W, y, M, N, K, stream)) return true;
     if (M > 8) {
         for (int r0 = 0; r0 < M; r0 += 8) {
