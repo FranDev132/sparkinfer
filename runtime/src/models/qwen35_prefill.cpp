@@ -1713,6 +1713,9 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
             use_i8 = restore_i8_gdn;
         } else {
             // ---- full softmax-attention layer (q_has_gate, partial RoPE, int8 KV) ----
+            // Set when q|gate|k|v came out of ONE GEMM and q/k/v were left in that packed buffer
+            // instead of being copied to tight arrays (see the Muse arm below).
+            bool qkv_packed = false;
             // Long-ctx: optionally keep Q/K/V/O on int8 (no GDN recurrence here).
             const bool restore_i8 = use_i8;
             if (use_i8_attn) use_i8 = true;
@@ -1744,18 +1747,37 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                     kernels::launch_prefill_nvfp4_quant_a(xn, fp4_a, fp4_as, N, H, st) &&
                     kernels::launch_prefill_nvfp4_gemm(fp4_a, fp4_as, w.qkvg_fp4, w.qkvg_fp4_sf,
                                                        fp4_qkv, N, qkvg_n, H, fp4_ws, st)) {
+                    // q, k and v are NOT copied out: the QK-norm + RoPE + KV-append kernel below
+                    // already reads every one of those elements, so handing it the packed pitch
+                    // costs nothing and the three copies -- 2.10 MB of the 2.23 MB per layer, at
+                    // 445 GB/s across four 2-D transfers -- disappear. Only the gate is still
+                    // copied out; its consumers are a three-way branch that would each need the
+                    // pitch. Measured over the whole pass: 208 copies, 0.261 ms, 2.0% of
+                    // prefill@128.
                     const size_t sp = (size_t)qkvg_n * sizeof(bf16);
-                    struct { void* dst; int off, n; } cut[4] = {
-                        { qb, 0,            qdim  }, { qg, qdim,          qdim  },
-                        { kf, 2 * qdim,     kvdim }, { vf, 2 * qdim + kvdim, kvdim },
-                    };
                     qkvg_fp4 = true;
-                    for (auto& cu : cut)
-                        qkvg_fp4 &= cudaMemcpy2DAsync(cu.dst, (size_t)cu.n * sizeof(bf16),
-                                                      fp4_qkv + cu.off, sp,
-                                                      (size_t)cu.n * sizeof(bf16), N,
-                                                      cudaMemcpyDeviceToDevice, st) == cudaSuccess;
-                    if (qkvg_fp4) inq = ing = ink = inv = true;
+                    {
+                        inq = ing = ink = inv = true;
+                        // SPARKINFER_MUSE_QKV_PACKED=0 copies q/k/v out as before, for an A/B
+                        // out of one binary.
+                        static const bool packed_on = [] {
+                            const char* e = getenv("SPARKINFER_MUSE_QKV_PACKED");
+                            return !(e && e[0] == '0');
+                        }();
+                        qkv_packed = packed_on;
+                        if (!qkv_packed) {
+                            struct { void* dst; int off, n; } cut[4] = {
+                                { qb, 0, qdim }, { qg, qdim, qdim },
+                                { kf, 2 * qdim, kvdim },
+                                { vf, 2 * qdim + kvdim, kvdim },
+                            };
+                            for (auto& cu : cut)
+                                qkvg_fp4 &= cudaMemcpy2DAsync(cu.dst, (size_t)cu.n * sizeof(bf16),
+                                                              fp4_qkv + cu.off, sp,
+                                                              (size_t)cu.n * sizeof(bf16), N,
+                                                              cudaMemcpyDeviceToDevice, st) == cudaSuccess;
+                        }
+                    }
                 }
                 if (!qkvg_fp4 && muse_group && muse_qb && use_i8 &&
                     kernels::pfm_moe_gemm_qi8_supported(w.wq_type)) {
@@ -1851,18 +1873,28 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                     signed char* vpool8 = (signed char*)s.kv->v_pool() + s.kv->layer_base_elems(L);
                     void* kscale = (char*)s.kv->k_scale_pool() + s.kv->scale_layer_base_elems(L) * 2;
                     void* vscale = (char*)s.kv->v_scale_pool() + s.kv->scale_layer_base_elems(L) * 2;
-                    kernels::launch_prefill_qknorm_ropenorm_kv_int8(qb, kf, vf, w.q_norm, w.k_norm,
+                    kernels::launch_prefill_qknorm_ropenorm_kv_int8(
+                        qkv_packed ? fp4_qkv : qb,
+                        qkv_packed ? fp4_qkv + 2 * qdim : kf,
+                        qkv_packed ? fp4_qkv + 2 * qdim + kvdim : vf,
+                        w.q_norm, w.k_norm,
                         kpool8, vpool8, kscale, vscale, btable, N, c.n_q_heads, c.n_kv_heads,
-                        c.head_dim, muse_rot, rope_theta, eps, bs, mbs, st, pos0);
+                        c.head_dim, muse_rot, rope_theta, eps, bs, mbs, st, pos0,
+                        qkv_packed ? qb : nullptr, qkv_packed ? qkvg_n : 0);
                     kernels::launch_prefill_attn_swa_pure_int8(qb, kpool8, vpool8, kscale, vscale,
                         btable, att, N, c.n_q_heads, c.n_kv_heads, c.head_dim, bs, mbs, attn_scale,
                         win_blocks, st, pos0);
                 } else {
                     bf16* kpool_bf = (bf16*)s.kv->k_pool() + s.kv->layer_base_elems(L);
                     bf16* vpool_bf = (bf16*)s.kv->v_pool() + s.kv->layer_base_elems(L);
-                    kernels::launch_prefill_qknorm_ropenorm_kv_bf16(qb, kf, vf, w.q_norm, w.k_norm,
+                    kernels::launch_prefill_qknorm_ropenorm_kv_bf16(
+                        qkv_packed ? fp4_qkv : qb,
+                        qkv_packed ? fp4_qkv + 2 * qdim : kf,
+                        qkv_packed ? fp4_qkv + 2 * qdim + kvdim : vf,
+                        w.q_norm, w.k_norm,
                         kpool_bf, vpool_bf, btable, N, c.n_q_heads, c.n_kv_heads, c.head_dim,
-                        muse_rot, rope_theta, eps, bs, mbs, st, pos0);
+                        muse_rot, rope_theta, eps, bs, mbs, st, pos0,
+                        qkv_packed ? qb : nullptr, qkv_packed ? qkvg_n : 0);
                     kernels::launch_prefill_attn_swa_pure_bf16(qb, kpool_bf, vpool_bf, btable, att,
                         N, c.n_q_heads, c.n_kv_heads, c.head_dim, bs, mbs, attn_scale, win_blocks,
                         st, pos0);
@@ -1935,6 +1967,10 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                     }
                 }
             }
+            // With q|gate|k|v left packed, the gate is a column slice of that buffer rather than
+            // a tight [N, qdim] array; its three consumers take the pitch instead of a copy.
+            const bf16* gate_src = qkv_packed ? (const bf16*)(fp4_qkv + qdim) : (const bf16*)qg;
+            const int gate_ld = qkv_packed ? qkvg_n : 0;
             // Muse: the gated attention output feeds exactly one consumer -- the o projection's
             // row-quantize -- so fold the gate into that quantize's load phase. `att` is then never
             // written back as bf16 and never re-read, and one launch per layer goes away.
@@ -1945,7 +1981,8 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
             // first and the int8 fold is skipped when it succeeds. Every arm therefore consumes a
             // gated activation and nothing reads the raw `att` -- the invariant #816 broke.
             const bool wo_fp4_gated = muse_nvfp4_wo && w.wo_fp4 && w.wo_fp4_sf && fp4_a && fp4_as &&
-                kernels::launch_prefill_nvfp4_gate_quant_a(att, qg, fp4_a, fp4_as, N, qdim, st);
+                kernels::launch_prefill_nvfp4_gate_quant_a(att, gate_src, fp4_a, fp4_as, N, qdim,
+                                                           st, gate_ld);
             const bool wo_fp4_done = wo_fp4_gated && c.muse_glimmer &&
                 kernels::launch_prefill_nvfp4_gemm(fp4_a, fp4_as, w.wo_fp4, w.wo_fp4_sf,
                                                    ao, N, H, qdim, fp4_ws, st);
@@ -1953,15 +1990,15 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
             if (!wo_fp4_gated &&
                 c.muse_glimmer && muse_qb && use_i8 && w.wo_rs && H >= 128 &&
                 kernels::pf_dense_gemm_qi8_supported(w.wo_type) &&
-                kernels::launch_prefill_gate_quant_rows_i8(att, qg, A_i8, sx, N, qdim, st,
-                                                           A_i8p)) {
+                kernels::launch_prefill_gate_quant_rows_i8(att, gate_src, A_i8, sx, N, qdim, st,
+                                                           A_i8p, gate_ld)) {
                 a_q = att; a_qR = N; a_qK = qdim;      // quant_a_i8(att, N, qdim) is now a no-op
                 a_pk = A_i8p != nullptr;
                 gate_fused = true;
             }
             // If the fused quantize ran but the GEMM declined, `att` is still raw -- gate it here.
             if (!gate_fused && !wo_fp4_done) {
-                kernels::launch_prefill_mul_sigmoid(att, qg, N, qdim, st);
+                kernels::launch_prefill_mul_sigmoid(att, gate_src, N, qdim, st, gate_ld);
             }
             // o off the same NVFP4 bytes, reading the already-gated `att`, with the residual taken
             // by the epilogue's C operand (same fold as the GDN out_proj above) so no separate
@@ -2024,7 +2061,26 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
             // hn's only consumer is the grouped FFN's row-quantize, so emit the int8 in the same
             // pass. Only when one chunk covers the prompt: a second chunk would need A_i8/sx again
             // after the first has overwritten them. The bf16 hn is still written either way.
-            if (muse_ffn_group && muse_qb && use_i8 && FC >= N &&
+            //
+            // ...but that consumer only exists when the FFN takes an int8 arm, and on this
+            // checkpoint it does not: gate/up carry NVFP4 operands at every scored context, so the
+            // block-scaled arm below runs and A_i8 is written and never read. The write is N*H
+            // int8 -- 109 MB per layer per window at a 16384-token window, 11.3 GB over a 32k
+            // prefill -- and the quantize is folded into a norm that would otherwise be a plain
+            // read-modify-write. Same class as the ffn-wide staging removed for this path already;
+            // this is the H-wide one that survived it.
+            //
+            // The test is the FP4 arm's own gate at the chunk width this branch requires (FC >= N,
+            // so a single chunk of N rows). SPARKINFER_MUSE_FFN_I8_SKIP=0 restores the staging for
+            // an A/B out of one binary.
+            static const bool ffn_i8_skip = [] {
+                const char* e = getenv("SPARKINFER_MUSE_FFN_I8_SKIP");
+                return !(e && e[0] == '0');
+            }();
+            const bool ffn_fp4_certain = ffn_i8_skip && !moe && gu_nvfp4 &&
+                w.gate_fp4 && w.gate_fp4_sf && w.up_fp4 && w.up_fp4_sf && fp4_a && fp4_as &&
+                kernels::prefill_nvfp4_supported(N, ffn, H);
+            if (!ffn_fp4_certain && muse_ffn_group && muse_qb && use_i8 && FC >= N &&
                 kernels::launch_rmsnorm_quant_i8(h, w.ffn_norm, hn, A_i8, sx, N, H, eps, st,
                                                  A_i8p)) {
                 hn_quantized = true;

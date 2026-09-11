@@ -20,9 +20,12 @@ bool launch_prefill_nvfp4_rmsnorm_quant_a(const void* src_bf16, const void* weig
                                           cudaStream_t stream = nullptr);
 // Muse's attention gate fused into the A-operand quantize: x * sigmoid(g) straight to FP4, the
 // same fold launch_prefill_gate_quant_rows_i8 does for the int8 o-projection.
+// gate_ld: row pitch of `gate` in elements, when it is a COLUMN SLICE of a wider packed
+// buffer instead of a tight [rows, cols] array. 0 = tight (every pre-existing caller).
 bool launch_prefill_nvfp4_gate_quant_a(const void* src_bf16, const void* gate_bf16,
                                        void* dst_fp4, void* dst_sf,
-                                       int m, int k, cudaStream_t stream = nullptr);
+                                       int m, int k, cudaStream_t stream = nullptr,
+                                       int gate_ld = 0);
 // Fuse the dense FFN's bf16-rounded SwiGLU producer into the down projection's FP4 A quantize.
 bool launch_prefill_nvfp4_swiglu_quant_a(const void* gate_bf16, const void* up_bf16,
                                          void* dst_fp4, void* dst_sf,

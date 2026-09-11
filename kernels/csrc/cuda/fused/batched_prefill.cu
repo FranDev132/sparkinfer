@@ -324,10 +324,14 @@ __global__ void pf_split_q_gate_kernel(const __nv_bfloat16* __restrict__ qraw,
 }
 
 __global__ void pf_mul_sigmoid_kernel(__nv_bfloat16* __restrict__ attn,
-                                      const __nv_bfloat16* __restrict__ gate, long n) {
+                                      const __nv_bfloat16* __restrict__ gate, long n,
+                                      int dim, int gate_ld) {
     const long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
-    attn[i] = __float2bfloat16(pf_to_f(attn[i]) * pf_sigmoid(pf_to_f(gate[i])));
+    // gate_ld != 0: `gate` is a column slice of a wider packed buffer, so its row pitch is not
+    // `dim`. attn stays tight, which is what every consumer of it expects.
+    const long g = gate_ld ? ((long)(i / dim) * gate_ld + (i % dim)) : i;
+    attn[i] = __float2bfloat16(pf_to_f(attn[i]) * pf_sigmoid(pf_to_f(gate[g])));
 }
 
 // One tap of the Gated-DeltaNet causal conv, by token index relative to THIS pass. A windowed
@@ -1156,7 +1160,13 @@ __global__ void pf_qknorm_ropenorm_kv_kernel(
     __half* __restrict__ k_scale, __half* __restrict__ v_scale,
     const int* __restrict__ block_table,
     int n_q_heads, int n_kv_heads, int head_dim, int rotary_dim, float theta, float eps,
-    int block_size, int max_blocks_per_seq, int pos0) {
+    int block_size, int max_blocks_per_seq, int pos0,
+    // src_ld > 0: q/k/v are COLUMN SLICES of one row-major [n_tokens, src_ld] buffer -- the
+    // packed q|gate|k|v this kernel's caller gets straight out of a single GEMM -- rather than
+    // three tight arrays. Each pointer still addresses its own column base; only the row pitch
+    // changes. q is written to `q_out` TIGHT either way, because the attention that reads it next
+    // wants a tight stride. src_ld == 0 keeps the original addressing for every other caller.
+    __nv_bfloat16* __restrict__ q_out, int src_ld) {
     auto* k_pool = static_cast<__nv_bfloat16*>(k_pool_v);
     auto* v_pool = static_cast<__nv_bfloat16*>(v_pool_v);
     auto* k_pool8 = static_cast<signed char*>(k_pool_v);
@@ -1183,7 +1193,9 @@ __global__ void pf_qknorm_ropenorm_kv_kernel(
 
     if (is_q || is_k) {
         const int hh = is_q ? unit : (unit - n_q_heads);
-        const size_t base = ((size_t)tok * (is_q ? n_q_heads : n_kv_heads) + hh) * head_dim;
+        const int nh = is_q ? n_q_heads : n_kv_heads;
+        const size_t base = src_ld ? ((size_t)tok * src_ld + (size_t)hh * head_dim)
+                                   : ((size_t)tok * nh + hh) * head_dim;
         const __nv_bfloat16* src = is_q ? q : k;
         const __nv_bfloat16* nrm = is_q ? q_w : k_w;
         const float xv = pf_to_f(src[base + t]);
@@ -1211,7 +1223,8 @@ __global__ void pf_qknorm_ropenorm_kv_kernel(
             out = ((t & 1) == 0) ? (x0 * c - x1 * s) : (x0 * s + x1 * c);
         }
         if (is_q) {
-            q[base + t] = __float2bfloat16(out);      // Q is never quantised
+            // Tight destination: `base` above follows the (possibly packed) SOURCE pitch.
+            q_out[((size_t)tok * n_q_heads + hh) * head_dim + t] = __float2bfloat16(out);
         } else {
             const size_t dst = (ctok * n_kv_heads + hh) * head_dim;
             if constexpr (INT8) {
@@ -1224,7 +1237,8 @@ __global__ void pf_qknorm_ropenorm_kv_kernel(
         }
     } else {                                          // V: append as-is (no norm, no rope)
         const int hh = unit - n_q_heads - n_kv_heads;
-        const size_t base = ((size_t)tok * n_kv_heads + hh) * head_dim;
+        const size_t base = src_ld ? ((size_t)tok * src_ld + (size_t)hh * head_dim)
+                                   : ((size_t)tok * n_kv_heads + hh) * head_dim;
         const size_t dst  = (ctok * n_kv_heads + hh) * head_dim;
         if constexpr (INT8) {
             const float val = pf_to_f(v[base + t]);
@@ -1622,10 +1636,12 @@ void launch_prefill_split_q_gate(const void* qraw, void* q, void* gate,
         reinterpret_cast<__nv_bfloat16*>(gate), n_tokens, n_heads, head_dim);
 }
 
-void launch_prefill_mul_sigmoid(void* attn, const void* gate, int n_tokens, int dim, cudaStream_t stream) {
+void launch_prefill_mul_sigmoid(void* attn, const void* gate, int n_tokens, int dim,
+                                cudaStream_t stream, int gate_ld) {
     const long n = (long)n_tokens * dim;
     pf_mul_sigmoid_kernel<<<(int)((n + 255) / 256), 256, 0, stream>>>(
-        reinterpret_cast<__nv_bfloat16*>(attn), reinterpret_cast<const __nv_bfloat16*>(gate), n);
+        reinterpret_cast<__nv_bfloat16*>(attn), reinterpret_cast<const __nv_bfloat16*>(gate), n,
+        dim, gate_ld);
 }
 
 void launch_prefill_gdn_conv(const void* qkv, const void* conv_w, void* conv_state,
@@ -1880,7 +1896,7 @@ void launch_prefill_qknorm_ropenorm_kv_bf16(
     void* k_pool, void* v_pool,
     const int* block_table, int n_tokens, int n_q_heads, int n_kv_heads, int head_dim,
     int rotary_dim, float theta, float eps, int block_size, int max_blocks_per_seq,
-    cudaStream_t stream, int pos0) {
+    cudaStream_t stream, int pos0, void* q_out, int src_ld) {
     dim3 grid(n_tokens, n_q_heads + 2 * n_kv_heads);   // token on grid.x
     const size_t shmem = (size_t)head_dim * sizeof(float);
     pf_qknorm_ropenorm_kv_kernel<false><<<grid, head_dim, shmem, stream>>>(
@@ -1888,7 +1904,8 @@ void launch_prefill_qknorm_ropenorm_kv_bf16(
         reinterpret_cast<const __nv_bfloat16*>(v), reinterpret_cast<const __nv_bfloat16*>(q_w),
         reinterpret_cast<const __nv_bfloat16*>(k_w), k_pool, v_pool, nullptr, nullptr,
         block_table, n_q_heads, n_kv_heads, head_dim, rotary_dim, theta, eps,
-        block_size, max_blocks_per_seq, pos0);
+        block_size, max_blocks_per_seq, pos0,
+        reinterpret_cast<__nv_bfloat16*>(q_out ? q_out : q), src_ld);
 }
 
 // int8-KV twin of the above: same QK-norm and NORMAL-RoPE math, but each K/V head vector is
@@ -1900,7 +1917,7 @@ void launch_prefill_qknorm_ropenorm_kv_int8(
     void* k_pool, void* v_pool, void* k_scale, void* v_scale,
     const int* block_table, int n_tokens, int n_q_heads, int n_kv_heads, int head_dim,
     int rotary_dim, float theta, float eps, int block_size, int max_blocks_per_seq,
-    cudaStream_t stream, int pos0) {
+    cudaStream_t stream, int pos0, void* q_out, int src_ld) {
     dim3 grid(n_tokens, n_q_heads + 2 * n_kv_heads);   // token on grid.x
     const size_t shmem = (size_t)head_dim * sizeof(float);
     pf_qknorm_ropenorm_kv_kernel<true><<<grid, head_dim, shmem, stream>>>(
@@ -1909,7 +1926,8 @@ void launch_prefill_qknorm_ropenorm_kv_int8(
         reinterpret_cast<const __nv_bfloat16*>(k_w), k_pool, v_pool,
         reinterpret_cast<__half*>(k_scale), reinterpret_cast<__half*>(v_scale),
         block_table, n_q_heads, n_kv_heads, head_dim, rotary_dim, theta, eps,
-        block_size, max_blocks_per_seq, pos0);
+        block_size, max_blocks_per_seq, pos0,
+        reinterpret_cast<__nv_bfloat16*>(q_out ? q_out : q), src_ld);
 }
 
 void launch_prefill_qknorm_rope_kv_bf16_vi8(

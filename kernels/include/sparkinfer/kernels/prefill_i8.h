@@ -22,9 +22,11 @@ namespace sparkinfer { namespace kernels {
 // One warp per row. Used for both the per-token activation A and (once, resident) the weight W.
 // Muse: fold attn *= sigmoid(gate) into the row-quantize load phase (bit-identical).
 // `qp` (optional): also emit the k-tiled [k/32][row][32] copy for the dense prefill GEMM.
+// gate_ld: row pitch of `gate` in elements, when it is a COLUMN SLICE of a wider packed
+// buffer instead of a tight [rows, cols] array. 0 = tight (every pre-existing caller).
 bool launch_prefill_gate_quant_rows_i8(const void* x, const void* gate, signed char* q,
                                       float* scale, int rows, int cols, cudaStream_t stream,
-                                      signed char* qp = nullptr);
+                                      signed char* qp = nullptr, int gate_ld = 0);
 
 // Returns false only when `qp` was requested but the path that ran cannot write it (the
 // warp-per-row fallback), i.e. the caller's k-tiled copy is now stale and must not be used.
