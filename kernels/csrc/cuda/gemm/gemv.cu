@@ -3943,9 +3943,28 @@ void si_mmvq_q4k_mma_kernel(const si_block_q8_1* __restrict__ q, const unsigned 
         }
         __syncthreads();
 
+        const int lnA = warp * 8 + tig * 2;
+        const float2 dmA = Wdm[lnA], dmB = Wdm[lnA + 1];
         #pragma unroll 1
         for (int g = 0; g < 8; g++) {
             const int kk = g * 32;
+            // The (dm, sc, m) triple depends only on the output COLUMN and the scale group, and
+            // (Ad, Asum) only on the row and the group -- neither depends on which of the four
+            // accumulator elements is being folded. Fetching them per element cost five shared
+            // loads per output element per group; hoisting collapses that to a handful per group.
+            // Ablating this fold-in measured it at 111 us of the kernel's 169.
+            const float sA = dmA.x * (float)Ssc[lnA][g],     mA = dmA.y * (float)Smn[lnA][g];
+            const float sB = dmB.x * (float)Ssc[lnA + 1][g], mB = dmB.y * (float)Smn[lnA + 1][g];
+            float adv[2][2], asv[2][2];
+            #pragma unroll
+            for (int ii = 0; ii < 2; ii++)
+                #pragma unroll
+                for (int eh = 0; eh < 2; eh++) {
+                    const int lmv = ii * 16 + grp + eh * 8;
+                    adv[ii][eh] = lmv < M ? Ad[lmv][g]   : 0.f;
+                    asv[ii][eh] = lmv < M ? Asum[lmv][g] : 0.f;
+                }
+
             unsigned af[2][4], bf0, bf1, bx, by;
             #pragma unroll
             for (int i = 0; i < 2; i++) {
@@ -3968,11 +3987,12 @@ void si_mmvq_q4k_mma_kernel(const si_block_q8_1* __restrict__ q, const unsigned 
                 #pragma unroll
                 for (int e = 0; e < 4; e++) {
                     const int lm = i * 16 + grp + (e >> 1) * 8;
-                    const int ln = warp * 8 + tig * 2 + (e & 1);
                     if (lm >= M) continue;
-                    const float2 dm = Wdm[ln];
-                    facc[i][e] += dm.x * (float)Ssc[ln][g] * Ad[lm][g] * (float)acc[e]
-                                - dm.y * (float)Smn[ln][g] * Asum[lm][g];
+                    // same products in the same association as the per-element form:
+                    // ((dm.x*sc)*Ad)*acc - (dm.y*m)*Asum
+                    const int ep = e & 1;
+                    const float sc = ep ? sB : sA, mn = ep ? mB : mA;
+                    facc[i][e] += sc * adv[i][e >> 1] * (float)acc[e] - mn * asv[i][e >> 1];
                 }
             }
         }
