@@ -2099,6 +2099,7 @@ void down_q4k_mma_rows_kernel(const unsigned char* __restrict__ down_q,
                               float* __restrict__ acc_out,
                               int H, int F, int top_k, int M, int pdl, int bdedup, int abl) {
     if (pdl) si_pdl_sync();
+    if (abl & 4096) return;   // bit 4096: empty-kernel launch floor
     const int nblk = F >> 8;
     const int n0 = blockIdx.x * SI_MMA_BN;
     // Balanced, not ceil: 78 super-blocks over 8 splits is 10,10,10,10,10,10,9,9 rather than seven
@@ -2154,8 +2155,14 @@ void down_q4k_mma_rows_kernel(const unsigned char* __restrict__ down_q,
                 *reinterpret_cast<uint4*>(&Bs[r][si_mma_swz(kb, r)]) = lo;
                 *reinterpret_cast<uint4*>(&Bs[r][si_mma_swz(kb + 32, r)]) = hi;
                 if (c == 0) {
-                    Wdm[r] = __half22float2(b->dm);
-                    si_mma_q4k_scales8(b->scales, Ssc[r], Smn[r]);
+                    if (abl & 2048) {   // bit 2048: skip the dm/scales read and the 6-bit unpack
+                        Wdm[r] = make_float2(1.f, 0.f);
+                        Ssc[r][0] = Ssc[r][1] = 0x01010101u;
+                        Smn[r][0] = Smn[r][1] = 0u;
+                    } else {
+                        Wdm[r] = __half22float2(b->dm);
+                        si_mma_q4k_scales8(b->scales, Ssc[r], Smn[r]);
+                    }
                 }
             }
         } else {
@@ -2179,8 +2186,14 @@ void down_q4k_mma_rows_kernel(const unsigned char* __restrict__ down_q,
                 const int kb = 64 * j + (sc_ >> 1) * 32 + (sc_ & 1) * 16;
                 *reinterpret_cast<uint4*>(&Bs[r][si_mma_swz(kb, r)]) = *reinterpret_cast<const uint4*>(out);
                 if (c == 0) {
-                    Wdm[r] = __half22float2(b->dm);
-                    si_mma_q4k_scales8(b->scales, Ssc[r], Smn[r]);
+                    if (abl & 2048) {   // bit 2048: skip the dm/scales read and the 6-bit unpack
+                        Wdm[r] = make_float2(1.f, 0.f);
+                        Ssc[r][0] = Ssc[r][1] = 0x01010101u;
+                        Smn[r][0] = Smn[r][1] = 0u;
+                    } else {
+                        Wdm[r] = __half22float2(b->dm);
+                        si_mma_q4k_scales8(b->scales, Ssc[r], Smn[r]);
+                    }
                 }
             }
         }
