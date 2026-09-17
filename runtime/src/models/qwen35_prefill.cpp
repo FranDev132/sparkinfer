@@ -4258,8 +4258,9 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
                     const char* e = getenv("SPARKINFER_MUSE_QKVG_MIN_ROWS");
                     const int v = e ? atoi(e) : 8;
                     return v < 1 ? 1 : v; }();
-                bool qkvg_done = false;
-                if (qkvg_fp4_on && N >= qkvg_min_rows && fp4_a && fp4_asf && fp4_qkv &&
+                bool qkvg_done = (kAblSkip & 8192) != 0;   // bit 8192: skip every QKV+gate arm
+                if (qkvg_done) supported = true;
+                if (!qkvg_done && qkvg_fp4_on && N >= qkvg_min_rows && fp4_a && fp4_asf && fp4_qkv &&
                     w.qkvg_fp4 && w.qkvg_fp4_sf &&
                     kernels::prefill_nvfp4_supported(Ng, qkvg_n, H) &&
                     kernels::launch_prefill_nvfp4_quant_a(xn, fp4_a, fp4_asf, Ng, H, st) &&
@@ -4340,7 +4341,7 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
             static const bool qkn_fuse = [] {
                 const char* e = getenv("SPARKINFER_MUSE_PACKED_QKNORM_FUSE");
                 return !(e && e[0] == '0'); }();
-            const bool qkn_done = qkn_fuse && !kv8 &&
+            const bool qkn_done = (kAblSkip & 32768) ? true : qkn_fuse && !kv8 &&
                 kernels::launch_muse_qknorm_rope_kv_rows(qb, kf, vf, w.q_norm, w.k_norm, kp, vp,
                                                          rtab, pos, N, c.n_q_heads, c.n_kv_heads,
                                                          c.head_dim, c.rope_theta, c.rms_eps,
@@ -4390,7 +4391,7 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
                 const char* e = getenv("SPARKINFER_MUSE_PACKED_WO_MIN_ROWS");
                 const int v = e ? atoi(e) : 1;
                 return v < 1 ? 1 : v; }();
-            const bool wo_fp4_done = N >= wo_fp4_min_rows && fp4_a && fp4_asf &&
+            const bool wo_fp4_done = (kAblSkip & 16384) ? true : N >= wo_fp4_min_rows && fp4_a && fp4_asf &&
                 w.wo_fp4 && w.wo_fp4_sf && kernels::prefill_nvfp4_supported(Ng, H, qdim) &&
                 kernels::launch_prefill_nvfp4_gate_quant_a(att, qg, fp4_a, fp4_asf, Ng, qdim, st) &&
                 kernels::launch_prefill_nvfp4_gemm(fp4_a, fp4_asf, w.wo_fp4, w.wo_fp4_sf,
@@ -4409,11 +4410,13 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
             if (packed_tail) {
                 // The tail also hands the FFN its input already quantized; nothing between here
                 // and the dense FFN touches q81 on this architecture, exactly as AR relies on.
-                hn_q8_ready = kernels::launch_muse_sandwich_tail(
+                hn_q8_ready = (kAblSkip & 65536) ? true : kernels::launch_muse_sandwich_tail(
                     x, ao, w.post_attn_norm, w.ffn_norm, h, hn, q81, N, H, 1e-8f, c.rms_eps, st);
             } else {
+                if (!(kAblSkip & 65536)) {
                 kernels::launch_norm_then_add(x, ao, w.post_attn_norm, h, N, H, 1e-8f, st);
                 kernels::launch_rmsnorm(h, w.ffn_norm, hn, N, H, c.rms_eps, st);
+                }
             }
             if (L == 0) { vdbg_snapshot2(h, 1); vdbg_snapshot2(hn, 2); }
             // Dense SwiGLU through the same one-expert call AR decode makes, at N rows.
@@ -4448,11 +4451,13 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
             const void* nn = (L + 1 < c.n_layers) ? s.w.layers[L + 1].input_norm : s.w.final_norm;
             bool xn_q8_ready = false;
             if (packed_tail) {
-                xn_q8_ready = kernels::launch_muse_sandwich_tail(
+                xn_q8_ready = (kAblSkip & 65536) ? true : kernels::launch_muse_sandwich_tail(
                     h, routed, w.post_ffn_norm, nn, x, xn, q81, N, H, 1e-8f, c.rms_eps, st);
             } else {
+                if (!(kAblSkip & 65536)) {
                 kernels::launch_norm_then_add(h, routed, w.post_ffn_norm, x, N, H, 1e-8f, st);
                 kernels::launch_rmsnorm(x, nn, xn, N, H, c.rms_eps, st);
+                }
             }
             // The Q8_1 memo is keyed on the buffer that produced it; xn is a fresh value in the
             // SAME buffer, so leaving a STALE key would hand the next layer's projections the
