@@ -2097,7 +2097,7 @@ void down_q4k_mma_rows_kernel(const unsigned char* __restrict__ down_q,
                               const float* __restrict__ expert_weights,
                               const si_block_q8_1* __restrict__ hq8,
                               float* __restrict__ acc_out,
-                              int H, int F, int top_k, int M, int pdl, int bdedup) {
+                              int H, int F, int top_k, int M, int pdl, int bdedup, int abl) {
     if (pdl) si_pdl_sync();
     const int nblk = F >> 8;
     const int n0 = blockIdx.x * SI_MMA_BN;
@@ -2143,7 +2143,9 @@ void down_q4k_mma_rows_kernel(const unsigned char* __restrict__ down_q,
                 // 16 B boundary of any 16 B-aligned weight (every cudaMalloc base is 256 B aligned). One
                 // uint4 load and a mask/shift per component replace four 4 B loads and the per-byte split
                 // -- the same nibbles to the same shared addresses. Bit-identical.
-                const uint4 nib = *reinterpret_cast<const uint4*>(b->qs + 32 * j + h * 16);
+                uint4 nib;
+                if (abl & 128) { nib.x = nib.y = nib.z = nib.w = 0x11111111u; }
+                else nib = *reinterpret_cast<const uint4*>(b->qs + 32 * j + h * 16);
                 const unsigned m4 = 0x0f0f0f0fu;
                 uint4 lo, hi;
                 lo.x = nib.x & m4;        lo.y = nib.y & m4;        lo.z = nib.z & m4;        lo.w = nib.w & m4;
@@ -2187,7 +2189,9 @@ void down_q4k_mma_rows_kernel(const unsigned char* __restrict__ down_q,
             const int r = u >> 4, c = u & 15;
             const si_block_q8_1* a = hq8 + (size_t)r * (F >> 5) + sb * 8 + (c >> 1);
             const unsigned* src = reinterpret_cast<const unsigned*>(a->qs + (c & 1) * 16);
-            uint4 v; v.x = src[0]; v.y = src[1]; v.z = src[2]; v.w = src[3];
+            uint4 v;
+            if (abl & 64) { v.x = v.y = v.z = v.w = 0x01010101u; }
+            else { v.x = src[0]; v.y = src[1]; v.z = src[2]; v.w = src[3]; }
             *reinterpret_cast<uint4*>(&As[r][si_mma_swz(16 * c, r)]) = v;
             if ((c & 1) == 0) {
                 const float2 ds = __half22float2(a->ds);
@@ -2198,6 +2202,11 @@ void down_q4k_mma_rows_kernel(const unsigned char* __restrict__ down_q,
 
         const int lnA = warp * 8 + tig * 2;
         const float2 dmA = Wdm[lnA], dmB = Wdm[lnA + 1];
+        if (abl & 256) {
+            // consume staged shared data so the staging stores are not eliminated
+            facc[0][0] += (float)As[tid & (MM - 1)][tid & 255]
+                        + (float)Bs[tid & (SI_MMA_BN - 1)][tid & 255];
+        } else {
         #pragma unroll 1
         for (int g = 0; g < 8; g++) {
             const int kk = g * 32;
@@ -2250,6 +2259,7 @@ void down_q4k_mma_rows_kernel(const unsigned char* __restrict__ down_q,
                     facc[i][e] += sc * adv[i][e >> 1] * (float)acc[e] - mn * asv[i][e >> 1];
                 }
             }
+        }
         }
         __syncthreads();
     }
@@ -2336,13 +2346,13 @@ static inline bool launch_down_q4k_mma_rows(
     const int bd = si_mma_bdedup();
     if (si_mma_astage(M) <= 8)
         launch_pdl_kernel(pdl, g, blk, 0, stream, down_q4k_mma_rows_kernel<8>, down_q, expert_ids,
-                          expert_weights, hq8, acc_scratch, H, F, top_k, M, pdl, bd);
+                          expert_weights, hq8, acc_scratch, H, F, top_k, M, pdl, bd, si_abl_skip());
     else if (si_mma_astage(M) <= 16)
         launch_pdl_kernel(pdl, g, blk, 0, stream, down_q4k_mma_rows_kernel<16>, down_q, expert_ids,
-                          expert_weights, hq8, acc_scratch, H, F, top_k, M, pdl, bd);
+                          expert_weights, hq8, acc_scratch, H, F, top_k, M, pdl, bd, si_abl_skip());
     else
         launch_pdl_kernel(pdl, g, blk, 0, stream, down_q4k_mma_rows_kernel<SI_MMA_MMAX>, down_q,
-                          expert_ids, expert_weights, hq8, acc_scratch, H, F, top_k, M, pdl, bd);
+                          expert_ids, expert_weights, hq8, acc_scratch, H, F, top_k, M, pdl, bd, si_abl_skip());
     const int thr = 256;
     down_q4k_mma_epilogue_kernel<<<(unsigned)((n + thr - 1) / thr), thr, 0, stream>>>(
         acc_scratch, expert_weights, output, H, top_k, M);
@@ -2387,13 +2397,13 @@ static inline bool launch_gate_up_q4k_mma_rows(
 #define SI_GU_MMA(W_, ACC_) do { \
         if (as <= 8) \
             launch_pdl_kernel(0, g, blk, 0, stream, down_q4k_mma_rows_kernel<8>, W_, expert_ids, \
-                              expert_weights, xq8, ACC_, F, H, 1, M, 0, bd); \
+                              expert_weights, xq8, ACC_, F, H, 1, M, 0, bd, si_abl_skip()); \
         else if (as <= 16) \
             launch_pdl_kernel(0, g, blk, 0, stream, down_q4k_mma_rows_kernel<16>, W_, expert_ids, \
-                              expert_weights, xq8, ACC_, F, H, 1, M, 0, bd); \
+                              expert_weights, xq8, ACC_, F, H, 1, M, 0, bd, si_abl_skip()); \
         else \
             launch_pdl_kernel(0, g, blk, 0, stream, down_q4k_mma_rows_kernel<SI_MMA_MMAX>, W_, \
-                              expert_ids, expert_weights, xq8, ACC_, F, H, 1, M, 0, bd); \
+                              expert_ids, expert_weights, xq8, ACC_, F, H, 1, M, 0, bd, si_abl_skip()); \
     } while (0)
     SI_GU_MMA(gate_q, acc_g);
     SI_GU_MMA(up_q, h);
