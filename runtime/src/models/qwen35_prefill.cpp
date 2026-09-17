@@ -3419,6 +3419,12 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
     // Which full-attention projections take the GEMM arm: bit 0 = wq, bit 1 = wo, bit 2 = wk/wv
     // (bit 2 requires bit 0, since it rides wq's quantize of xn). All by default; the bits exist
     // so each can be measured against the others out of ONE binary.
+    // DIAGNOSTIC ONLY (diag branch, never merged). 1=attention core, 2=dense FFN incl. the gate/up
+    // NVFP4 GEMM, 4=LM head. Each bit removes real work: timing experiment, output is wrong.
+    // Every call site of a phase is guarded, so this cannot miss whichever branch is live.
+    static const int kAblSkip = [] {
+        const char* e = getenv("SPARKINFER_ABL_SKIP"); return e ? atoi(e) : 0;
+    }();
     static const int kAttnGemm = [] {
         const char* e = getenv("SPARKINFER_ATTN_GEMM");
         const int v = e ? atoi(e) : 3;
@@ -4302,12 +4308,14 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
             // Windowed layer: same flash-decode entry point, pointed at this row's compact view
             // instead of the full KV. Global layer: full causal over the real table.
             if (w.swa) {
+                if (!(kAblSkip & 1))
                 kernels::launch_flash_decode_split(
                     qb, kp, vp, swa_vtbl, swa_vlen, att, fa_m, fa_l, fa_acc,
                     N, c.n_q_heads, c.n_kv_heads, c.head_dim, bs, swa_budget, swa_vsplits,
                     1.f / sqrtf((float)c.head_dim), st, nullptr, swa_budget * bs,
                     ks, vs, kv8 ? 1 : 0);
             } else {
+                if (!(kAblSkip & 1))
                 kernels::launch_flash_decode_split(
                     qb, kp, vp, rtab, seq, att, fa_m, fa_l, fa_acc,
                     N, c.n_q_heads, c.n_kv_heads, c.head_dim, bs, mbs, ns,
@@ -4354,7 +4362,7 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
             // Wide enough to be worth a block-scaled GEMM: run gate/up through the FP4 operands
             // this model already holds for prefill and hand the pair to the call below, which then
             // does only the SwiGLU and the GGUF down GEMV.
-            const bool gu_gemm =
+            const bool gu_gemm = !(kAblSkip & 2) &&
                 packed && topk == 1 && N >= gu_gemm_min_rows() &&
                 packed_gate_up_nvfp4(w, hn, Ng, ffn, H, fp4_a, fp4_asf, fp4_ws, sg, su, st);
             // ...and down through its FP4 copy when it is resident, with the SwiGLU folded into
@@ -4366,6 +4374,7 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
                                                    routed, Ng, H, ffn, fp4_ws, st,
                                                    w.down_fp4_alpha);
             if (!dn_gemm)
+                if (!(kAblSkip & 2))
                 kernels::launch_moe_expert_ffn_q4k(hn, w.gate_q, w.up_q, w.down_q,
                                                    w.gate_qtype, w.up_qtype, w.down_qtype,
                                                    expert_ids, expert_w, routed, moe_h, moe_out,
@@ -4645,6 +4654,7 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
             // in a separate kernel. Using the fused accumulation here changed verifier logits
             // after the first speculative token even though both paths consumed the same KV.
             const bool int8_gate_fused = kv8 && (H == 2048 || H == 4096);
+            if (!(kAblSkip & 1))
             kernels::launch_flash_decode_split(
                 qb, kp, vp, btab_rows ? btab_rows : btable, seq, att,
                 fa_m, fa_l, fa_acc,
@@ -4847,6 +4857,7 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
                     supported = false; break;
                 }
             } else {
+                if (!(kAblSkip & 2))
                 kernels::launch_moe_expert_ffn_q4k(hn, w.gate_q, w.up_q, w.down_q,
                                                    w.gate_qtype, w.up_qtype, w.down_qtype,
                                                    expert_ids, expert_w, routed, moe_h, moe_out,
@@ -4958,6 +4969,7 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
             for (int r = 0; r < N; ++r) {
                 const int slot = r % fan;
                 cudaStream_t rs = slot == 0 ? st : row_stream[slot - 1];
+                if (!(kAblSkip & 2))
                 kernels::launch_moe_expert_ffn_q4k(hn + (size_t)r * H, w.gate_q, w.up_q, w.down_q,
                     w.gate_qtype, w.up_qtype, w.down_qtype,
                     expert_ids + (size_t)r * topk, expert_w + (size_t)r * topk,
@@ -4970,6 +4982,7 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
                 pf_cu(cudaStreamWaitEvent(st, row_join_ev[i], 0), "verify moe row join wait");
             }
         } else
+        if (!(kAblSkip & 2))
         kernels::launch_moe_expert_ffn_q4k(hn, w.gate_q, w.up_q, w.down_q,
             w.gate_qtype, w.up_qtype, w.down_qtype, expert_ids, expert_w, routed,
             moe_h, moe_out, N, topk, H, ffn, q81, st, moe_exact_splitk);
@@ -5133,7 +5146,7 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
         // kernel and stays bit-identical. Opt out with SPARKINFER_CB_HEAD_MULTIROW=0.
         static const bool cb_head_mr = []{ const char* e = getenv("SPARKINFER_CB_HEAD_MULTIROW");
                                            return !(e && e[0] == '0'); }();
-        bool mr_done = false;
+        bool mr_done = (kAblSkip & 4) != 0;   // pretend the head scored
         // Tensor cores first, for the whole batch in one launch.
         //
         // What this replaces on Muse is launch_mmvq_rows_f32 further down, not the multi-row arm
