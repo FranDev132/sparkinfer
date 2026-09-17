@@ -2293,6 +2293,12 @@ static int si_mma_down_slot_for(cudaStream_t stream) {
 // Narrowest instantiation that covers M. SPARKINFER_MMA_ASTAGE=0 pins every width back to the
 // 32-row kernel, so both arms of an A/B come out of ONE binary.
 // SPARKINFER_MMA_BDEDUP=0 restores the two-pass B loader, so both arms come out of ONE binary.
+// DIAGNOSTIC ONLY (diag branch, never merged): 16 = skip the down projection, 32 = skip the
+// SwiGLU+Q8_1 quantize. Bits 1/2/4/8 live in qwen35_prefill.cpp.
+static inline int si_abl_skip() {
+    static const int v = [] { const char* e = getenv("SPARKINFER_ABL_SKIP"); return e ? atoi(e) : 0; }();
+    return v;
+}
 static inline int si_mma_bdedup() {
     static const int on = [] {
         const char* e = getenv("SPARKINFER_MMA_BDEDUP");
@@ -3167,6 +3173,7 @@ void launch_moe_expert_ffn_q4k(
         const int qthreads = 256;
         const int pdl = down_mmvq_pdl();
         const int q_pdl = gu_chain && pdl;
+        if (!(si_abl_skip() & 32)) {
         if (swiglu_fold)
             launch_pdl_kernel(q_pdl, dim3((nqb + (qthreads >> 5) - 1) / (qthreads >> 5)), dim3(qthreads), 0, stream,
                 swiglu_quant_h_q8_1_kernel, reinterpret_cast<const __nv_bfloat16*>(gate_bf16),
@@ -3174,6 +3181,8 @@ void launch_moe_expert_ffn_q4k(
         else
             launch_pdl_kernel(q_pdl, dim3((nqb + (qthreads >> 5) - 1) / (qthreads >> 5)), dim3(qthreads), 0, stream,
                 quant_h_q8_1_kernel, h_scratch, hq8, nqb, q_pdl);
+        }
+        if (si_abl_skip() & 16) return;   // bit 16: quantize ran, skip the down projection
         // split-K MMVQ down: S warps/row -> S*H warps in flight, hiding the bs=1
         // occupancy stall the one-warp kernel hits. Dense top-1 defaults to S=8 unless
         // an explicit split-K env override is set; routed MoE keeps its existing default.
@@ -3203,6 +3212,7 @@ void launch_moe_expert_ffn_q4k(
         const int qthreads = 256;
         const int pdl = down_mmvq_pdl();
         const int q_pdl = gu_chain && pdl;
+        if (!(si_abl_skip() & 32)) {
         if (swiglu_fold)
             launch_pdl_kernel(q_pdl, dim3((nqb + (qthreads >> 5) - 1) / (qthreads >> 5)), dim3(qthreads), 0, stream,
                 swiglu_quant_h_q8_1_kernel, reinterpret_cast<const __nv_bfloat16*>(gate_bf16),
@@ -3210,6 +3220,8 @@ void launch_moe_expert_ffn_q4k(
         else
             launch_pdl_kernel(q_pdl, dim3((nqb + (qthreads >> 5) - 1) / (qthreads >> 5)), dim3(qthreads), 0, stream,
                 quant_h_q8_1_kernel, h_scratch, hq8, nqb, q_pdl);
+        }
+        if (si_abl_skip() & 16) return;   // bit 16: quantize ran, skip the down projection
         int S = dense_top1_down_splitk(down_splitk_s_q4(), top_k, "SPARKINFER_DOWN_SPLITK_S_Q4");
         // The split-K factor was fitted at ONE row, where splitting hides a bs=1 occupancy stall.
         // A packed batch already gives every block M rows of work, so the extra splits buy
@@ -3330,6 +3342,7 @@ void launch_moe_expert_ffn_q4k(
         const int qthreads = 256;
         const int pdl = down_mmvq_pdl();
         const int q_pdl = gu_chain && pdl;
+        if (!(si_abl_skip() & 32)) {
         if (swiglu_fold)
             launch_pdl_kernel(q_pdl, dim3((nqb + (qthreads >> 5) - 1) / (qthreads >> 5)), dim3(qthreads), 0, stream,
                 swiglu_quant_h_q8_1_kernel, reinterpret_cast<const __nv_bfloat16*>(gate_bf16),
@@ -3337,6 +3350,8 @@ void launch_moe_expert_ffn_q4k(
         else
             launch_pdl_kernel(q_pdl, dim3((nqb + (qthreads >> 5) - 1) / (qthreads >> 5)), dim3(qthreads), 0, stream,
                 quant_h_q8_1_kernel, h_scratch, hq8, nqb, q_pdl);
+        }
+        if (si_abl_skip() & 16) return;   // bit 16: quantize ran, skip the down projection
         // Row-count-aware split-K: S=8 (July-2026 sweep) is tuned for 1-row AR decode; the DFlash
         // compact verify runs num_tokens=6 rows -> already high occupancy, so split-K reduction
         // overhead dominates and S=1 wins (+2.7% DFlash decode @2550, bit-exact @128, SPEC 32/32).

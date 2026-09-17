@@ -4422,9 +4422,12 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
             // Wide enough to be worth a block-scaled GEMM: run gate/up through the FP4 operands
             // this model already holds for prefill and hand the pair to the call below, which then
             // does only the SwiGLU and the GGUF down GEMV.
+            // bit 8: skip the GEMM itself but still claim success, so the FFN below runs its
+            // bf16 gate/up path on stale sg/su -- isolates the GEMM's cost. Timing only.
             const bool gu_gemm = !(kAblSkip & 2) &&
                 packed && topk == 1 && N >= gu_gemm_min_rows() &&
-                packed_gate_up_nvfp4(w, hn, Ng, ffn, H, fp4_a, fp4_asf, fp4_ws, sg, su, st);
+                ((kAblSkip & 8) ? true :
+                packed_gate_up_nvfp4(w, hn, Ng, ffn, H, fp4_a, fp4_asf, fp4_ws, sg, su, st));
             // ...and down through its FP4 copy when it is resident, with the SwiGLU folded into
             // its quantize -- the arm Qwen3.8's packed FFN already takes -- instead of the Q4_K
             // mma rows, which were a quarter of the step.
