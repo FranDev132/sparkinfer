@@ -2342,7 +2342,14 @@ static inline bool launch_down_q4k_mma_rows(
         return false;
     acc_scratch += (size_t)slot * SI_MMA_MMAX * 6656u;
     const int nblk = F >> 8;
-    int sk = SI_MMA_SK; if (sk > nblk) sk = nblk;   // never launch a split with nothing to reduce
+    // SPARKINFER_MMA_SK overrides the split count for THIS launcher only; the gate/up variant
+    // keeps SI_MMA_SK. The kernel derives its split from gridDim.y, so nothing else changes.
+    static const int sk_env = [] {
+        const char* e = getenv("SPARKINFER_MMA_SK");
+        int v = e ? atoi(e) : SI_MMA_SK;
+        return v < 1 ? 1 : v;
+    }();
+    int sk = sk_env; if (sk > nblk) sk = nblk;   // never launch a split with nothing to reduce
     const size_t n = (size_t)M * (size_t)H;
     const dim3 g(H / SI_MMA_BN, sk), blk(SI_MMA_NW * 32);
     const int bd = si_mma_bdedup();
