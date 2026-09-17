@@ -2264,6 +2264,7 @@ void down_q4k_mma_rows_kernel(const unsigned char* __restrict__ down_q,
         __syncthreads();
     }
 
+    if (!(abl & 512)) {
     #pragma unroll
     for (int i = 0; i < NT; i++)
         #pragma unroll
@@ -2272,6 +2273,7 @@ void down_q4k_mma_rows_kernel(const unsigned char* __restrict__ down_q,
             const int gn = n0 + warp * 8 + tig * 2 + (e & 1);
             if (lm < M && gn < H) atomicAdd(&acc_out[(size_t)lm * H + gn], facc[i][e]);
         }
+    }
 }
 
 // Scales by the expert weight, narrows to bf16, and re-zeroes what it consumed so the next call
@@ -2354,6 +2356,7 @@ static inline bool launch_down_q4k_mma_rows(
         launch_pdl_kernel(pdl, g, blk, 0, stream, down_q4k_mma_rows_kernel<SI_MMA_MMAX>, down_q,
                           expert_ids, expert_weights, hq8, acc_scratch, H, F, top_k, M, pdl, bd, si_abl_skip());
     const int thr = 256;
+    if (!(si_abl_skip() & 1024))
     down_q4k_mma_epilogue_kernel<<<(unsigned)((n + thr - 1) / thr), thr, 0, stream>>>(
         acc_scratch, expert_weights, output, H, top_k, M);
     return true;
