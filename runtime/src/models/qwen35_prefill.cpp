@@ -160,6 +160,13 @@ void dflash_release_verify_cache() {
     cache.arena.free_all();
 }
 
+// DIAG ONLY (never merges): SPARKINFER_PF_ABL bit 1 skips prefill attention at EVERY arm while
+// claiming success, so the fallbacks do not silently run. Output is wrong by construction.
+static int pf_abl() {
+    static const int v = [] { const char* e = getenv("SPARKINFER_PF_ABL"); return e ? atoi(e) : 0; }();
+    return v;
+}
+
 int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                         int pos0) {
     const Qwen35Config& c = s.cfg;
@@ -2090,6 +2097,7 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                         kpool8, vpool8, kscale, vscale, ltab, N, c.n_q_heads, c.n_kv_heads,
                         c.head_dim, muse_rot, rope_theta, eps, bs, mbs, st, pos0,
                         qkv_packed ? qb : nullptr, qkv_packed ? qkvg_n : 0);
+                    if (!(pf_abl() & 1))
                     kernels::launch_prefill_attn_swa_pure_int8(qb, kpool8, vpool8, kscale, vscale,
                         ltab, att, N, c.n_q_heads, c.n_kv_heads, c.head_dim, bs, mbs, attn_scale,
                         win_blocks, st, pos0);
@@ -2104,6 +2112,7 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                         kpool_bf, vpool_bf, ltab, N, c.n_q_heads, c.n_kv_heads, c.head_dim,
                         muse_rot, rope_theta, eps, bs, mbs, st, pos0,
                         qkv_packed ? qb : nullptr, qkv_packed ? qkvg_n : 0);
+                    if (!(pf_abl() & 1))
                     kernels::launch_prefill_attn_swa_pure_bf16(qb, kpool_bf, vpool_bf, ltab, att,
                         N, c.n_q_heads, c.n_kv_heads, c.head_dim, bs, mbs, attn_scale, win_blocks,
                         st, pos0);
@@ -2144,13 +2153,13 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                             c.n_q_heads, c.n_kv_heads, c.head_dim,
                             rope_dim, rope_theta, eps, bs, mbs, st, pos0,
                             mrope_win, c.mrope_sec_h, c.mrope_sec_w);
-                    const bool vi8_done = vi8 && kernels::launch_prefill_attn_mma_bf16_vi8(
+                    const bool vi8_done = (pf_abl() & 1) ? true : vi8 && kernels::launch_prefill_attn_mma_bf16_vi8(
                         qb, kf, vi8, vi8_scale, ltab, att, N, c.n_q_heads, c.n_kv_heads,
                         c.head_dim, bs, mbs, attn_scale, st, pos0);
                     if (!vi8_done)
-                        if (!kernels::launch_prefill_attn_bf16_paged(qb, kpool, vpool, ltab, att,
+                        if (!((pf_abl() & 1) || kernels::launch_prefill_attn_bf16_paged(qb, kpool, vpool, ltab, att,
                                 N, c.n_q_heads, c.n_kv_heads, c.head_dim, bs, mbs, attn_scale,
-                                st, pos0)) {
+                                st, pos0))) {
                             a.free_all(); a8.free_all(); am.free_all(); aw.free_all();
                             fprintf(stderr, "[prefill] windowed pass declined by attention "
                                             "(pos0=%d)\n", pos0);
@@ -2176,9 +2185,9 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                             vf + o * kvdim, w.q_norm, w.k_norm, kpool, vpool, kscale, vscale, bt,
                             len, c.n_q_heads, c.n_kv_heads, c.head_dim, rope_dim, rope_theta, eps,
                             bs, mbs, st, pos0, mrope_win, c.mrope_sec_h, c.mrope_sec_w);
-                        if (!kernels::launch_prefill_attn_int8_paged(qb + o * qdim, kpool, vpool,
+                        if (!((pf_abl() & 1) || kernels::launch_prefill_attn_int8_paged(qb + o * qdim, kpool, vpool,
                                 kscale, vscale, bt, att + o * qdim, len, c.n_q_heads, c.n_kv_heads,
-                                c.head_dim, bs, mbs, attn_scale, win_blocks, st, pos0)) {
+                                c.head_dim, bs, mbs, attn_scale, win_blocks, st, pos0))) {
                             a.free_all(); a8.free_all(); am.free_all(); aw.free_all();
                             fprintf(stderr, "[prefill] no int8 attention kernel for hd=%d win=%d "
                                             "pos0=%d\n", c.head_dim, win_blocks, pos0);
