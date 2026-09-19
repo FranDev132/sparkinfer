@@ -1291,11 +1291,29 @@ bool launch_prefill_attn_mma_muse_hd128(
     // over-budget shape costs ~4x (measured: the 113 KB RQH=16/PLANES=4 shape drops 11667 -> 2677
     // pp because the smem opt-in fails and no mma tier runs at all). A refusal here just tries the
     // next narrower tier, and RQH=4 is the shape that ships today.
+    // The packed-V plane the six-head tier already uses: V through two 4-byte operand loads
+    // instead of the paged gather's eight LDG.E.U16 + eight PRMT, i.e. 128 B per instruction
+    // against 64. Muse's tier never had it -- the plane is built under `gqa % 6 == 0`, and
+    // 32Q/2KV is GQA-16 -- so every global layer has been paying the gather. The kernel's VT
+    // branch is written against n_kv_heads/VTLD, not against six heads, so the same plane serves
+    // this tier unchanged. Packing costs one read of V plus a 16 B/page write per layer-pass,
+    // against the whole-KV stream the attention itself does.
+    // Gated at 2048 tokens: below that the pass is too short for the plane to pay for itself.
+    // SPARKINFER_PREFILL_ATTN_VPACK=0 disables it and restores the gather (A/B in ONE binary).
+    const signed char* muse_vt = (n_tokens >= 2048)
+        ? vpack_build(v_pool, block_table, (q_pos0 + n_tokens + 15) / 16,
+                      n_kv_heads, 128, stream)
+        : nullptr;
     #define MUSE_ATTN_TIER(RQH, PL)                                                               \
         if (gqa % (RQH) == 0 && n_q_heads % (RQH) == 0 && fills(RQH) &&                           \
-            launch_attn_gqa<128, 8, (RQH), (PL), false, false, 1, false>(                         \
+            (muse_vt                                                                              \
+             ? launch_attn_gqa<128, 8, (RQH), (PL), true, false, 1, false>(                       \
                 q, k_pool, v_pool, k_scale, v_scale, block_table, attn, n_tokens, n_q_heads,      \
-                n_kv_heads, block_size, max_blocks_per_seq, scale, win_blocks, stream, q_pos0))   \
+                n_kv_heads, block_size, max_blocks_per_seq, scale, win_blocks, stream, q_pos0,    \
+                muse_vt)                                                                          \
+             : launch_attn_gqa<128, 8, (RQH), (PL), false, false, 1, false>(                      \
+                q, k_pool, v_pool, k_scale, v_scale, block_table, attn, n_tokens, n_q_heads,      \
+                n_kv_heads, block_size, max_blocks_per_seq, scale, win_blocks, stream, q_pos0)))  \
             return true;                                                                          \
         cudaGetLastError();   /* a refused opt-in must not poison the next tier's peek */
     MUSE_ATTN_TIER(16, 2)
