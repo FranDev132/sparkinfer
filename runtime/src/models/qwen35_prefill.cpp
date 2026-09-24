@@ -718,6 +718,20 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
     // the selective FFN-int8 recovery (A/B).
     static int bf16_minctx = []{ const char* e = getenv("SPARKINFER_PREFILL_BF16_MINCTX"); return e ? atoi(e) : 98304; }();
     const bool long_bf16 = !moe && N > bf16_minctx;
+    // The dense-GGUF population the fused quantized-B GEMM serves: load_gguf placed per-row weight
+    // scales for it (SPARKINFER_PREFILL_QB_DENSE). Compressed-tensors checkpoints also set s.gguf
+    // but carry none, so they keep exactly the path they had, as does Muse.
+    const bool dense_qb = !c.muse_glimmer && !moe && [&] {
+        for (const Qwen35LayerWeights& w : s.w.layers)
+            if (w.gate_rs || w.down_rs || w.wqkv_rs || w.wq_rs) return true;
+        return false;
+    }();
+    // Those models run their bf16 GEMMs on the mma.sync kernel at every length; see the bf16
+    // fallback in proj() below.
+    const bool dense_bf16_mma = dense_qb && [] {
+        const char* e = getenv("SPARKINFER_PREFILL_BF16_MMA_DENSE");
+        return !(e && e[0] == '0');
+    }();
     if (long_bf16) use_i8 = false;
     const char* _pi8ffn = getenv("SPARKINFER_PREFILL_I8_FFN");
     bool use_i8_ffn = long_bf16 && (!_pi8ffn || _pi8ffn[0] != '0');
@@ -988,7 +1002,22 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
         const char* e = getenv("SPARKINFER_MUSE_QB_APACK");
         return !(e && e[0] == '0');
     }();
-    signed char* A_i8p = muse_apack ? a8.alloc<signed char>(a_i8_sz) : nullptr;
+    // The other dense GGUFs (dense_qb) run the same fused GEMM and staged it from row-major A:
+    // on Ternary-Bonsai-2's shapes that GEMM is 24.3 ms per forward at M=128 and 64.7 ms (FFN +
+    // attention) at M=512 row-major, 20.4 / 47.5 ms k-tiled. Only that GEMM reads the copy, and it
+    // declines past pf_dense_gemm_qi8_max_m() rows, so the copy is sized for that many rows rather
+    // than for N (8.9 MB on Bonsai): long-context prefill takes no extra VRAM, and a quantize with
+    // more rows than that just skips it (apk_dst). Whether it is allocated depends only on the
+    // model, never on N, so the arena sequence is the same on every call.
+    // SPARKINFER_PREFILL_QB_APACK=0 restores row-major staging (A/B in one binary).
+    const bool dense_apack = dense_qb && need_i8 && [] {
+        const char* e = getenv("SPARKINFER_PREFILL_QB_APACK");
+        return !(e && e[0] == '0');
+    }();
+    const size_t a_i8p_sz = muse_apack ? a_i8_sz
+        : std::min(a_i8_sz, (size_t)kernels::pf_dense_gemm_qi8_max_m() *
+                            (size_t)imax(a_wide_k, ffn));
+    signed char* A_i8p = (muse_apack || dense_apack) ? a8.alloc<signed char>(a_i8p_sz) : nullptr;
     signed char* W_i8 = need_i8 ? a8.alloc<signed char>(maxw) : nullptr;
     float* sx = need_i8 ? a8.alloc<float>(sx_n) : nullptr;
     float* sw = need_i8 ? a8.alloc<float>((size_t)maxNO) : nullptr;
@@ -1722,9 +1751,16 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
     // either refreshes it or clears this, so a stale copy can never reach the GEMM.
     bool a_pk = false;
     auto apk = [&]() -> const signed char* { return a_pk ? A_i8p : nullptr; };
+    // The copy to hand a quantize of R x K: none when it would not fit (a_i8p_sz above), nor, off
+    // Muse, when R is past the rows the fused GEMM accepts -- nothing would read it.
+    const long a_i8p_rows = muse_apack ? (long)N : (long)kernels::pf_dense_gemm_qi8_max_m();
+    auto apk_dst = [&](long R, long K) -> signed char* {
+        return (A_i8p && R <= a_i8p_rows && (size_t)R * (size_t)K <= a_i8p_sz) ? A_i8p : nullptr;
+    };
     auto quant_a_i8 = [&](const bf16* A, int R, int K) {
         if (a_q == A && a_qR == R && a_qK == K) return;
-        a_pk = kernels::launch_prefill_quantize_rows_i8(A, A_i8, sx, R, K, st, A_i8p) && A_i8p;
+        signed char* qp = apk_dst(R, K);
+        a_pk = kernels::launch_prefill_quantize_rows_i8(A, A_i8, sx, R, K, st, qp) && qp;
         a_q = A; a_qR = R; a_qK = K;
     };
     // int8 tensor-core GEMM with the Muse-only split-K fan-out tried first. Everything else keeps
@@ -1800,7 +1836,13 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
             // disabled; it stays on wmma (not mma.sync) in that fallback.
             // Gate on full prompt length N (not chunk rows R): FFN is token-chunked to FC=32k for
             // VRAM, so R<=FC would otherwise keep the dominant gate/up/down GEMMs on wmma forever.
-            const bool prefer_mma = !moe && N > bf16_minctx;
+            // dense_qb models take it at every length: their short-context bf16 GEMMs are the GDN
+            // projections at exactly N==512 (use_i8_gdn), where the wmma kernel is 42 ms of a
+            // 134 ms Ternary-Bonsai-2 prefill. The two kernels issue the same m16n8k16 MMAs in the
+            // same K order into fp32 and round the same way, and measure byte-identical there
+            // (0 differing outputs at M=128/300/511/512/1000 on the GDN shapes) while the mma.sync
+            // one is 12-27% faster. SPARKINFER_PREFILL_BF16_MMA_DENSE=0 restores wmma.
+            const bool prefer_mma = !moe && (N > bf16_minctx || dense_bf16_mma);
             kernels::launch_prefill_gemm(A, dq(W, wtype, n_out, K), C, R, n_out, K, st, prefer_mma);
         }
     };
@@ -2738,8 +2780,9 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                         proj_fused(hn_c, up_pf,   up_pf_type,   w.up_rs,   ffu, ffn, H, fn);
                     }
                     a_q = nullptr;
+                    signed char* const qp = apk_dst(fn, ffn);
                     a_pk = kernels::launch_prefill_swiglu_quant_i8(ffg, ffu, A_i8, sx, fn, ffn, st,
-                                                                   A_i8p) && A_i8p;
+                                                                   qp) && qp;
                     bool down_fused = false;
                     if (w.down_rs && kernels::pf_dense_gemm_qi8_supported(down_pf_type)) {
                         down_fused = kernels::launch_prefill_gemm_qi8_dense(
@@ -2762,13 +2805,15 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                 }
                 if (ffn_i8) {
                     a_q = nullptr;                     // this branch writes A_i8/sx directly
+                    signed char* qp = apk_dst(fn, H);
                     a_pk = kernels::launch_prefill_quantize_rows_i8(hn_c, A_i8, sx, fn, H, st,
-                                                                    A_i8p) && A_i8p;
+                                                                    qp) && qp;
                     kernels::launch_prefill_gemm_i8(A_i8, ffn_Wg_i8, sx, ffn_swg, ffg, fn, ffn, H, st);
                     kernels::launch_prefill_gemm_i8(A_i8, ffn_Wu_i8, sx, ffn_swu, ffu, fn, ffn, H, st);
                     // fused SwiGLU + int8 quantize for the down input (skips the ffg DRAM round-trip)
+                    qp = apk_dst(fn, ffn);
                     a_pk = kernels::launch_prefill_swiglu_quant_i8(ffg, ffu, A_i8, sx, fn, ffn, st,
-                                                                   A_i8p) && A_i8p;
+                                                                   qp) && qp;
                     if (ffn_fused)
                         kernels::launch_prefill_gemm_i8_resid(A_i8, ffn_Wd_i8, sx, ffn_swd,
                                                               x + (size_t)fo * H, fn, H, ffn, st);
@@ -2812,10 +2857,11 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                         // skips the ffg store + reload that proj()'s internal quantize would pay.
                         a_q = nullptr;                 // swiglu_quant writes A_i8/sx directly
                         // The fused epilogue already emitted the k-tiled copy (fuse_qp below).
-                        if (!ffn_fused_swiglu)
+                        if (!ffn_fused_swiglu) {
+                            signed char* const qp = apk_dst(fn, ffn);
                             a_pk = kernels::launch_prefill_swiglu_quant_i8(ffg, ffu, A_i8, sx, fn,
-                                                                          ffn, st, A_i8p) && A_i8p;
-                        else
+                                                                          ffn, st, qp) && qp;
+                        } else
                             a_pk = A_i8p != nullptr;
                         // Fused quantized-B down projection. The activation is ALREADY in A_i8/sx
                         // (the fused SwiGLU wrote it), so this cannot go through proj_fused, which

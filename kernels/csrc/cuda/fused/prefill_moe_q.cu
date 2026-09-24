@@ -821,15 +821,17 @@ __global__ __launch_bounds__(256, 2) void pf_dense_gemm_qi8_kernel_g(
         const unsigned char* __restrict__ W_q_arg, const float* __restrict__ row_scale_arg,
         __nv_bfloat16* __restrict__ C_arg, int Mtot, int N_arg, int K, PfQGroup gd,
         int* __restrict__ partials = nullptr, int sb_per_split = 0, int atomic_acc = 0,
-        const signed char* __restrict__ A_pack = nullptr) {
+        const signed char* __restrict__ A_pack = nullptr, int m_fast = 0) {
     using namespace nvcuda;
     constexpr int BS = qm_bs<QT>();
     // Split-K takes blockIdx.x for the K slice and shifts the tile/M indices up one dimension.
     // Blocks are dispatched x-fastest, so the slices that share an output tile now issue together
     // and their accumulator lines stay resident between them.
+    // m_fast (unsplit grids only): blockIdx.x is the M-tile and blockIdx.y the N-tile, so the
+    // M-tiles that share one weight tile are dispatched back to back -- see qm_m_fast().
     const int zsl  = SPLIT ? (int)blockIdx.x : 0;
-    const int btil = SPLIT ? (int)blockIdx.y : (int)blockIdx.x;
-    const int bmt  = SPLIT ? (int)blockIdx.z : (int)blockIdx.y;
+    const int btil = SPLIT ? (int)blockIdx.y : (m_fast ? (int)blockIdx.y : (int)blockIdx.x);
+    const int bmt  = SPLIT ? (int)blockIdx.z : (m_fast ? (int)blockIdx.x : (int)blockIdx.y);
     const int p0 = bmt * QM_BM;
     const int M  = min(QM_BM, Mtot - p0);
     if (M <= 0) return;
@@ -1306,6 +1308,18 @@ static int qm_pick_splits(int ntiles, int K, int mtiles, bool have_partials, int
         else                            QM_LAUNCH_ONE(QMQ_Q6_K, GRP, SPL, __VA_ARGS__);            \
     } while (0)
 
+// Unsplit grids with more than one M-tile ran N-tiles fastest, so the M-tiles that read the same
+// weight tile sat a whole grid row apart and each fetched it from DRAM again (the weight loads are
+// evict-first). Dispatching them back to back turns the repeat reads into L2 hits. Each block still
+// computes exactly its own tile, so the output is bit-identical. Measured on Ternary-Bonsai-2's
+// shapes at M=512: fused FFN + attention GEMMs 47.5 -> 44.9 ms per forward.
+// SPARKINFER_QB_M_FAST=0 restores the N-fastest grid (A/B).
+static int qm_m_fast() {
+    static int e = -1;
+    if (e < 0) { const char* v = getenv("SPARKINFER_QB_M_FAST"); e = (v && v[0] == '0') ? 0 : 1; }
+    return e;
+}
+
 // Dense fused-decode int8 GEMM (single weight, no routing). See pf_dense_gemm_qi8_kernel_g.
 // `out_acc` (optional): when the split-K atomic path is taken, skip the reduce pass and report
 // that `partials[0 .. M*N)` holds the raw int32 accumulator instead. The caller's next kernel then
@@ -1355,9 +1369,10 @@ bool launch_prefill_gemm_qi8_dense(int ggml_type, const signed char* A_i8, const
             return true;
         }
     }
-    dim3 grid(ntiles, mtiles);
+    const int mf = (mtiles > 1 && qm_m_fast()) ? 1 : 0;
+    dim3 grid = mf ? dim3(mtiles, ntiles) : dim3(ntiles, mtiles);
     QM_LAUNCH_DENSE(false, false, A_i8, sx, W, row_scale, C, M, N, K, PfQGroup{}, nullptr, 0, 0,
-                    A_pack);
+                    A_pack, mf);
     return true;
 }
 
@@ -1440,9 +1455,10 @@ bool launch_prefill_gemm_qi8_dense_group(int ggml_type, const signed char* A_i8,
             return true;
         }
     }
-    dim3 grid(tiles, mtiles);
+    const int mf = (mtiles > 1 && qm_m_fast()) ? 1 : 0;
+    dim3 grid = mf ? dim3(mtiles, tiles) : dim3(tiles, mtiles);
     QM_LAUNCH_DENSE(true, false, A_i8, sx, nullptr, nullptr, nullptr, M, 0, K, d, nullptr, 0, 0,
-                    A_pack);
+                    A_pack, mf);
     return true;
 }
 
