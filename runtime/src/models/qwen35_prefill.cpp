@@ -1442,6 +1442,41 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
             use_i8_ffn = false;
         }
     }
+    // The same cache for the ordinary int8 path whenever the FFN runs in more than one chunk.
+    // Without it every chunk re-materializes gate/up/down, so at N = 4*FC each weight is decoded
+    // four times per layer. It needs no VRAM of its own: W_i8 already holds one int8 weight of
+    // this size, and wbuf -- the bf16 dequant scratch -- is exactly two more, and neither is
+    // touched inside the FFN once all three weights take the direct int8 materialize (checked per
+    // layer below, since the dq() fallback would write wbuf). Only the two small scale arrays are
+    // new, and they live outside the arena: its slots are positional. Same materialize, same
+    // activation quantizer and same GEMM as the per-chunk path, so the output is bit-identical.
+    // SPARKINFER_PREFILL_FFN_WCACHE=0 restores re-materializing per chunk (A/B).
+    static const bool ffn_wcache_env = [] {
+        const char* e = getenv("SPARKINFER_PREFILL_FFN_WCACHE");
+        return !(e && e[0] == '0');
+    }();
+    bool ffn_wcache = false;
+    if (ffn_wcache_env && s.gguf && !use_i8_ffn && use_i8 && !moe && !c.muse_glimmer && !gu_nvfp4 &&
+        N > FC &&
+        W_i8 && wbuf && sw && (size_t)ffn * H <= maxw && ffn <= maxNO) {
+        static float* wc_sw = nullptr;
+        static size_t wc_sw_n = 0;
+        const size_t need = (size_t)ffn + (size_t)H;
+        if (need > wc_sw_n) {
+            if (wc_sw) cudaFree(wc_sw);
+            wc_sw = nullptr; wc_sw_n = 0;
+            if (cudaMalloc((void**)&wc_sw, need * sizeof(float)) == cudaSuccess) wc_sw_n = need;
+        }
+        if (wc_sw) {
+            ffn_Wg_i8 = W_i8;
+            ffn_Wu_i8 = reinterpret_cast<signed char*>(wbuf);
+            ffn_Wd_i8 = reinterpret_cast<signed char*>(wbuf) + (size_t)ffn * H;
+            ffn_swg = sw;
+            ffn_swu = wc_sw;
+            ffn_swd = wc_sw + ffn;
+            ffn_wcache = true;
+        }
+    }
 
     // ---- MoE (Qwen3.6) scratch: expert-int8 weights + pair bucketing + pair-major hidden ----
     // The expert-grouped GEMMs run int8 tensor-core UNCONDITIONALLY (that is the speedup), so this
@@ -2550,7 +2585,16 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
             ffn_pf(nullptr, 0, w.down_q, w.down_qtype, w.down_nv, &down_pf, &down_pf_type);
             // Per-token independent, so this is numerically identical to the full-width pass.
             // Long-ctx: selective int8 FFN (GDN/attn stay bf16) + int8 weight cache across chunks.
-            const bool ffn_i8 = use_i8_ffn && ffn_i8_stage && ffn_Wg_i8 != nullptr;
+            // The scratch-backed cache holds only if all three weights take the direct int8
+            // materialize: the dq() fallback writes wbuf, which is where up and down live.
+            auto rows_i8_direct = [](int t, int cols) {
+                return (t == 12 || t == 13 || t == 14) && (cols & 255) == 0;
+            };
+            const bool ffn_i8 = (use_i8_ffn ||
+                                 (ffn_wcache && rows_i8_direct(gate_pf_type, H) &&
+                                  rows_i8_direct(up_pf_type, H) &&
+                                  rows_i8_direct(down_pf_type, ffn))) &&
+                                ffn_i8_stage && ffn_Wg_i8 != nullptr;
             auto dequant_w_i8 = [&](int wtype, const void* W, signed char* dst, float* scale,
                                     int n_out, int K) {
                 if (!kernels::launch_gguf_dequant_rows_i8(wtype, W, dst, scale, n_out, K, st)) {
