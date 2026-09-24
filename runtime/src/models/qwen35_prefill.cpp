@@ -1843,7 +1843,11 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
             // (0 differing outputs at M=128/300/511/512/1000 on the GDN shapes) while the mma.sync
             // one is 12-27% faster. SPARKINFER_PREFILL_BF16_MMA_DENSE=0 restores wmma.
             const bool prefer_mma = !moe && (N > bf16_minctx || dense_bf16_mma);
-            kernels::launch_prefill_gemm(A, dq(W, wtype, n_out, K), C, R, n_out, K, st, prefer_mma);
+            // A Q4_K weight that fills the device goes straight into the GEMM, skipping the dequant
+            // pass (launch_prefill_gemm_q4k_bf16, byte-identical); anything it declines dequantizes.
+            if (!(prefer_mma && wtype == 12 &&
+                  kernels::launch_prefill_gemm_q4k_bf16(A, W, C, R, n_out, K, st)))
+                kernels::launch_prefill_gemm(A, dq(W, wtype, n_out, K), C, R, n_out, K, st, prefer_mma);
         }
     };
 
@@ -2764,16 +2768,20 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                                             eps, st);
                 if (ffn_qi8) {
                     bool gu_grouped = false;
+                    int gu_fused_swiglu = 0;
                     if (gate_pf_type == up_pf_type && w.gate_rs && w.up_rs) {
                         const void*  Wf[2]  = { gate_pf, up_pf };
                         const float* rsf[2] = { w.gate_rs, w.up_rs };
                         void*        Cf[2]  = { ffg, ffu };
                         const int    nf[2]  = { ffn, ffn };
                         quant_a_i8(hn_c, fn, H);
+                        // A_i8/sx double as the fused SwiGLU's output, as in Muse's branch below:
+                        // on the split-K path the epilogue reads the int32 accumulator directly,
+                        // so gate/up are never reduced to bf16 or read back.
                         gu_grouped = kernels::launch_prefill_gemm_qi8_dense_group(
                             gate_pf_type, A_i8, sx, Wf, rsf, Cf, nf, 2, fn, H, st,
                             qb_partials, QB_SPLITS, qb_partials_cap,
-                            nullptr, nullptr, nullptr, apk());
+                            A_i8, sx, &gu_fused_swiglu, apk(), apk_dst(fn, ffn));
                     }
                     if (!gu_grouped) {
                         proj_fused(hn_c, gate_pf, gate_pf_type, w.gate_rs, ffg, ffn, H, fn);
@@ -2781,8 +2789,11 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                     }
                     a_q = nullptr;
                     signed char* const qp = apk_dst(fn, ffn);
-                    a_pk = kernels::launch_prefill_swiglu_quant_i8(ffg, ffu, A_i8, sx, fn, ffn, st,
-                                                                   qp) && qp;
+                    if (gu_fused_swiglu)       // the grouped GEMM's epilogue already wrote A_i8/sx/qp
+                        a_pk = qp != nullptr;
+                    else
+                        a_pk = kernels::launch_prefill_swiglu_quant_i8(ffg, ffu, A_i8, sx, fn, ffn,
+                                                                       st, qp) && qp;
                     bool down_fused = false;
                     if (w.down_rs && kernels::pf_dense_gemm_qi8_supported(down_pf_type)) {
                         down_fused = kernels::launch_prefill_gemm_qi8_dense(

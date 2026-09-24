@@ -24,6 +24,11 @@ namespace sparkinfer { namespace kernels {
 void launch_prefill_gemm(const void* A, const void* W, void* C,
                          int M, int N, int K, cudaStream_t stream = nullptr,
                          bool prefer_mma = false);
+// Same bf16 GEMM, weight read straight from its Q4_K super-blocks (no dequant pass). Byte-identical
+// to launch_gguf_dequant + launch_prefill_gemm(prefer_mma). false = not taken (M > 512, K % 256,
+// or a grid too small to fill the device -- see batched_prefill.cu): the caller dequantizes.
+bool launch_prefill_gemm_q4k_bf16(const void* A, const void* W_q4k, void* C,
+                                  int M, int N, int K, cudaStream_t stream = nullptr);
 
 // SwiGLU elementwise for the dense FFN: h[i] = silu(gate[i]) * up[i] over n elements.
 void launch_prefill_swiglu(const void* gate, const void* up, void* h, long n,

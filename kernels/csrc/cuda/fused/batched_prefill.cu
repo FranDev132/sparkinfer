@@ -150,12 +150,16 @@ __global__ void pf_gemm_kernel(const __nv_bfloat16* __restrict__ A,
 // The wmma path stages fp32 fragments through smem and loads unswizzled, which caps it near ~60%
 // of the bf16 tensor roofline; this reaches ~the int8 kernel's efficiency at half the MAC rate.
 // fp32 accumulate, so it stays bf16-faithful (KL parity with the wmma GEMM).
+// MFRAG sets the M-tile: 2 is the 128-row tile, 1 a 64-row tile for grids too small to fill the
+// device (see launch_prefill_gemm). Only the tiling changes: every output element is still one warp's
+// fp32 accumulator, fed the same m16n8k16 operands in the same K order, so the result is bit-identical.
+template <int MFRAG = 2>
 __global__ __launch_bounds__(256, 2) void pf_gemm_bf16_mma_kernel(
         const __nv_bfloat16* __restrict__ A, const __nv_bfloat16* __restrict__ W,
         __nv_bfloat16* __restrict__ C, int M, int N, int K) {
-    constexpr int MFRAG = 2;          // 32 rows per warp / 16
+    constexpr int BM = 64 * MFRAG;    // 4 warp rows x MFRAG 16-row fragments
     constexpr int NFRAG = 8;          // 64 cols per warp / 8
-    __shared__ __nv_bfloat16 As[2][PF_BM][PF_BK];
+    __shared__ __nv_bfloat16 As[2][BM][PF_BK];
     __shared__ __nv_bfloat16 Bs[2][PF_BN][PF_BK];
 
     const int tid  = threadIdx.x;
@@ -163,9 +167,9 @@ __global__ __launch_bounds__(256, 2) void pf_gemm_bf16_mma_kernel(
     const int lane = tid & 31;
     const int grp  = lane >> 2;                       // 0..7
     const int tig  = lane & 3;                        // thread-in-group
-    const int wm   = warp & 3;                        // rows [wm*32, +32)
+    const int wm   = warp & 3;                        // rows [wm*16*MFRAG, +16*MFRAG)
     const int wn   = warp >> 2;                       // cols [wn*64, +64)
-    const int m0   = blockIdx.y * PF_BM;
+    const int m0   = blockIdx.y * BM;
     const int n0   = blockIdx.x * PF_BN;
     const int nk   = (K + PF_BK - 1) / PF_BK;
 
@@ -183,7 +187,8 @@ __global__ __launch_bounds__(256, 2) void pf_gemm_bf16_mma_kernel(
         for (int s = tid; s < 512; s += 256) {
             const int r = s >> 2, c = s & 3, e = c << 3;   // 8 bf16 per 16B chunk
             const int gm = m0 + r, gn = n0 + r, gk = k0 + e;
-            pf_cp16(&As[buf][r][pf_swz_e(e, r)], &A[(size_t)gm * K + gk], gm < M && gk < K);
+            if (MFRAG == 2 || r < BM)
+                pf_cp16(&As[buf][r][pf_swz_e(e, r)], &A[(size_t)gm * K + gk], gm < M && gk < K);
             pf_cp16(&Bs[buf][r][pf_swz_e(e, r)], &W[(size_t)gn * K + gk], gn < N && gk < K);
         }
         __pipeline_commit();
@@ -202,7 +207,7 @@ __global__ __launch_bounds__(256, 2) void pf_gemm_bf16_mma_kernel(
             unsigned af[MFRAG][4], bf[NFRAG][2];
             #pragma unroll
             for (int i = 0; i < MFRAG; i++) {
-                const int rlo = wm * 32 + i * 16 + grp, rhi = rlo + 8;
+                const int rlo = wm * 16 * MFRAG + i * 16 + grp, rhi = rlo + 8;
                 af[i][0] = pf_lds32b(&As[buf][rlo][pf_swz_e(kb,     rlo)]);
                 af[i][1] = pf_lds32b(&As[buf][rhi][pf_swz_e(kb,     rhi)]);
                 af[i][2] = pf_lds32b(&As[buf][rlo][pf_swz_e(kb + 8, rlo)]);
@@ -238,7 +243,7 @@ __global__ __launch_bounds__(256, 2) void pf_gemm_bf16_mma_kernel(
             if (gn + 1 >= N) {                            // tail: scalar path
                 #pragma unroll
                 for (int e = 0; e < 4; e++) {
-                    const int gm = m0 + wm * 32 + i * 16 + grp + (e >> 1) * 8;
+                    const int gm = m0 + wm * 16 * MFRAG + i * 16 + grp + (e >> 1) * 8;
                     const int cn = gn + (e & 1);
                     if (gm < M && cn < N) C[(size_t)gm * N + cn] = __float2bfloat16(acc[i][j][e]);
                 }
@@ -246,7 +251,185 @@ __global__ __launch_bounds__(256, 2) void pf_gemm_bf16_mma_kernel(
             }
             #pragma unroll
             for (int h = 0; h < 2; h++) {
-                const int gm = m0 + wm * 32 + i * 16 + grp + h * 8;
+                const int gm = m0 + wm * 16 * MFRAG + i * 16 + grp + h * 8;
+                if (gm >= M) continue;
+                const __nv_bfloat162 v = __floats2bfloat162_rn(acc[i][j][h * 2], acc[i][j][h * 2 + 1]);
+                *reinterpret_cast<__nv_bfloat162*>(&C[(size_t)gm * N + gn]) = v;
+            }
+        }
+    }
+}
+
+// ============================================================================
+// The same bf16 mma.sync GEMM with the weight read straight from its Q4_K super-blocks.
+//
+// A bf16 projection on a quantized weight used to be two passes: launch_gguf_dequant writes the
+// whole [N, K] weight as bf16 (deq_q4k_coalesced_kernel), then the GEMM reads it back. At prefill@512
+// on Ternary-Bonsai-2 that round trip is ~5-7 ms of materialize for the GDN projections alone.
+// Here each thread keeps the raw bytes of its two 8-value chunks for the NEXT BK stage in registers
+// (the 16-byte super-block header and 8 quant bytes), issued before the current stage's MMAs, and
+// decodes them into the idle Bs plane after them -- the pattern pf_dense_gemm_qi8_kernel_g uses.
+//
+// BIT-IDENTICAL to dequant-then-GEMM: a chunk's eight values are exactly what
+// deq_q4k_coalesced_kernel writes for them -- the same (s, m) unpack, the same dd = d*s, mm = dmin*m,
+// the same bf16(dd*nib - mm) -- both compiled with --use_fast_math. The A tile, the mma.sync
+// sequence and the fp32 accumulation are pf_gemm_bf16_mma_kernel's, so every output is too.
+__device__ __forceinline__ float pfq_h2f(unsigned u) {
+    __half h; *((unsigned short*)&h) = (unsigned short)u; return __half2float(h);
+}
+__device__ __forceinline__ int pfq_b(const uint4& w, int i) {
+    const unsigned x = (i < 4) ? w.x : (i < 8) ? w.y : (i < 12) ? w.z : w.w;
+    return (int)((x >> (8 * (i & 3))) & 0xFFu);
+}
+template <int MFRAG = 2>
+__global__ __launch_bounds__(256, 2) void pf_gemm_q4k_bf16_mma_kernel(
+        const __nv_bfloat16* __restrict__ A, const unsigned char* __restrict__ Wq,
+        __nv_bfloat16* __restrict__ C, int M, int N, int K) {
+    constexpr int BM = 64 * MFRAG;
+    constexpr int NFRAG = 8;
+    __shared__ __nv_bfloat16 As[2][BM][PF_BK];
+    __shared__ __nv_bfloat16 Bs[2][PF_BN][PF_BK];
+
+    const int tid  = threadIdx.x;
+    const int warp = tid >> 5;
+    const int lane = tid & 31;
+    const int grp  = lane >> 2;
+    const int tig  = lane & 3;
+    const int wm   = warp & 3;
+    const int wn   = warp >> 2;
+    const int m0   = blockIdx.y * BM;
+    const int n0   = blockIdx.x * PF_BN;
+    const int nk   = K / PF_BK;
+    const int nsb  = K >> 8;
+
+    float acc[MFRAG][NFRAG][4];
+    #pragma unroll
+    for (int i = 0; i < MFRAG; i++)
+        #pragma unroll
+        for (int j = 0; j < NFRAG; j++)
+            #pragma unroll
+            for (int e = 0; e < 4; e++) acc[i][j][e] = 0.f;
+
+    auto stageA = [&](int buf, int k0) {
+        #pragma unroll
+        for (int s = tid; s < BM * 4; s += 256) {
+            const int r = s >> 2, c = s & 3, e = c << 3;
+            const int gm = m0 + r, gk = k0 + e;
+            pf_cp16(&As[buf][r][pf_swz_e(e, r)], &A[(size_t)gm * K + gk], gm < M);
+        }
+        __pipeline_commit();
+    };
+    // This thread's two B chunks: s = tid and tid + 256 -> row r = s >> 2, 8-value chunk c = s & 3.
+    const int r0 = tid >> 2, r1 = r0 + 64, cc = tid & 3;
+    const bool ok0 = n0 + r0 < N, ok1 = n0 + r1 < N;
+    const unsigned char* wr0 = Wq + (size_t)(ok0 ? n0 + r0 : 0) * (size_t)nsb * 144;
+    const unsigned char* wr1 = Wq + (size_t)(ok1 ? n0 + r1 : 0) * (size_t)nsb * 144;
+    uint4 h0 = make_uint4(0u, 0u, 0u, 0u), h1 = h0;
+    uint2 q0 = make_uint2(0u, 0u), q1 = q0;
+    // n0l = the chunk's first value inside its 256-value super-block, as deq_q4k_coalesced_kernel
+    // numbers it: sub-block pair jj, nibble half, offset l0 within the 32-byte quant run.
+    auto fetchB = [&](int k0) {
+        const int n0l = (k0 & 255) + cc * 8;
+        const int jj = n0l >> 6, l0 = n0l & 31;
+        const size_t off = (size_t)(k0 >> 8) * 144;
+        if (ok0) { h0 = __ldg(reinterpret_cast<const uint4*>(wr0 + off));
+                   q0 = __ldg(reinterpret_cast<const uint2*>(wr0 + off + 16 + jj * 32 + l0)); }
+        if (ok1) { h1 = __ldg(reinterpret_cast<const uint4*>(wr1 + off));
+                   q1 = __ldg(reinterpret_cast<const uint2*>(wr1 + off + 16 + jj * 32 + l0)); }
+    };
+    auto decode_one = [&](const uint4& h, const uint2& q, int j, int half, __nv_bfloat16* dst) {
+        const float d = pfq_h2f(h.x), dmin = pfq_h2f(h.x >> 16);
+        int sc, mn;
+        if (j < 4) { sc = pfq_b(h, 4 + j) & 63; mn = pfq_b(h, 4 + j + 4) & 63; }
+        else {
+            sc = (pfq_b(h, 4 + j + 4) & 0xF) | ((pfq_b(h, 4 + j - 4) >> 6) << 4);
+            mn = (pfq_b(h, 4 + j + 4) >> 4)  | ((pfq_b(h, 4 + j) >> 6) << 4);
+        }
+        const float dd = d * sc, mm = dmin * mn;
+        __nv_bfloat16 out[8];
+        #pragma unroll
+        for (int t = 0; t < 8; t++) {
+            const unsigned qb = ((t < 4 ? q.x : q.y) >> (8 * (t & 3))) & 0xFFu;
+            const int nib = half ? (int)(qb >> 4) : (int)(qb & 0xFu);
+            out[t] = __float2bfloat16(dd * nib - mm);
+        }
+        *reinterpret_cast<uint4*>(dst) = *reinterpret_cast<const uint4*>(out);
+    };
+    auto storeB = [&](int buf, int k0) {
+        const int n0l = (k0 & 255) + cc * 8;
+        const int jj = n0l >> 6, half = (n0l & 63) >> 5;
+        const int j = jj * 2 + half;
+        __nv_bfloat16* d0 = &Bs[buf][r0][pf_swz_e(cc * 8, r0)];
+        __nv_bfloat16* d1 = &Bs[buf][r1][pf_swz_e(cc * 8, r1)];
+        if (ok0) decode_one(h0, q0, j, half, d0);
+        else *reinterpret_cast<uint4*>(d0) = make_uint4(0u, 0u, 0u, 0u);
+        if (ok1) decode_one(h1, q1, j, half, d1);
+        else *reinterpret_cast<uint4*>(d1) = make_uint4(0u, 0u, 0u, 0u);
+    };
+
+    stageA(0, 0);
+    fetchB(0);
+    storeB(0, 0);
+    int buf = 0;
+    for (int t = 0; t < nk; t++) {
+        const bool more = t + 1 < nk;
+        if (more) { stageA(buf ^ 1, (t + 1) * PF_BK); fetchB((t + 1) * PF_BK); }
+        __pipeline_wait_prior(more ? 1 : 0);
+        __syncthreads();
+
+        #pragma unroll
+        for (int kk = 0; kk < PF_BK; kk += 16) {
+            const int kb = kk + tig * 2;
+            unsigned af[MFRAG][4], bf[NFRAG][2];
+            #pragma unroll
+            for (int i = 0; i < MFRAG; i++) {
+                const int rlo = wm * 16 * MFRAG + i * 16 + grp, rhi = rlo + 8;
+                af[i][0] = pf_lds32b(&As[buf][rlo][pf_swz_e(kb,     rlo)]);
+                af[i][1] = pf_lds32b(&As[buf][rhi][pf_swz_e(kb,     rhi)]);
+                af[i][2] = pf_lds32b(&As[buf][rlo][pf_swz_e(kb + 8, rlo)]);
+                af[i][3] = pf_lds32b(&As[buf][rhi][pf_swz_e(kb + 8, rhi)]);
+            }
+            #pragma unroll
+            for (int j = 0; j < NFRAG; j++) {
+                const int col = wn * 64 + j * 8 + grp;
+                bf[j][0] = pf_lds32b(&Bs[buf][col][pf_swz_e(kb,     col)]);
+                bf[j][1] = pf_lds32b(&Bs[buf][col][pf_swz_e(kb + 8, col)]);
+            }
+            #pragma unroll
+            for (int i = 0; i < MFRAG; i++)
+                #pragma unroll
+                for (int j = 0; j < NFRAG; j++)
+                    asm volatile(
+                        "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+                        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+                        : "+f"(acc[i][j][0]), "+f"(acc[i][j][1]), "+f"(acc[i][j][2]), "+f"(acc[i][j][3])
+                        : "r"(af[i][0]), "r"(af[i][1]), "r"(af[i][2]), "r"(af[i][3]),
+                          "r"(bf[j][0]), "r"(bf[j][1]));
+        }
+        // The plane written here was last read by the previous stage's MMAs, which the barrier at
+        // the top of this stage has already retired; the next stage's top barrier publishes it.
+        if (more) storeB(buf ^ 1, (t + 1) * PF_BK);
+        __syncthreads();
+        buf ^= 1;
+    }
+
+    #pragma unroll
+    for (int i = 0; i < MFRAG; i++) {
+        #pragma unroll
+        for (int j = 0; j < NFRAG; j++) {
+            const int gn = n0 + wn * 64 + j * 8 + tig * 2;
+            if (gn + 1 >= N) {
+                #pragma unroll
+                for (int e = 0; e < 4; e++) {
+                    const int gm = m0 + wm * 16 * MFRAG + i * 16 + grp + (e >> 1) * 8;
+                    const int cn = gn + (e & 1);
+                    if (gm < M && cn < N) C[(size_t)gm * N + cn] = __float2bfloat16(acc[i][j][e]);
+                }
+                continue;
+            }
+            #pragma unroll
+            for (int h = 0; h < 2; h++) {
+                const int gm = m0 + wm * 16 * MFRAG + i * 16 + grp + h * 8;
                 if (gm >= M) continue;
                 const __nv_bfloat162 v = __floats2bfloat162_rn(acc[i][j][h * 2], acc[i][j][h * 2 + 1]);
                 *reinterpret_cast<__nv_bfloat162*>(&C[(size_t)gm * N + gn]) = v;
@@ -1587,6 +1770,30 @@ __global__ __launch_bounds__(NWARP * 32) void pf_attn_bf16_paged_tiled_kernel(
 // ============================================================================
 // Host launchers
 // ============================================================================
+// M tile for the bf16 mma.sync kernels. The 128-row tile is the fast one once the grid spans
+// several waves, but a grid of at most one wave leaves SMs idle -- at prefill@512 on
+// Ternary-Bonsai-2 the GDN projections put 160-320 blocks on 340 slots -- and the 64-row tile
+// doubles the block count for the same work. Measured there: ssm_out 193 -> 154 us, z 294 -> 217,
+// wqkv 301 -> 291. Output is bit-identical either way (see pf_gemm_bf16_mma_kernel).
+// SPARKINFER_PREFILL_BF16_MMA_BM=64 / =128 pins the tile (A/B).
+static bool pf_mma_bm64(int M, int N) {
+    static const int env = [] {
+        const char* e = getenv("SPARKINFER_PREFILL_BF16_MMA_BM");
+        return e ? atoi(e) : 0;
+    }();
+    if (env == 64) return true;
+    if (env == 128) return false;
+    static int slots = 0;
+    if (!slots) {
+        int dev = 0, sms = 170;
+        cudaGetDevice(&dev);
+        cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
+        slots = 2 * sms;
+    }
+    const long blocks = (long)((N + PF_BN - 1) / PF_BN) * (long)((M + PF_BM - 1) / PF_BM);
+    return M > 64 && blocks <= slots;
+}
+
 void launch_prefill_gemm(const void* A, const void* W, void* C,
                          int M, int N, int K, cudaStream_t stream, bool prefer_mma) {
     // Narrow n_out (the GDN gate projections) wastes most of a 128-wide tile and grids to only
@@ -1598,14 +1805,52 @@ void launch_prefill_gemm(const void* A, const void* W, void* C,
     // SPARKINFER_PREFILL_BF16_WMMA=1 for A/B. Never auto-select by M alone — MoE keeps bf16
     // projections at every context, and a silent M-threshold switch regressed its accuracy gate.
     static int force_wmma = []{ const char* e = getenv("SPARKINFER_PREFILL_BF16_WMMA"); return e && e[0] != '0' ? 1 : 0; }();
-    if (force_wmma || !prefer_mma)
+    if (force_wmma || !prefer_mma) {
         pf_gemm_kernel<<<grid, 256, 0, stream>>>(
             reinterpret_cast<const __nv_bfloat16*>(A), reinterpret_cast<const __nv_bfloat16*>(W),
             reinterpret_cast<__nv_bfloat16*>(C), M, N, K);
-    else
-        pf_gemm_bf16_mma_kernel<<<grid, 256, 0, stream>>>(
+    } else if (pf_mma_bm64(M, N)) {
+        pf_gemm_bf16_mma_kernel<1><<<dim3(grid.x, (M + 63) / 64), 256, 0, stream>>>(
             reinterpret_cast<const __nv_bfloat16*>(A), reinterpret_cast<const __nv_bfloat16*>(W),
             reinterpret_cast<__nv_bfloat16*>(C), M, N, K);
+    } else {
+        pf_gemm_bf16_mma_kernel<2><<<grid, 256, 0, stream>>>(
+            reinterpret_cast<const __nv_bfloat16*>(A), reinterpret_cast<const __nv_bfloat16*>(W),
+            reinterpret_cast<__nv_bfloat16*>(C), M, N, K);
+    }
+}
+
+// bf16 GEMM on a Q4_K weight without materializing it (pf_gemm_q4k_bf16_mma_kernel). Declines --
+// returns false, so the caller dequantizes and runs launch_prefill_gemm -- for anything else.
+//
+// Only where its 128-row grid already fills about a wave. The fused kernel's blocks are longer
+// than the plain GEMM's (they decode their own B tile), so on a grid with idle slots it loses to
+// dequantize + the 64-row tile above; on a full one, skipping the dequant pass wins. Measured at
+// M=512 on Ternary-Bonsai-2's GDN projections (dequant + 64-row GEMM vs fused): wqkv (320 blocks)
+// 352 -> 323 us, while z (192 blocks) 238 vs 320 and ssm_out (160 blocks) 176 vs 242 stay on the
+// dequant path. SPARKINFER_PREFILL_BF16_Q4K_FUSED=0 always dequantizes (A/B).
+bool launch_prefill_gemm_q4k_bf16(const void* A, const void* W_q4k, void* C,
+                                  int M, int N, int K, cudaStream_t stream) {
+    static const bool on = [] {
+        const char* e = getenv("SPARKINFER_PREFILL_BF16_Q4K_FUSED");
+        return !(e && e[0] == '0');
+    }();
+    // M <= 512: every 128-row M tile decodes the weight again, which is the right trade only while
+    // there are few of them. The >96k bf16 fallback keeps dequantizing once.
+    if (!on || !A || !W_q4k || !C || M <= 0 || M > 512 || N <= 0 || K <= 0 || (K & 255)) return false;
+    static int slots = 0;
+    if (!slots) {
+        int dev = 0, sms = 170;
+        cudaGetDevice(&dev);
+        cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
+        slots = 2 * sms;
+    }
+    const dim3 g128((N + PF_BN - 1) / PF_BN, (M + PF_BM - 1) / PF_BM);
+    if ((long)g128.x * (long)g128.y * 10 < (long)slots * 9) return false;
+    pf_gemm_q4k_bf16_mma_kernel<2><<<g128, 256, 0, stream>>>(
+        reinterpret_cast<const __nv_bfloat16*>(A), reinterpret_cast<const unsigned char*>(W_q4k),
+        reinterpret_cast<__nv_bfloat16*>(C), M, N, K);
+    return true;
 }
 
 void launch_prefill_swiglu(const void* gate, const void* up, void* h, long n, cudaStream_t stream) {
