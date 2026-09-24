@@ -828,6 +828,12 @@ struct Qwen35Model::Impl {
     bf16* bonsai_ffn_gate = nullptr;
     bf16* bonsai_ffn_up = nullptr;
     bf16* bonsai_ffn_h = nullptr;
+    // int8-activation arm (launch_ptq1_rotq_* + launch_gemv_ptq1_i8_*): the rotated activation
+    // quantized to int8 at the wider of the two FFN input widths, with its per-128 scales and
+    // integer sums. Null when the arm is off (SPARKINFER_PTQ1_I8=0).
+    signed char* bonsai_ffn_q = nullptr;
+    float* bonsai_ffn_qd = nullptr;
+    int* bonsai_ffn_qs = nullptr;
     // Resolved once at load rather than looked up per layer per token.
     const signed char* bonsai_sign_h = nullptr;     // int8[hidden]
     const signed char* bonsai_sign_ffn = nullptr;   // int8[moe_ffn]
@@ -2549,6 +2555,35 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
             // single fused kernel. That is the slow-but-obviously-correct shape for an accuracy
             // experiment; if the accuracy win is real, the fusion work follows, and NVFP4's
             // decoded magnitudes are exact int8 so a dp4a path is reachable.
+            if (w.gate_qtype == kPtq1GgmlType && w.up_qtype == kPtq1GgmlType &&
+                w.down_qtype != kPtq1GgmlType && c.top_k == 1) {
+                // Ternary gate/up, folded down. hn is rotated into the weights' basis and
+                // quantized to int8 in one pass, gate and up run as one GEMV launch into bf16,
+                // and the expert FFN takes them as supplied projections: SwiGLU folded into the
+                // Q8_1 quantize of h, then down exactly as the folded path runs it.
+                if (s.bonsai_ffn_q &&
+                    kernels::launch_ptq1_rotq_bf16(s.hn, s.bonsai_sign_h, s.bonsai_ffn_q,
+                                                   s.bonsai_ffn_qd, s.bonsai_ffn_qs, 1, H,
+                                                   (int)s.bonsai_block, st)) {
+                    kernels::launch_gemv_ptq1_i8_bf16(s.bonsai_ffn_q, s.bonsai_ffn_qd,
+                                                      s.bonsai_ffn_qs, w.gate_q, w.up_q,
+                                                      s.bonsai_ffn_gate, s.bonsai_ffn_up,
+                                                      c.moe_ffn, H, st);
+                } else {
+                    kernels::launch_hadamard_rotate_bf16(s.hn, s.bonsai_rot_hn, s.bonsai_sign_h,
+                                                         H, (int)H, (int)s.bonsai_block, st);
+                    kernels::launch_gemv_ptq1(s.bonsai_rot_hn, w.gate_q, s.bonsai_ffn_gate,
+                                              c.moe_ffn, H, st);
+                    kernels::launch_gemv_ptq1(s.bonsai_rot_hn, w.up_q, s.bonsai_ffn_up,
+                                              c.moe_ffn, H, st);
+                }
+                kernels::launch_moe_expert_ffn_q4k(s.hn, w.gate_q, w.up_q, w.down_q,
+                                                   w.gate_qtype, w.up_qtype, w.down_qtype,
+                                                   s.mf_ids, s.mf_weights, s.routed, s.mf_h,
+                                                   s.mf_out, 1, c.top_k, H, c.moe_ffn,
+                                                   nullptr, st, false, s.bonsai_ffn_gate,
+                                                   s.bonsai_ffn_up);
+            } else
             // Ternary SwiGLU, read in the stored blocks. Same three-GEMV-plus-elementwise shape
             // as the NVFP4 arm below and for the same reason: obviously correct first, and the
             // fused kernel it replaces cannot drive type 143 at all.
@@ -6007,6 +6042,10 @@ bool Qwen35Model::load_gguf(const std::string& path) {
         // regrouping bug in the native upload was attributed: attn_gate is entirely v heads and
         // came out far more wrong than attn_qkv, where v is a third of the rows.
         if (v == "1" || v == "all") v = "head,embed,proj,ffn";
+        // Unset (or set empty) takes the FFN's gate and up projections natively and folds the
+        // rest; "0"/"none" folds everything.
+        if (v.empty()) v = "gu";
+        if (v == "0" || v == "none") v.clear();
         return v;
     }();
     const bool bonsai_native = had.present && !bonsai_native_set.empty();
@@ -6022,15 +6061,22 @@ bool Qwen35Model::load_gguf(const std::string& path) {
     // non-residual width, and because it replaces a single fused Q4_K kernel with three GEMVs and
     // an elementwise SwiGLU -- a different performance question from the projections.
     const bool bonsai_native_ffn = bonsai_native_set.find("ffn") != std::string::npos;
-    // The decode shadow: main's folded Q4_K load, unchanged, plus a ternary copy of the head, the
-    // residual-width projections and the FFN that only forward_token reads. Prefill keeps its
-    // Q4_K GEMMs and the packed batch its Q4_K kernels; single-row decode reads 2.6x fewer bytes.
-    // Off whenever SPARKINFER_BONSAI_NATIVE picks a residency explicitly.
+    // "gu": gate and up only, down folded. Those two are the FFN's residual-width half: they read
+    // the post-attention norm, and their outputs meet only in SwiGLU, whose result feeds the
+    // folded down exactly as it does today -- so neither rotation of the FFN-width activation nor
+    // any change to down's numerics is involved.
+    const bool bonsai_native_gu = bonsai_native_ffn ||
+                                  bonsai_native_set.find("gu") != std::string::npos;
+    // The decode shadow: a ternary copy of the head, the residual-width projections and the FFN,
+    // next to their folded Q4_K load, for decode (single-row and packed) to read; prefill never
+    // does. Under the default "gu" residency gate and up are already ternary, so the FFN's copy is
+    // down's alone. Off whenever SPARKINFER_BONSAI_NATIVE takes any family beyond gate/up.
     static const bool bonsai_shadow_env = [] {
         const char* e = getenv("SPARKINFER_BONSAI_DECODE_SHADOW");
         return !(e && e[0] == '0');
     }();
-    const bool bonsai_shadow = had.present && bonsai_native_set.empty() && bonsai_shadow_env;
+    const bool bonsai_shadow = had.present && bonsai_shadow_env && !bonsai_native_ffn &&
+                               !bonsai_native_proj && !bonsai_native_head && !bonsai_native_embed;
     // Which parts get a ternary copy: "head", "proj", "ffn", comma-separated. Default: the FFN,
     // ~70% of the weight bytes. The head and the projections add speed but each moves the
     // logits further from the folded path's (KL vs main 0.018 FFN-only, 0.026 all three).
@@ -6072,7 +6118,7 @@ bool Qwen35Model::load_gguf(const std::string& path) {
         }
         // All four or none: a half-allocated FFN scratch would leave the decode branch reading a
         // null buffer, and the folded path is a perfectly good fallback.
-        if ((bonsai_native_ffn || bonsai_shadow) && s.cfg.hidden > 0 && s.cfg.moe_ffn > 0 &&
+        if ((bonsai_native_gu || bonsai_shadow) && s.cfg.hidden > 0 && s.cfg.moe_ffn > 0 &&
             s.bonsai_sign_h && s.bonsai_sign_ffn) {
             const size_t hb = (size_t)s.cfg.hidden * sizeof(bf16);
             const size_t fb = (size_t)s.cfg.moe_ffn * sizeof(bf16);
@@ -6084,6 +6130,21 @@ bool Qwen35Model::load_gguf(const std::string& path) {
                 s.owned.push_back(s.bonsai_ffn_gate);
                 s.owned.push_back(s.bonsai_ffn_up);
                 s.owned.push_back(s.bonsai_ffn_h);
+                const char* pe = getenv("SPARKINFER_PTQ1_I8");
+                const bool ffn_i8 = !(pe && pe[0] == '0') && s.bonsai_block == 1024 &&
+                                    s.cfg.hidden % 1024 == 0 && s.cfg.moe_ffn % 1024 == 0;
+                const size_t wid = (size_t)std::max<long>(s.cfg.hidden, s.cfg.moe_ffn);
+                if (ffn_i8 &&
+                    cudaMalloc((void**)&s.bonsai_ffn_q, wid) == cudaSuccess &&
+                    cudaMalloc((void**)&s.bonsai_ffn_qd, wid / 128 * sizeof(float)) == cudaSuccess &&
+                    cudaMalloc((void**)&s.bonsai_ffn_qs, wid / 128 * sizeof(int)) == cudaSuccess) {
+                    s.owned.push_back(s.bonsai_ffn_q);
+                    s.owned.push_back(s.bonsai_ffn_qd);
+                    s.owned.push_back(s.bonsai_ffn_qs);
+                } else {
+                    cudaFree(s.bonsai_ffn_q); cudaFree(s.bonsai_ffn_qd); cudaFree(s.bonsai_ffn_qs);
+                    s.bonsai_ffn_q = nullptr; s.bonsai_ffn_qd = nullptr; s.bonsai_ffn_qs = nullptr;
+                }
             } else {
                 cudaFree(s.bonsai_rot_hn); cudaFree(s.bonsai_ffn_gate);
                 cudaFree(s.bonsai_ffn_up); cudaFree(s.bonsai_ffn_h);
@@ -6581,14 +6642,15 @@ bool Qwen35Model::load_gguf(const std::string& path) {
         if (sh && p) shadow_of[p] = sh;
         return p;
     };
-    // The dense FFN's three matrices, left in their stored blocks. No v-head regrouping applies:
-    // that is a property of tensors PRODUCING a GDN v head, and none of these does. Gate and up
-    // read the residual width, down reads the FFN width -- both sign vectors are required up
-    // front, because a down leg that fell back to Q4_K while gate/up went native would be reading
-    // a correctly-rotated activation with un-rotated weights.
+    // The dense FFN's matrices, left in their stored blocks. No v-head regrouping applies: that
+    // is a property of tensors PRODUCING a GDN v head, and none of these does. Gate and up read
+    // the residual width, down reads the FFN width -- both sign vectors are required up front.
+    // Down may stay folded while gate/up go native: its input is SwiGLU's output, which is in the
+    // architecture's basis whichever way gate and up were computed; only a NATIVE down needs that
+    // output rotated.
     auto ffn_w = [&](const std::string& name, int& type) -> const void* {
         const GGUFTensor* t = g.tensor(name);
-        if (bonsai_native_ffn && s.bonsai_ffn_h && t && t->ggml_type == kPtq1GgmlType &&
+        if (bonsai_native_gu && s.bonsai_ffn_h && t && t->ggml_type == kPtq1GgmlType &&
             s.bonsai_sign_dev.count(t->dims[0])) {
             void* d = nullptr;
             if (cudaMalloc(&d, t->n_bytes) == cudaSuccess &&
@@ -6881,19 +6943,22 @@ bool Qwen35Model::load_gguf(const std::string& path) {
             // consumes equal-stride pairs; unselected layers retain the native Q4_K path.
             const bool gu3 = ffn_q3a_on("ffn_gate") && ffn_q3a_on("ffn_up") &&
                              int_list_has(ffn_q3a_layers, i);
-            // Native ternary first, and all three together: the decode branch below needs the
-            // whole SwiGLU in one basis, so a partial take is worse than none.
+            // Native ternary first. Gate and up go together (they share one activation and meet in
+            // SwiGLU); down only with them, and only when the whole FFN was asked for.
             w.gate_q = ffn_w(b + "ffn_gate.weight", w.gate_qtype);
             w.up_q   = w.gate_q ? ffn_w(b + "ffn_up.weight", w.up_qtype) : nullptr;
-            w.down_q = w.up_q   ? ffn_w(b + "ffn_down.weight", w.down_qtype) : nullptr;
-            if (!(w.gate_q && w.up_q && w.down_q)) {
+            w.down_q = (w.up_q && bonsai_native_ffn) ? ffn_w(b + "ffn_down.weight", w.down_qtype)
+                                                     : nullptr;
+            if (!(w.gate_q && w.up_q)) {
                 w.gate_q = gu3 ? dev_quant_q3a(b + "ffn_gate.weight", w.gate_qtype, &w.prefill_gate_q, &w.prefill_gate_qtype)
                                : dev_quant(b + "ffn_gate.weight", w.gate_qtype);
                 w.up_q   = gu3 ? dev_quant_q3a(b + "ffn_up.weight", w.up_qtype, &w.prefill_up_q, &w.prefill_up_qtype)
                                : dev_quant(b + "ffn_up.weight", w.up_qtype);
-                w.down_q = dev_quant_down(b + "ffn_down.weight", w.down_qtype);
                 ffn_q_shadow(b + "ffn_gate.weight", w.gate_q);
                 ffn_q_shadow(b + "ffn_up.weight", w.up_q);
+            }
+            if (!w.down_q) {
+                w.down_q = dev_quant_down(b + "ffn_down.weight", w.down_qtype);
                 ffn_q_shadow(b + "ffn_down.weight", w.down_q);
             }
         } else {
@@ -7079,6 +7144,22 @@ bool Qwen35Model::load_gguf(const std::string& path) {
                     float* dst = base + off; off += (size_t)rows;
                     if (ok && W && fusable(wt) && fill(wt, W, dst, (size_t)rows, cols)) *rs = dst;
                 };
+                // Ternary gate/up (the default Ternary-Bonsai-2 load): the fused GEMM's PTQ1 arm
+                // decodes against the row scale launch_ptq1_rows_i8 computes. Only gate/up: prefill
+                // hands those two a rotated activation, and nothing else is read that way.
+                auto place_t = [&](const void* W, int wt, const float** rs, int rows, int cols) {
+                    if (wt != kPtq1GgmlType) { place(W, wt, rs, rows, cols); return; }
+                    float* dst = base + off; off += (size_t)rows;
+                    const size_t chunk = tmp_bytes / (size_t)cols;
+                    bool good = ok && W != nullptr;
+                    for (size_t r0 = 0; good && r0 < (size_t)rows; r0 += chunk) {
+                        const size_t nr = ((size_t)rows - r0 < chunk) ? ((size_t)rows - r0) : chunk;
+                        good = kernels::launch_ptq1_rows_i8(
+                            (const char*)W + r0 * (size_t)(cols / 128) * 28, tmp, dst + r0,
+                            (int)nr, cols, s.stream);
+                    }
+                    if (good) *rs = dst;
+                };
                 if (!qb_dense) {
                     place(lw.wq,     lw.wq_type,     &lw.wq_rs,    qd, H);
                     place(lw.wgate,  lw.wgate_type,  &lw.wgate_rs, qd, H);
@@ -7086,12 +7167,12 @@ bool Qwen35Model::load_gguf(const std::string& path) {
                     place(lw.wv,     lw.wv_type,     &lw.wv_rs,    kd, H);
                     place(lw.wo,     lw.wo_type,     &lw.wo_rs,    H,  qd);
                 }
-                place(lw.prefill_gate_q ? lw.prefill_gate_q : lw.gate_q,
-                      lw.prefill_gate_q ? lw.prefill_gate_qtype : lw.gate_qtype,
-                      &lw.gate_rs, ff, H);
-                place(lw.prefill_up_q ? lw.prefill_up_q : lw.up_q,
-                      lw.prefill_up_q ? lw.prefill_up_qtype : lw.up_qtype,
-                      &lw.up_rs, ff, H);
+                place_t(lw.prefill_gate_q ? lw.prefill_gate_q : lw.gate_q,
+                        lw.prefill_gate_q ? lw.prefill_gate_qtype : lw.gate_qtype,
+                        &lw.gate_rs, ff, H);
+                place_t(lw.prefill_up_q ? lw.prefill_up_q : lw.up_q,
+                        lw.prefill_up_q ? lw.prefill_up_qtype : lw.up_qtype,
+                        &lw.up_rs, ff, H);
                 place(lw.down_q, lw.down_qtype,  &lw.down_rs,  H,  ff);
                 // Attention, for the dense arm. Exactly one of the two families exists on a given
                 // layer, so both are placed at the same base and the cursor advances once, by the
@@ -7614,7 +7695,12 @@ bool Qwen35Model::load_gguf(const std::string& path) {
             n_proj += swap_in(d.wqkv, d.wqkv_type) + swap_in(d.wqkv_gate, d.wqkv_gate_type) +
                       swap_in(d.wq, d.wq_type) + swap_in(d.wgate, d.wgate_type) +
                       swap_in(d.wk, d.wk_type) + swap_in(d.wv, d.wv_type);
-            if (shadow_of.count(d.gate_q) && shadow_of.count(d.up_q) && shadow_of.count(d.down_q)) {
+            // A leg loaded ternary (gate/up under "gu") needs no copy; the rest must have one.
+            auto ternary = [&](const void* p, int t) {
+                return p && (t == kPtq1GgmlType || shadow_of.count(p));
+            };
+            if (ternary(d.gate_q, d.gate_qtype) && ternary(d.up_q, d.up_qtype) &&
+                ternary(d.down_q, d.down_qtype)) {
                 swap_in(d.gate_q, d.gate_qtype);
                 swap_in(d.up_q, d.up_qtype);
                 swap_in(d.down_q, d.down_qtype);

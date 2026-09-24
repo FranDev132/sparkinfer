@@ -2648,8 +2648,16 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
             // Long-ctx: selective int8 FFN (GDN/attn stay bf16) + int8 weight cache across chunks.
             // The scratch-backed cache holds only if all three weights take the direct int8
             // materialize: the dq() fallback writes wbuf, which is where up and down live.
-            auto rows_i8_direct = [](int t, int cols) {
-                return (t == 12 || t == 13 || t == 14) && (cols & 255) == 0;
+            // Ternary gate/up (the default Ternary-Bonsai-2 load). Their weights are read in the
+            // stored, Hadamard-rotated basis, so the activation they see is hn rotated the same way
+            // and row-quantized in one pass (launch_ptq1_rotq_rows_i8); every arm below routes
+            // them through tgu_gate_up instead of proj(), whose dq() fallback would un-rotate.
+            const bool t_gu = gate_pf_type == kPtq1GgmlType && up_pf_type == kPtq1GgmlType &&
+                              s.bonsai_sign_hidden && s.bonsai_block == 1024 && use_i8 &&
+                              (H % 1024) == 0;
+            auto rows_i8_direct = [&](int t, int cols) {
+                return ((t == 12 || t == 13 || t == 14) && (cols & 255) == 0) ||
+                       (t_gu && t == kPtq1GgmlType && cols == H);
             };
             const bool ffn_i8 = (use_i8_ffn ||
                                  (ffn_wcache && rows_i8_direct(gate_pf_type, H) &&
@@ -2669,10 +2677,80 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                 (!qb_dense_pass || FC <= kernels::pf_dense_gemm_qi8_max_m()) &&
                 kernels::pf_dense_gemm_qi8_supported(gate_pf_type);
             if (ffn_i8 && !ffn_qi8) {
-                dequant_w_i8(gate_pf_type, gate_pf, ffn_Wg_i8, ffn_swg, ffn, H);
-                dequant_w_i8(up_pf_type,   up_pf,   ffn_Wu_i8, ffn_swu, ffn, H);
+                if (t_gu) {
+                    kernels::launch_ptq1_rows_i8(gate_pf, ffn_Wg_i8, ffn_swg, ffn, H, st);
+                    kernels::launch_ptq1_rows_i8(up_pf,   ffn_Wu_i8, ffn_swu, ffn, H, st);
+                } else {
+                    dequant_w_i8(gate_pf_type, gate_pf, ffn_Wg_i8, ffn_swg, ffn, H);
+                    dequant_w_i8(up_pf_type,   up_pf,   ffn_Wu_i8, ffn_swu, ffn, H);
+                }
                 dequant_w_i8(down_pf_type, down_pf, ffn_Wd_i8, ffn_swd, H, ffn);
             }
+            // gate/up -> ffg/ffu (bf16) for a ternary pair: rotate+quantize hn into A_i8, then the
+            // fused quantized-B GEMM (its PTQ1 arm) where the chunk fits it, else the int8 weights
+            // (the per-layer cache when this layer filled it, a materialize otherwise).
+            // fused_out (optional): as for the Q4_K pair, let the grouped GEMM's split-K epilogue
+            // apply SwiGLU and write the down projection's int8 input straight into A_i8/sx.
+            // h_out (optional): past the fused GEMM, let launch_prefill_gemm_i8_swiglu write
+            // h = bf16(silu(g) * u) into ffg instead of gate and up separately; *h_out says it did.
+            auto tgu_gate_up = [&](const bf16* hin, int rows_c, int* fused_out,
+                                   bool* h_out = nullptr) {
+                signed char* const qp = apk_dst(rows_c, H);
+                kernels::launch_ptq1_rotq_rows_i8(
+                    hin, static_cast<const signed char*>(s.bonsai_sign_hidden), A_i8, sx, qp,
+                    rows_c, H, s.bonsai_block, st);
+                a_pk = qp != nullptr;
+                a_q = nullptr;   // A_i8 now holds the ROTATED activation: no memo may reuse it
+                bool done = false;
+                if (w.gate_rs && w.up_rs && rows_c <= kernels::pf_dense_gemm_qi8_max_m()) {
+                    const void*  Wf[2]  = { gate_pf, up_pf };
+                    const float* rsf[2] = { w.gate_rs, w.up_rs };
+                    void*        Cf[2]  = { ffg, ffu };
+                    const int    nf[2]  = { ffn, ffn };
+                    done = kernels::launch_prefill_gemm_qi8_dense_group(
+                        kPtq1GgmlType, A_i8, sx, Wf, rsf, Cf, nf, 2, rows_c, H, st,
+                        qb_partials, QB_SPLITS, qb_partials_cap,
+                        fused_out ? A_i8 : nullptr, fused_out ? sx : nullptr, fused_out, apk(),
+                        fused_out ? apk_dst(rows_c, ffn) : nullptr);
+                }
+                if (done) return;
+                const bool gu_h = h_out && ffn % 128 == 0 && ffn >= 2048 && ffn <= 20480;
+                if (ffn_i8 && !ffn_qi8) {
+                    if (gu_h && kernels::launch_prefill_gemm_i8_swiglu(
+                                    A_i8, ffn_Wg_i8, ffn_Wu_i8, sx, ffn_swg, ffn_swu, ffg, ffn,
+                                    rows_c, ffn, H, st)) {
+                        *h_out = true;
+                        return;
+                    }
+                    kernels::launch_prefill_gemm_i8(A_i8, ffn_Wg_i8, sx, ffn_swg, ffg, rows_c, ffn, H, st);
+                    kernels::launch_prefill_gemm_i8(A_i8, ffn_Wu_i8, sx, ffn_swu, ffu, rows_c, ffn, H, st);
+                } else {
+                    // No weight cache: a gate half and the matching up half per pass through W_i8,
+                    // as the Q4_K pair does it below.
+                    if (gu_h && rows_c % 128 == 0 && H % 64 == 0 &&
+                        (size_t)ffn * H <= maxw && ffn <= maxNO) {
+                        const int nh = ffn / 2;
+                        const size_t rb = (size_t)(H / 128) * 28;
+                        bool ok = true;
+                        for (int h0 = 0; h0 < ffn && ok; h0 += nh) {
+                            kernels::launch_ptq1_rows_i8(
+                                static_cast<const char*>(gate_pf) + (size_t)h0 * rb, W_i8, sw, nh,
+                                H, st);
+                            kernels::launch_ptq1_rows_i8(
+                                static_cast<const char*>(up_pf) + (size_t)h0 * rb,
+                                W_i8 + (size_t)nh * H, sw + nh, nh, H, st);
+                            ok = kernels::launch_prefill_gemm_i8_swiglu(
+                                A_i8, W_i8, W_i8 + (size_t)nh * H, sx, sw, sw + nh, ffg + h0, ffn,
+                                rows_c, nh, H, st);
+                        }
+                        if (ok) { *h_out = true; return; }
+                    }
+                    kernels::launch_ptq1_rows_i8(gate_pf, W_i8, sw, ffn, H, st);
+                    gemm_i8(A_i8, W_i8, sx, sw, ffg, rows_c, ffn, H, false);
+                    kernels::launch_ptq1_rows_i8(up_pf, W_i8, sw, ffn, H, st);
+                    gemm_i8(A_i8, W_i8, sx, sw, ffu, rows_c, ffn, H, false);
+                }
+            };
             // The down projection takes the int8 path on both branches whenever ffn_i8 or use_i8,
             // so the FFN residual can ride the residual-fused GEMM straight into x per chunk.
             // Muse Glimmer must NOT residual-fuse: the post-FFN sandwich (norm_then_add below) needs
@@ -2784,7 +2862,10 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                 if (ffn_qi8) {
                     bool gu_grouped = false;
                     int gu_fused_swiglu = 0;
-                    if (gate_pf_type == up_pf_type && w.gate_rs && w.up_rs) {
+                    if (t_gu) {
+                        tgu_gate_up(hn_c, fn, &gu_fused_swiglu);
+                        gu_grouped = true;
+                    } else if (gate_pf_type == up_pf_type && w.gate_rs && w.up_rs) {
                         const void*  Wf[2]  = { gate_pf, up_pf };
                         const float* rsf[2] = { w.gate_rs, w.up_rs };
                         void*        Cf[2]  = { ffg, ffu };
@@ -2831,19 +2912,25 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                 }
                 if (ffn_i8) {
                     a_q = nullptr;                     // this branch writes A_i8/sx directly
-                    signed char* qp = apk_dst(fn, H);
-                    a_pk = kernels::launch_prefill_quantize_rows_i8(hn_c, A_i8, sx, fn, H, st,
-                                                                    qp) && qp;
+                    signed char* qp = nullptr;
                     // Gate, up and SwiGLU in one GEMM whose epilogue writes h = bf16(silu(g) * u):
                     // one bf16 plane goes to DRAM and comes back instead of two. Bit-identical to
                     // the two GEMMs + launch_prefill_swiglu_quant_i8 (see the kernel). The launcher
                     // declines a partial final chunk (fn % 128) and that chunk keeps the old form.
                     // SPARKINFER_PREFILL_GEMM_I8_SWIGLU=0 keeps it everywhere.
-                    const bool h_ready = ffn >= 2048 && ffn <= 20480 &&
-                        kernels::launch_prefill_gemm_i8_swiglu(A_i8, ffn_Wg_i8, ffn_Wu_i8, sx,
-                                                               ffn_swg, ffn_swu, ffg, ffn, fn, ffn,
-                                                               H, st);
-                    if (!h_ready) {
+                    bool h_ready = false;
+                    if (t_gu) {
+                        tgu_gate_up(hn_c, fn, nullptr, &h_ready);
+                    } else {
+                        qp = apk_dst(fn, H);
+                        a_pk = kernels::launch_prefill_quantize_rows_i8(hn_c, A_i8, sx, fn, H, st,
+                                                                        qp) && qp;
+                        h_ready = ffn >= 2048 && ffn <= 20480 &&
+                            kernels::launch_prefill_gemm_i8_swiglu(A_i8, ffn_Wg_i8, ffn_Wu_i8, sx,
+                                                                   ffn_swg, ffn_swu, ffg, ffn, fn,
+                                                                   ffn, H, st);
+                    }
+                    if (!t_gu && !h_ready) {
                         kernels::launch_prefill_gemm_i8(A_i8, ffn_Wg_i8, sx, ffn_swg, ffg, fn, ffn, H, st);
                         kernels::launch_prefill_gemm_i8(A_i8, ffn_Wu_i8, sx, ffn_swu, ffu, fn, ffn, H, st);
                     }
@@ -2897,7 +2984,14 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                         return !(e && e[0] == '0');
                     }();
                     bool h_ready = false;
-                    if (!ffn_grouped && gu_swiglu_on && use_i8 && ffn_i8_stage &&
+                    if (!ffn_grouped && t_gu) {
+                        tgu_gate_up(hn_c, fn, nullptr,
+                                    gu_swiglu_on && use_i8 && ffn_i8_stage &&
+                                            fn > kernels::pf_dense_gemm_qi8_max_m() &&
+                                            a_i8_fits(fn, H)
+                                        ? &h_ready
+                                        : nullptr);
+                    } else if (!ffn_grouped && gu_swiglu_on && use_i8 && ffn_i8_stage &&
                         fn > kernels::pf_dense_gemm_qi8_max_m() && fn % 128 == 0 &&
                         gate_pf_type == up_pf_type &&
                         (gate_pf_type == 12 || gate_pf_type == 13 || gate_pf_type == 14) &&
@@ -2923,7 +3017,7 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                             h_ready = h0 + nh >= ffn;
                         }
                     }
-                    if (!ffn_grouped && !h_ready) {
+                    if (!ffn_grouped && !t_gu && !h_ready) {
                         proj_fused(hn_c, gate_pf, gate_pf_type, w.gate_rs, ffg, ffn, H, fn);
                         proj_fused(hn_c, up_pf,   up_pf_type,   w.up_rs,   ffu, ffn, H, fn);
                     }
@@ -4089,6 +4183,16 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
     // scratch that the main stream is reading.
     const bf16* bonsai_rot_src = nullptr;
     int bonsai_rot_k = 0;
+    // The ternary gate/up's int8 activation (launch_ptq1_rotq_bf16) with its per-128 scales and
+    // sums. Same condition as bonsai_rot_n, so the arena sequence is fixed per model.
+    const size_t bt_w = (size_t)(ffn > H ? ffn : H);
+    signed char* bt_q = bonsai_any ? a.alloc<signed char>((size_t)NA * bt_w) : nullptr;
+    float* bt_qd = bonsai_any ? a.alloc<float>((size_t)NA * bt_w / 128) : nullptr;
+    int* bt_qs = bonsai_any ? a.alloc<int>((size_t)NA * bt_w / 128) : nullptr;
+    // Split-K partials for the ternary down (launch_gemm_ptq1_i8_rows_bf16): up to 8 splits of
+    // [N, H] f32. Same condition again, so the sequence stays fixed per model.
+    const size_t bt_part_cap = (size_t)8 * NA * H;
+    float* bt_part = bonsai_any ? a.alloc<float>(bt_part_cap) : nullptr;
     bf16* sg = a.alloc<bf16>((size_t)NA * ffn);
     bf16* su = a.alloc<bf16>((size_t)NA * ffn);
     bf16* sh = a.alloc<bf16>((size_t)NA * ffn);
@@ -4123,7 +4227,16 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
         const char* e = getenv("SPARKINFER_CB_DENSE_MMA_MINROWS");
         return e ? atoi(e) : 4;
     }();
-    const int q4k_mma_min = gu_acc_needed ? cb_dense_mma_min : 0;
+    // A stack whose gate/up are ternary (the default Ternary-Bonsai-2 load) still runs a Q4_K down
+    // and Q4_K in-projections, so it keeps the same floor without needing gu_acc.
+    const bool ternary_gu_stack = packed && dense && !muse && [&] {
+        for (int L = 0; L < c.n_layers; ++L) {
+            const Qwen35LayerWeights& lw = s.w.layers[L];
+            if (lw.gate_q && lw.gate_qtype == kPtq1GgmlType && lw.down_qtype == 12) return true;
+        }
+        return false;
+    }();
+    const int q4k_mma_min = (gu_acc_needed || ternary_gu_stack) ? cb_dense_mma_min : 0;
     // out_scratch is not just the [N, H] fp32 output: launch_moe_expert_ffn_q4k also reuses it as
     // the Q8_1 staging buffer for the SwiGLU hidden, which needs
     // num_tokens * top_k * llama_q8_1_bytes(ffn) bytes. That kernel's "<= hidden floats; fits"
@@ -5413,8 +5526,11 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
             const bool ternary_ffn = w.gate_qtype == kPtq1GgmlType &&
                                      w.up_qtype == kPtq1GgmlType &&
                                      w.down_qtype == kPtq1GgmlType;
-            const bool q4_ffn = !ternary_ffn && w.gate_q && w.up_q && w.down_q;
-            if (!native_ffn && !q4_ffn && !ternary_ffn) {
+            // Ternary gate/up with a folded down (the default Ternary-Bonsai-2 load).
+            const bool ternary_gu = w.gate_qtype == kPtq1GgmlType && w.up_qtype == kPtq1GgmlType &&
+                                    w.down_qtype != kPtq1GgmlType && w.down_q;
+            const bool q4_ffn = !ternary_ffn && !ternary_gu && w.gate_q && w.up_q && w.down_q;
+            if (!native_ffn && !q4_ffn && !ternary_ffn && !ternary_gu) {
                 verify_decline("[dflash-verify] dense layer=%d missing gate/up/down\n", L);
                 supported = false; break;
             }
@@ -5445,8 +5561,9 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
             // Packed decode against the Bonsai decode shadow: the ternary legs single-row decode
             // reads, rotated and quantized per row as it does and multiplied at its G=8 lane
             // split, so each row is bit-identical to that row decoded alone -- and the step streams
-            // the 3.7 GB ternary FFN instead of its 9.6 GB Q4_K fold. Wider batches keep the fold:
-            // the dp4a work grows per row and the fold's mma path overtakes it.
+            // the 3.7 GB ternary FFN instead of its 9.6 GB Q4_K fold. Wider batches, where the
+            // dp4a work per row stops paying, take the ternary_gu arm below: the same ternary
+            // legs on the int8 tensor cores.
             static const int kCbShadowMaxRows = [] {
                 const char* e = getenv("SPARKINFER_BONSAI_CB_SHADOW_MAX_ROWS");
                 return e ? atoi(e) : 8;
@@ -5560,6 +5677,43 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
                             N, H, ffn);
                     supported = false; break;
                 }
+            } else if (ternary_gu) {
+                // Same as the AR decode arm in qwen35.cpp at N rows: hn rotated and quantized
+                // once, gate and up in one launch. Then down: the decode shadow's ternary copy
+                // when there is one -- SwiGLU's output rotated and quantized at the FFN width,
+                // the same tensor-core kernel, k split across CTAs since 5120 rows are only 40 --
+                // else the folded down through the expert FFN with the projections supplied.
+                if (topk != 1 || !bt_q || !s.bonsai_sign_hidden ||
+                    !kernels::launch_ptq1_rotq_bf16(
+                        hn, static_cast<const signed char*>(s.bonsai_sign_hidden), bt_q, bt_qd,
+                        bt_qs, N, H, s.bonsai_block, st) ||
+                    !kernels::launch_gemm_ptq1_i8_rows_bf16(bt_q, bt_qd, bt_qs, w.gate_q, w.up_q,
+                                                            sg, su, N, ffn, H, st)) {
+                    verify_decline("[dflash-verify] ternary gate/up declined N=%d\n", N);
+                    supported = false; break;
+                }
+                static const bool cb_ternary_down = [] {
+                    const char* e = getenv("SPARKINFER_BONSAI_CB_TERNARY_DOWN");
+                    return !(e && e[0] == '0');
+                }();
+                const Qwen35LayerWeights* tdl =
+                    (cb_ternary_down && s.bonsai_dec_layers) ? &s.bonsai_dec_layers[L] : nullptr;
+                if (tdl && tdl->down_qtype == kPtq1GgmlType && tdl->down_q && s.bonsai_sign_ffn) {
+                    if (!kernels::launch_ptq1_swiglu_rotq_bf16(
+                            sg, su, static_cast<const signed char*>(s.bonsai_sign_ffn), bt_q,
+                            bt_qd, bt_qs, N, ffn, s.bonsai_block, st) ||
+                        !kernels::launch_gemm_ptq1_i8_rows_bf16(bt_q, bt_qd, bt_qs, tdl->down_q,
+                                                                nullptr, routed, nullptr, N, H,
+                                                                ffn, st, bt_part, bt_part_cap)) {
+                        verify_decline("[dflash-verify] ternary down declined N=%d\n", N);
+                        supported = false; break;
+                    }
+                } else
+                kernels::launch_moe_expert_ffn_q4k(hn, w.gate_q, w.up_q, w.down_q,
+                                                   w.gate_qtype, w.up_qtype, w.down_qtype,
+                                                   expert_ids, expert_w, routed, moe_h, moe_out,
+                                                   N, topk, H, ffn, nullptr, st, false, sg, su,
+                                                   nullptr, q4k_mma_min);
             } else if (ternary_ffn) {
                 // Same shape as the AR decode arm in qwen35.cpp, at N rows: rotate the
                 // post-attention norm at the residual width, gate and up, SwiGLU, then rotate
