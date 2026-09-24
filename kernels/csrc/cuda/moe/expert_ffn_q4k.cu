@@ -2107,7 +2107,10 @@ __device__ __forceinline__ void si_mma_q4k_scales8(const unsigned char* sc12, un
 template <int MM> struct si_mma_shm { static constexpr int B = MM * 320 + SI_MMA_BN * 280; };
 template <int MM, int CG> struct si_mma_lb {
     static constexpr int occ = 102400 / si_mma_shm<MM>::B;
-    static constexpr int v = CG == 1 ? 8 : (occ > 8 ? 8 : occ);
+    // CG == 1 used to ask for eight CTAs whatever MM was, which capped ptxas at 64 registers
+    // even where shared memory only ever lets five (MM=32) or seven (MM=16) reside -- and the
+    // fold-in below needs the headroom to keep a whole super-block's scale loads in flight.
+    static constexpr int v = occ > 8 ? 8 : occ;
 };
 
 template <int MM, int CG = 1>
@@ -2133,9 +2136,11 @@ void down_q4k_mma_rows_kernel(const unsigned char* __restrict__ down_q,
 
     __shared__ signed char As[MM][256];
     __shared__ signed char Bs[SI_MMA_BN][256];
-    __shared__ unsigned Ssc[SI_MMA_BN][2], Smn[SI_MMA_BN][2];
+    __shared__ __align__(16) unsigned Ssc[SI_MMA_BN][2], Smn[SI_MMA_BN][2];
     __shared__ float2 Wdm[SI_MMA_BN];
-    __shared__ float Ad[MM][8], Asum[MM][8];
+    // (Ad, Asum) interleaved and indexed [group][row]: the fold-in reads the pair for eight
+    // consecutive rows at once, which as [row][8] floats was two 2-way-conflicted loads per pair.
+    __shared__ float2 AdS[8][MM];
 
     constexpr int NT = (MM + 15) / 16;   // 16-row mma tiles this width actually needs
     float facc[CG][NT][4];
@@ -2226,8 +2231,7 @@ void down_q4k_mma_rows_kernel(const unsigned char* __restrict__ down_q,
                     uint4 v; v.x = src[0]; v.y = src[1]; v.z = src[2]; v.w = src[3];
                     *reinterpret_cast<uint4*>(&As[r][si_mma_swz(16 * c, r)]) = v;
                     if ((c & 1) == 0) {
-                        const float2 ds = __half22float2(a->ds);
-                        Ad[r][c >> 1] = ds.x; Asum[r][c >> 1] = ds.y;
+                        AdS[c >> 1][r] = __half22float2(a->ds);
                     }
                 }
             }
@@ -2235,7 +2239,14 @@ void down_q4k_mma_rows_kernel(const unsigned char* __restrict__ down_q,
 
             const int lnA = warp * 8 + tig * 2;
             const float2 dmA = Wdm[lnA], dmB = Wdm[lnA + 1];
-            #pragma unroll 1
+            // This column pair's eight (sc, m) bytes per matrix, one 16-byte load each for the whole
+            // super-block rather than a byte load per group -- the same bytes si_*_scales8 stored.
+            const uint4 scw = *reinterpret_cast<const uint4*>(&Ssc[lnA][0]);
+            const uint4 mnw = *reinterpret_cast<const uint4*>(&Smn[lnA][0]);
+            // Unrolled: with g a constant the scale shifts fold away and every group's shared loads
+            // can issue ahead of the previous group's MMAs. Each accumulator still folds g = 0..7
+            // in order, so the result is unchanged.
+            #pragma unroll
             for (int g = 0; g < 8; g++) {
                 const int kk = g * 32;
                 // The (dm, sc, m) triple depends only on the output COLUMN and the scale group, and
@@ -2243,16 +2254,19 @@ void down_q4k_mma_rows_kernel(const unsigned char* __restrict__ down_q,
                 // accumulator elements is being folded. Fetching them per element cost five shared
                 // loads per output element per group; hoisting collapses that to a handful per group.
                 // Ablating this fold-in measured it at 111 us of the kernel's 169.
-                const float sA = dmA.x * (float)reinterpret_cast<const unsigned char*>(Ssc[lnA])[g],     mA = dmA.y * (float)reinterpret_cast<const unsigned char*>(Smn[lnA])[g];
-                const float sB = dmB.x * (float)reinterpret_cast<const unsigned char*>(Ssc[lnA + 1])[g], mB = dmB.y * (float)reinterpret_cast<const unsigned char*>(Smn[lnA + 1])[g];
+                const int sh = 8 * (g & 3);
+                const float sA = dmA.x * (float)(((g < 4 ? scw.x : scw.y) >> sh) & 0xFFu);
+                const float mA = dmA.y * (float)(((g < 4 ? mnw.x : mnw.y) >> sh) & 0xFFu);
+                const float sB = dmB.x * (float)(((g < 4 ? scw.z : scw.w) >> sh) & 0xFFu);
+                const float mB = dmB.y * (float)(((g < 4 ? mnw.z : mnw.w) >> sh) & 0xFFu);
                 float adv[NT][2], asv[NT][2];
                 #pragma unroll
                 for (int ii = 0; ii < NT; ii++)
                     #pragma unroll
                     for (int eh = 0; eh < 2; eh++) {
                         const int lmv = ii * 16 + grp + eh * 8;
-                        adv[ii][eh] = lmv < M ? Ad[lmv][g]   : 0.f;
-                        asv[ii][eh] = lmv < M ? Asum[lmv][g] : 0.f;
+                        const float2 v = lmv < M ? AdS[g][lmv] : make_float2(0.f, 0.f);
+                        adv[ii][eh] = v.x; asv[ii][eh] = v.y;
                     }
 
                 unsigned af[NT][4], bf[2];
@@ -2907,7 +2921,8 @@ void launch_moe_expert_ffn_q4k(
     const int* expert_ids, const float* expert_weights, void* output,
     float* h_scratch, float* out_scratch,
     int num_tokens, int top_k, int hidden, int ffn, const void* input_q8, cudaStream_t stream,
-    bool ar_exact_splitk, const void* gate_bf16, const void* up_bf16, float* gate_acc
+    bool ar_exact_splitk, const void* gate_bf16, const void* up_bf16, float* gate_acc,
+    int down_mma_min_rows
 ) {
     mg_sparse_ffn_init();
     // Qwythos dense hybrid fast path: pack2 gate/up without expert lookup + PDL-chained
@@ -3349,8 +3364,12 @@ void launch_moe_expert_ffn_q4k(
             // kernel, which pads M to the 16 rows of an m16n8k32 tile. Below eight there is no
             // traffic to win back and the padding is pure waste: four rows measured 5.9% slower
             // end to end, while eight is 5.2% faster and sixteen 23% faster.
-            static int down_mma_min = -1;
-            if (down_mma_min < 0) { const char* e = getenv("SPARKINFER_DOWN_MMA_MINROWS"); down_mma_min = e ? atoi(e) : 8; }
+            // A caller that has measured its own crossover passes down_mma_min_rows (the packed
+            // dense Q4_K step: 4); the env knob still wins.
+            static int down_mma_min_env = -2;
+            if (down_mma_min_env == -2) { const char* e = getenv("SPARKINFER_DOWN_MMA_MINROWS"); down_mma_min_env = e ? atoi(e) : -1; }
+            const int down_mma_min = down_mma_min_env >= 0 ? down_mma_min_env
+                                   : (down_mma_min_rows > 0 ? down_mma_min_rows : 8);
             if (down_mma && num_tokens >= down_mma_min && top_k == 1 &&
                 launch_down_q4k_mma_rows(pdl, reinterpret_cast<const unsigned char*>(down_q),
                                          expert_ids, expert_weights, hq8,

@@ -4032,6 +4032,18 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
         return false;
     }();
     float* gu_acc = gu_acc_needed ? a.alloc<float>((size_t)NA * ffn) : nullptr;
+    // Row floor for the other Q4_K tensor-core arms -- the down projection and the in-projections
+    // proj() sends to launch_mmvq_rows -- on those same stacks. Both default to eight, which is
+    // where they started paying on Muse Glimmer's 6656-wide shapes. On Ternary-Bonsai-2's 5120 /
+    // 17408 shapes they already win at four rows: cb-decode c4 258.8 -> 286.1 tok/s (+10.5%),
+    // with c2 and c8 unchanged. The gate/up arm is not included; at four rows it measured -3.7%.
+    // Muse and every other model keep the kernels' default. SPARKINFER_CB_DENSE_MMA_MINROWS=0
+    // restores it here too (A/B in one binary).
+    static const int cb_dense_mma_min = [] {
+        const char* e = getenv("SPARKINFER_CB_DENSE_MMA_MINROWS");
+        return e ? atoi(e) : 4;
+    }();
+    const int q4k_mma_min = gu_acc_needed ? cb_dense_mma_min : 0;
     // out_scratch is not just the [N, H] fp32 output: launch_moe_expert_ffn_q4k also reuses it as
     // the Q8_1 staging buffer for the SwiGLU hidden, which needs
     // num_tokens * top_k * llama_q8_1_bytes(ffn) bytes. That kernel's "<= hidden floats; fits"
@@ -4359,7 +4371,7 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
             return false;
         }
         quant_rows(in, k);
-        if (!kernels::launch_mmvq_rows(type, q81, w, out, N, no, k, st)) {
+        if (!kernels::launch_mmvq_rows(type, q81, w, out, N, no, k, st, q4k_mma_min)) {
             // Distinguishes "this weight TYPE is not implemented" (handled above, prints its own
             // message) from "the mmvq launcher refused THIS SHAPE" -- which is otherwise a silent
             // false and reads identically at the call site.
@@ -4474,7 +4486,7 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
         }
         if (type != 8 && type != 12 && type != 14) return false;
         if (q81_src != in || q81_k != k) { quant_rows(in, k); ps = st; }
-        return kernels::launch_mmvq_rows(type, q81, w, out, N, no, k, ps);
+        return kernels::launch_mmvq_rows(type, q81, w, out, N, no, k, ps, q4k_mma_min);
     };
     auto capture = [&](int layer) {
         if (!capture_dst || !capture_layers || n_capture <= 0) return;
@@ -5470,7 +5482,7 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
                                                    w.gate_qtype, w.up_qtype, w.down_qtype,
                                                    expert_ids, expert_w, routed, moe_h, moe_out,
                                                    N, topk, H, ffn, q81, st, false, nullptr,
-                                                   nullptr, gu_acc);
+                                                   nullptr, gu_acc, q4k_mma_min);
             }
             if (L == 0) vdbg_snapshot2(routed, 3);
             // Residual + next-layer norm, matching the MoE branch's tail.

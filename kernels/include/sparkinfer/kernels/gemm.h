@@ -203,8 +203,10 @@ bool launch_mmvq_q80_rows(const void* q81, const void* W, void* y,
 bool launch_gemv_rows2(const void* x, const void* W0, const void* W1, void* y0, void* y1,
                        int M, int N0, int N1, int K, cudaStream_t stream = nullptr);
 
+// mma_min_rows: the row count from which a Q4_K matrix takes the int8 tensor-core arm instead of
+// the chunked MMVQ. 0 keeps the default (8, or SPARKINFER_MMVQ_MMA_MINM when that is set).
 bool launch_mmvq_rows(int qtype, const void* q81, const void* W, void* y,
-                      int M, int N, int K, cudaStream_t stream = nullptr);
+                      int M, int N, int K, cudaStream_t stream = nullptr, int mma_min_rows = 0);
 // Two or four Q4_K matrices over one Q8_1 activation on the int8 tensor cores, in one launch: y[i]
 // gets [M, Ns[i]] from W[i], as launch_mmvq_rows's tensor-core arm computes a matrix. Every Ns[i]
 // must be a multiple of 32. False = nothing issued (batch too narrow, shape unsupported, or the arm
