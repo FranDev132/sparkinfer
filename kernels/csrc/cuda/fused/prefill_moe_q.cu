@@ -1248,7 +1248,7 @@ static int qm_block_slots() {
 }
 
 // Among the slice counts NOT LARGER than the one the block-target heuristic asked for, take the one
-// that leaves the fewest idle block slots in the final wave.
+// with the least wall time: whole waves times the super-blocks each block walks.
 //
 // Why this matters here: the grid is `splits * ntiles` blocks against `slots` of them, and at
 // Muse's prefill@128 those land badly. The q/gate/k/v group is 136 tiles, so 13 slices put 1768
@@ -1256,20 +1256,45 @@ static int qm_block_slots() {
 // slices give exactly 2.00. The o projection is 104 tiles: 8 slices = 2.45 waves, 6 slices = 1.84.
 // Only ever moving DOWN is deliberate: a larger slice count would also multiply the split-K atomic
 // traffic, and that is what made a plain "raise the block target" retune lose (swept 2560 -> 5600).
-// Ties break toward more slices, since shorter blocks balance the tail better.
+// Ties break toward fewer slices: at equal wall time, more slices only add partial traffic.
 // SPARKINFER_MUSE_QB_WAVE=0 restores the plain heuristic (A/B; bit-identical either way).
 static int qm_wave_pick(int ntiles, int nsb, int want) {
     static int on = -1;
     if (on < 0) { const char* e = getenv("SPARKINFER_MUSE_QB_WAVE"); on = (e && e[0] == '0') ? 0 : 1; }
     if (!on || ntiles <= 0 || want <= 1) return want;
     const double slots = (double)qm_block_slots();
-    int best = want; double best_eff = -1.0;
+    // Minimise what sets the wall time: waves x per-block work, ceil(s*ntiles/slots) * ceil(nsb/s),
+    // breaking ties toward fewer slices. The previous objective, wave efficiency w/ceil(w), is
+    // scale-invariant, so it ties: a 5120-wide output (80 tiles on 340 slots) scores 0.941 at
+    // s = 4, 8 and 12 alike, and its tiebreak took the largest -- the same occupancy for 3x the
+    // blocks, 3x the int32 partial traffic and 3x the reduce input. Split-K sums int32 partials,
+    // so the slice count cannot change the output. SPARKINFER_QB_WAVE_POLICY=0 restores the old
+    // objective (A/B).
+    static int legacy = -1;
+    if (legacy < 0) {
+        const char* e = getenv("SPARKINFER_QB_WAVE_POLICY");
+        legacy = (e && e[0] == '0') ? 1 : 0;
+    }
+    int best = want;
+    if (legacy) {
+        double best_eff = -1.0;
+        for (int sbp = 1; sbp <= nsb; sbp++) {
+            const int s = (nsb + sbp - 1) / sbp;
+            if (s > want) continue;
+            const double w = (double)s * (double)ntiles / slots;
+            const double eff = w / ceil(w);
+            if (eff > best_eff + 1e-9 || (eff > best_eff - 1e-9 && s > best)) { best_eff = eff; best = s; }
+        }
+        return best;
+    }
+    double best_cost = -1.0;
     for (int sbp = 1; sbp <= nsb; sbp++) {
         const int s = (nsb + sbp - 1) / sbp;
         if (s > want) continue;
-        const double w = (double)s * (double)ntiles / slots;
-        const double eff = w / ceil(w);
-        if (eff > best_eff + 1e-9 || (eff > best_eff - 1e-9 && s > best)) { best_eff = eff; best = s; }
+        const double cost = ceil((double)s * (double)ntiles / slots) * (double)((nsb + s - 1) / s);
+        if (best_cost < 0 || cost < best_cost - 1e-9 || (cost < best_cost + 1e-9 && s < best)) {
+            best_cost = cost; best = s;
+        }
     }
     return best;
 }
