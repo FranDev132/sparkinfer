@@ -93,7 +93,10 @@ void launch_moe_expert_ffn_q4k(
     // [num_tokens, ffn] fp32 scratch the caller owns. When supplied, a wide batch of a dense Q4_K
     // FFN runs gate/up on the int8 tensor cores and accumulates the gate here (the up projection
     // accumulates in h_scratch). nullptr keeps the MMVQ gate/up.
-    float* gate_acc = nullptr);
+    float* gate_acc = nullptr,
+    // Row count from which a Q4_K down projection takes the int8 tensor-core arm. 0 keeps the
+    // default (8, or SPARKINFER_DOWN_MMA_MINROWS when that is set).
+    int down_mma_min_rows = 0);
 
 // Qwen3.6 UD shared expert: Q8_0 gate/up/down via int8 dp4a MMVQ. Reuses the FNQ
 // Q8_1(hn) buffer for gate/up; overwrites h_q8_buf with Q8_1(h) for down.
