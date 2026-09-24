@@ -1903,8 +1903,37 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
             kernels::launch_prefill_quantize_rows_fp8(wb, W_i8, sw, lvdim, H, st);
             kernels::launch_prefill_gemm_fp8(A_i8, W_i8, sx, sw, lz, N, lvdim, H, st);
         } else {
-            proj(A, w.wqkv,      w.wqkv_type,      b8, lqkv,  H);   // qkv
-            proj(A, w.wqkv_gate, w.wqkv_gate_type, lz, lvdim, H);   // z gate
+            // Fused quantized-B when the row scales exist (proj_fused falls back to proj when they
+            // do not), so a GDN layer stops materializing an int8 copy of wqkv/wqkv_gate -- on a
+            // 27B hybrid that is 10240+6144 rows of H per layer, on 48 of 64 layers.
+            //
+            // Both read the same activation, which is what the grouped launch wants: one kernel
+            // covering both output widths, so the pair costs one launch and one tail wave instead
+            // of two. The ffn gate/up pair and the attention q/k/v triple already group; this was
+            // the last co-located pair on the dense path.
+            // SPARKINFER_PREFILL_QB_GDN_GROUP=0 keeps it as two launches (A/B).
+            static const bool gdn_group_on = [] {
+                const char* e = getenv("SPARKINFER_PREFILL_QB_GDN_GROUP");
+                return !(e && e[0] == '0');
+            }();
+            bool gdn_grouped = false;
+            if (gdn_group_on && use_i8 && w.wqkv_rs && w.wqkv_gate_rs &&
+                w.wqkv_gate_type == w.wqkv_type &&
+                kernels::pf_dense_gemm_qi8_supported(w.wqkv_type)) {
+                const void*  Wg[2]  = { w.wqkv, w.wqkv_gate };
+                const float* rsg[2] = { w.wqkv_rs, w.wqkv_gate_rs };
+                void*        Cg[2]  = { b8, lz };
+                const int    ng[2]  = { lqkv, lvdim };
+                quant_a_i8(A, N, H);
+                gdn_grouped = kernels::launch_prefill_gemm_qi8_dense_group(
+                    w.wqkv_type, A_i8, sx, Wg, rsg, Cg, ng, 2, N, H, st,
+                    qb_partials, QB_SPLITS, qb_partials_cap,
+                    nullptr, nullptr, nullptr, apk());
+            }
+            if (!gdn_grouped) {
+                proj_fused(A, w.wqkv,      w.wqkv_type,      w.wqkv_rs,      b8, lqkv,  H);   // qkv
+                proj_fused(A, w.wqkv_gate, w.wqkv_gate_type, w.wqkv_gate_rs, lz, lvdim, H);   // z gate
+            }
         }
     };
 
@@ -2042,8 +2071,16 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                 }
             }
             if (!out_fp4) {
-                attn_fused = proj_resid(lnrm, w.ssm_out, w.ssm_out_type, x, H, lvdim);
-                if (!attn_fused) proj(lnrm, w.ssm_out, w.ssm_out_type, ao, H, lvdim);
+                // Same trade the o-projection already makes: with row scales, give up
+                // proj_resid's fused residual add (that path materializes W_i8 to get it) for the
+                // fused weight decode. The residual is added downstream when attn_fused is false.
+                if (w.ssm_out_rs) {
+                    proj_fused(lnrm, w.ssm_out, w.ssm_out_type, w.ssm_out_rs, ao, H, lvdim);
+                    attn_fused = false;
+                } else {
+                    attn_fused = proj_resid(lnrm, w.ssm_out, w.ssm_out_type, x, H, lvdim);
+                    if (!attn_fused) proj(lnrm, w.ssm_out, w.ssm_out_type, ao, H, lvdim);
+                }
             }
             use_i8 = restore_i8_gdn;
         } else {

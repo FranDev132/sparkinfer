@@ -6823,9 +6823,17 @@ bool Qwen35Model::load_gguf(const std::string& path) {
     // `scale`), so the fused GEMM's int8 bytes match the materialize path's by construction, not by
     // re-deriving the scale. Q6_K down (and any non-Q4/Q5 attn weight) is left null -> stays on the
     // materialize path. ~11 MB for Muse-30B. SPARKINFER_MUSE_PREFILL_QB=0 skips the precompute.
-    if (c.muse_glimmer) {
+    // Nothing in the fused GEMM is Muse-specific; only this gate was. Every other dense GGUF
+    // checkpoint left *_rs null, so proj_fused fell back to proj and each projection materialized
+    // a full int8 copy of the weight -- written to DRAM and read straight back at exactly the rate
+    // the fused arm exists to avoid. SPARKINFER_PREFILL_QB_DENSE=0 restores that.
+    const bool qb_dense = c.dense_ffn && !c.muse_glimmer && [] {
+        const char* e = getenv("SPARKINFER_PREFILL_QB_DENSE");
+        return !(e && e[0] == '0');
+    }();
+    if (c.muse_glimmer || qb_dense) {
         const char* qb_env = getenv("SPARKINFER_MUSE_PREFILL_QB");
-        if (!qb_env || qb_env[0] != '0') {
+        if (qb_dense || !qb_env || qb_env[0] != '0') {
             // Q6_K too: the dense fused GEMM decodes it now, so a Q6_K attn_v / ffn_down gets its
             // row scales here instead of falling back to the per-layer materialize.
             auto fusable = [](int t) { return t == 12 || t == 13 || t == 14; };  // Q4_K / Q5_K / Q6_K
@@ -6836,7 +6844,25 @@ bool Qwen35Model::load_gguf(const std::string& path) {
             // fell back to the materialize path regardless of being a fusable type. Slots are
             // reserved for all eight; a slot stays unfilled (and its *_rs null) when that
             // weight's type is not fusable, so a Q6_K down still takes the materialize path.
-            const size_t per_layer = (size_t)(2 * qd + 2 * kd + H + 2 * ff + H);  // rows/layer
+            // A hybrid checkpoint concatenates q and gate into one 2*qd-row attn_q, and its GDN
+            // layers carry wqkv/wqkv_gate/ssm_out instead of q/k/v/o entirely.
+            const int q_out = c.hybrid ? 2 * qd : qd;
+            const int lqd   = c.linear_q_heads * c.linear_head_dim;
+            const int lvd   = c.linear_v_heads * c.linear_head_dim;
+            const int lqkv  = 2 * lqd + lvd;
+            // A layer is either full-attention or GDN, never both, so the two families share one
+            // region sized by the larger. SPARKINFER_PREFILL_QB_ATTN=0 reserves neither.
+            const bool qb_attn = qb_dense && [] {
+                const char* e = getenv("SPARKINFER_PREFILL_QB_ATTN");
+                return !(e && e[0] == '0');
+            }();
+            const size_t att_rows = (size_t)q_out + 2 * (size_t)kd + (size_t)H;
+            const size_t gdn_rows = (size_t)lqkv + (size_t)lvd + (size_t)H;
+            const size_t mix = !qb_attn ? 0 : (att_rows > gdn_rows ? att_rows : gdn_rows);
+            // Muse fills all eight slots; the dense arm fills only the three FFN ones plus
+            // whichever attention family the layer actually has, so it reserves only those.
+            const size_t per_layer = qb_dense ? (size_t)(2 * ff + H) + mix
+                                              : (size_t)(2 * qd + 2 * kd + H + 2 * ff + H);  // rows/layer
             const size_t total = per_layer * (size_t)c.n_layers;
             const size_t tmp_bytes = 64u << 20;                        // int8 scratch, thrown away
             signed char* tmp = nullptr;
@@ -6864,11 +6890,13 @@ bool Qwen35Model::load_gguf(const std::string& path) {
                     float* dst = base + off; off += (size_t)rows;
                     if (ok && W && fusable(wt) && fill(wt, W, dst, (size_t)rows, cols)) *rs = dst;
                 };
-                place(lw.wq,     lw.wq_type,     &lw.wq_rs,    qd, H);
-                place(lw.wgate,  lw.wgate_type,  &lw.wgate_rs, qd, H);
-                place(lw.wk,     lw.wk_type,     &lw.wk_rs,    kd, H);
-                place(lw.wv,     lw.wv_type,     &lw.wv_rs,    kd, H);
-                place(lw.wo,     lw.wo_type,     &lw.wo_rs,    H,  qd);
+                if (!qb_dense) {
+                    place(lw.wq,     lw.wq_type,     &lw.wq_rs,    qd, H);
+                    place(lw.wgate,  lw.wgate_type,  &lw.wgate_rs, qd, H);
+                    place(lw.wk,     lw.wk_type,     &lw.wk_rs,    kd, H);
+                    place(lw.wv,     lw.wv_type,     &lw.wv_rs,    kd, H);
+                    place(lw.wo,     lw.wo_type,     &lw.wo_rs,    H,  qd);
+                }
                 place(lw.prefill_gate_q ? lw.prefill_gate_q : lw.gate_q,
                       lw.prefill_gate_q ? lw.prefill_gate_qtype : lw.gate_qtype,
                       &lw.gate_rs, ff, H);
@@ -6876,6 +6904,25 @@ bool Qwen35Model::load_gguf(const std::string& path) {
                       lw.prefill_up_q ? lw.prefill_up_qtype : lw.up_qtype,
                       &lw.up_rs, ff, H);
                 place(lw.down_q, lw.down_qtype,  &lw.down_rs,  H,  ff);
+                // Attention, for the dense arm. Exactly one of the two families exists on a given
+                // layer, so both are placed at the same base and the cursor advances once, by the
+                // larger. Keyed on which weight is actually present rather than on a layer index,
+                // so a checkpoint whose attention interval differs from what its config says
+                // cannot silently hand a GDN scale to a full-attention GEMM.
+                if (qb_attn) {
+                    const size_t mix_base = off;
+                    if (lw.wq) {
+                        place(lw.wq, lw.wq_type, &lw.wq_rs, q_out, H);
+                        place(lw.wk, lw.wk_type, &lw.wk_rs, kd,    H);
+                        place(lw.wv, lw.wv_type, &lw.wv_rs, kd,    H);
+                        place(lw.wo, lw.wo_type, &lw.wo_rs, H,     qd);
+                    } else if (lw.wqkv) {
+                        place(lw.wqkv,      lw.wqkv_type,      &lw.wqkv_rs,      lqkv, H);
+                        place(lw.wqkv_gate, lw.wqkv_gate_type, &lw.wqkv_gate_rs, lvd,  H);
+                        place(lw.ssm_out,   lw.ssm_out_type,   &lw.ssm_out_rs,   H,    lvd);
+                    }
+                    off = mix_base + mix;
+                }
             }
             if (ok) ok = cudaStreamSynchronize(s.stream) == cudaSuccess;
             if (tmp) cudaFree(tmp);
@@ -6885,6 +6932,7 @@ bool Qwen35Model::load_gguf(const std::string& path) {
                     Qwen35LayerWeights& lw = s.w.layers[i];
                     lw.wq_rs = lw.wgate_rs = lw.wk_rs = lw.wv_rs = lw.wo_rs = lw.gate_rs = lw.up_rs = nullptr;
                     lw.down_rs = nullptr;
+                    lw.wqkv_rs = lw.wqkv_gate_rs = lw.ssm_out_rs = nullptr;
                 }
                 fprintf(stderr, "[prefill-muse] dense row-scale precompute unavailable "
                                 "-> int8 materialize path\n");

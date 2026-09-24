@@ -174,6 +174,11 @@ struct Qwen35LayerWeights {
     // Q4_K, i.e. fusable, and were falling back to the int8 materialize only because the scale
     // pool had no slot for them. Null when this layer's down really is unfusable (Q6_K).
     const float* down_rs = nullptr;
+    // GDN-layer row scales, the same role wq_rs/wk_rs/... play on a full-attention layer. A hybrid
+    // stack projects through wqkv/wqkv_gate/ssm_out on its linear-attention layers, and those had
+    // no fused-B arm at all -- ~23% of a 27B hybrid's non-embedding parameters.
+    const float* wqkv_rs = nullptr; const float* wqkv_gate_rs = nullptr;
+    const float* ssm_out_rs = nullptr;
 };
 
 struct Qwen35Weights {
