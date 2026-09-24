@@ -38,6 +38,9 @@ bool pfm_moe_gemm_qi8_supported(int ggml_type);
 
 // Dense fused-decode GEMM only: Q4_K / Q5_K / Q6_K (the routed predicate above stays Q4_K/Q5_K).
 bool pf_dense_gemm_qi8_supported(int ggml_type);
+// Largest M the fused quantized-B GEMM accepts (SPARKINFER_PREFILL_QB_MAX_M, default 512). Past it
+// the launcher declines, so a caller that would give up a better path to try it can check first.
+int pf_dense_gemm_qi8_max_m();
 
 // Dense (non-routed) fused-decode int8 GEMM: C[M,N] = A_i8[M,K] @ dequant(W_q[N,K])^T, reading the
 // weight in native Q4_K/Q5_K and decoding it to int8 inside the B-stage using a per-output-row

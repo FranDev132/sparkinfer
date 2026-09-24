@@ -1855,6 +1855,13 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
     // the two independent proj() calls. Default on with either fp8 projection path (dense >96k GDN
     // or MoE); SPARKINFER_PREFILL_FP8_GDN_SHAREQ=0 restores the per-projection quantize (A/B).
     const char* _pshareq = getenv("SPARKINFER_PREFILL_FP8_GDN_SHAREQ");
+    // Whether the fused quantized-B GEMM can run at this pass's M at all. Past its limit the
+    // launcher declines and the caller falls back to materializing -- after having already given
+    // up the residual-fused int8 GEMM to try it. Only the dense-GGUF population whose row scales
+    // qwen35.cpp places under SPARKINFER_PREFILL_QB_DENSE is re-routed on this; Muse and the
+    // compressed-tensors checkpoints keep exactly the path they had.
+    const bool qb_dense_pass = s.gguf && !c.muse_glimmer && !moe;
+    const bool qb_fires = N <= kernels::pf_dense_gemm_qi8_max_m();
     const bool fp8_shareq = (use_fp8_gdn || moe_fp8) && (!_pshareq || _pshareq[0] != '0');
     auto gdn_qkv_z = [&](const bf16* A, const Qwen35LayerWeights& w, bool norm_deferred) {
         // Checkpoint-native NVFP4: quantize xn to FP4 ONCE (both projections read it) and run two
@@ -2071,10 +2078,11 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                 }
             }
             if (!out_fp4) {
-                // Same trade the o-projection already makes: with row scales, give up
-                // proj_resid's fused residual add (that path materializes W_i8 to get it) for the
-                // fused weight decode. The residual is added downstream when attn_fused is false.
-                if (w.ssm_out_rs) {
+                // Same trade the o-projection makes: with row scales, give up proj_resid's fused
+                // residual add (that path materializes W_i8 to get it) for the fused weight decode.
+                // Only where the fused GEMM accepts this M -- past it, it would decline and the
+                // residual add would have been given up for nothing.
+                if (w.ssm_out_rs && qb_fires) {
                     proj_fused(lnrm, w.ssm_out, w.ssm_out_type, w.ssm_out_rs, ao, H, lvdim);
                     attn_fused = false;
                 } else {
@@ -2433,7 +2441,7 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                 if (!wo_fp4_done)
                     proj_fused_acc(att, w.wo, w.wo_type, w.wo_rs, ao, H, qdim, &attn_acc);
                 attn_fused = false;
-            } else if (w.wo_rs) {
+            } else if (w.wo_rs && (qb_fires || !qb_dense_pass)) {
                 proj_fused(att, w.wo, w.wo_type, w.wo_rs, ao, H, qdim);
                 attn_fused = false;
             } else {
@@ -2550,7 +2558,10 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                     kernels::launch_prefill_quantize_rows_i8(wb, dst, scale, n_out, K, st);
                 }
             };
+            // Only where a full chunk fits the fused GEMM's M limit: past it every chunk declines
+            // and re-materializes, and the down projection loses its fused residual add.
             const bool ffn_qi8 = use_i8 && ffn_i8_stage && w.gate_rs && w.up_rs &&
+                (!qb_dense_pass || FC <= kernels::pf_dense_gemm_qi8_max_m()) &&
                 kernels::pf_dense_gemm_qi8_supported(gate_pf_type);
             if (ffn_i8 && !ffn_qi8) {
                 dequant_w_i8(gate_pf_type, gate_pf, ffn_Wg_i8, ffn_swg, ffn, H);

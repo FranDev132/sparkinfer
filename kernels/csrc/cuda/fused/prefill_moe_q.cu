@@ -1156,6 +1156,7 @@ static int qb_max_m() {
     }();
     return v;
 }
+int pf_dense_gemm_qi8_max_m() { return qb_max_m(); }
 
 bool launch_pfm_moe_gemm_qi8(int ggml_type, const signed char* A_i8, const float* sx,
                              const void* W_q, const float* row_scale,
