@@ -548,6 +548,9 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
     static const void* g_pfb_lin_key = nullptr;
     static const void* g_pfb_conv_key = nullptr;
     static const void* g_pfb_btable_key = nullptr;
+    // The ternary legs the pass reads while the decode shadow holds them; a released shadow
+    // frees them, so a graph that recorded them must not replay.
+    static const void* g_pfb_tleg_key = nullptr;
     static uint64_t g_pfb_arena_gen[4] = {0, 0, 0, 0};   // keep_a, keep_a8, keep_am, keep_aw
     static uint64_t g_pfb_scratch_epoch = 0;
     // DEFAULT ON: measured +5.91% on Muse prefill@128, byte-identical output (SCORE_EQ IDENTICAL,
@@ -583,7 +586,8 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
     const bool graph_keys_match = g_pfb_model_key == s.w.lm_head &&
                                   g_pfb_lin_key == s.lin_state &&
                                   g_pfb_conv_key == s.lin_conv_state &&
-                                  g_pfb_btable_key == pfb_btable;
+                                  g_pfb_btable_key == pfb_btable &&
+                                  g_pfb_tleg_key == (const void*)s.bonsai_pf_layers;
     // The graph also embeds the scratch it was captured with: the four kept arenas and the
     // kernel-level workspaces (scratch_epoch.h). A pass that never captures -- a prefix-cache
     // resume (pos0 > 0), a DSpark prefill that captures hidden states, an early return that
@@ -1944,6 +1948,19 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
         }
         proj(A, W, wtype, C, n_out, K, rows);
     };
+    // proj_fused with the residual add folded into its split-K reduce: X += A @ W^T with
+    // launch_prefill_add's rounding, and no scratch output to write and read back. Returns false,
+    // launching nothing, where the fused GEMM would not split; the caller then runs proj_fused into
+    // scratch plus the separate add, as before.
+    auto proj_fused_resid = [&](const bf16* A, const void* W, int wtype, const float* rs,
+                                bf16* X, int n_out, int K) -> bool {
+        if (!use_i8 || !rs || n_out < 128 || !qb_partials || !a_i8_fits(N, K) ||
+            !kernels::pf_dense_gemm_qi8_supported(wtype))
+            return false;
+        quant_a_i8(A, N, K);
+        return kernels::launch_prefill_gemm_qi8_dense_resid(wtype, A_i8, sx, W, rs, X, N, n_out, K,
+                                                            st, qb_partials, QB_SPLITS, apk());
+    };
 
     // GDN wqkv + wqkv_gate both project the same input xn, so on the fp8 path quantize xn to e4m3
     // ONCE and share it across both GEMMs (proj() would otherwise re-quantize xn per projection --
@@ -1959,7 +1976,55 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
     const bool qb_dense_pass = s.gguf && !c.muse_glimmer && !moe;
     const bool qb_fires = N <= kernels::pf_dense_gemm_qi8_max_m();
     const bool fp8_shareq = (use_fp8_gdn || moe_fp8) && (!_pshareq || _pshareq[0] != '0');
-    auto gdn_qkv_z = [&](const bf16* A, const Qwen35LayerWeights& w, bool norm_deferred) {
+    // The decode shadow's ternary legs (attention q/k/v and o, GDN ssm_out), read through the
+    // fused GEMM's PTQ1 arm where the pass fits it: the input rotated into the blocks' basis as it
+    // is row-quantized (launch_ptq1_rotq_rows_i8, as the ternary gate/up take hn), then the stored
+    // blocks at 0.21875 bytes/weight. Prefill then does the arithmetic decode does, where the
+    // folded Q4_K it replaces is a refit of those blocks. SPARKINFER_PREFILL_TERNARY_PROJ: bit 1
+    // q/k/v, 2 o, 4 ssm_out, 8 the GDN in-projections, 16 the seed token's LM head (default 31;
+    // 0 keeps them all folded, for an A/B).
+    static const int tproj_mask = [] {
+        const char* e = getenv("SPARKINFER_PREFILL_TERNARY_PROJ");
+        return e ? atoi(e) : 31;
+    }();
+    // Rotate+quantize A (N x K) into A_i8/sx and the k-tiled copy; false, launching nothing, where
+    // the fused GEMM would not take it. The split-K partials exist only up to 128 rows; past that
+    // the legs run unsplit, which is what the fused GEMM does there anyway.
+    auto trotq = [&](const bf16* A, const void* sign, int K) -> bool {
+        if (!use_i8 || !sign || !qb_dense_pass || !qb_fires || !a_i8_fits(N, K) ||
+            s.bonsai_block != 1024 || (K % 1024))
+            return false;
+        signed char* const qp = apk_dst(N, K);
+        if (!kernels::launch_ptq1_rotq_rows_i8(A, static_cast<const signed char*>(sign), A_i8, sx,
+                                               qp, N, K, s.bonsai_block, st))
+            return false;
+        a_pk = qp != nullptr;
+        a_q = nullptr;   // A_i8 now holds the ROTATED activation: no memo may reuse it
+        return true;
+    };
+    // A ternary leg with the residual folded into its split-K reduce (1), or where the GEMM does
+    // not split, into C for the caller's add (2). 0: nothing written, the caller runs the folded
+    // leg (its quantize redoes A_i8, the memo having been cleared).
+    auto tproj_resid = [&](const bf16* A, const void* sign, const void* W, const float* rs,
+                           bf16* X, bf16* C, int n_out, int K) -> int {
+        if (!W || !rs || !trotq(A, sign, K)) return 0;
+        if (kernels::launch_prefill_gemm_qi8_dense_resid(kPtq1GgmlType, A_i8, sx, W, rs, X, N,
+                                                         n_out, K, st, qb_partials, QB_SPLITS,
+                                                         apk()))
+            return 1;
+        if (kernels::launch_prefill_gemm_qi8_dense(kPtq1GgmlType, A_i8, sx, W, rs, C, N, n_out, K,
+                                                   st, qb_partials, QB_SPLITS, nullptr, apk()))
+            return 2;
+        return 0;
+    };
+    // z_pending (optional): on the fused quantized-B path, launch only qkv (on st) and leave the z
+    // projection to the caller, which runs it on a side stream -- see the GDN block below.
+    // gt/grs (optional): the layer's decode-shadow view, whose in-projections are read in their
+    // ternary blocks where the fused GEMM takes the pass; *z_tern then says z must be too, since
+    // A_i8 holds the rotated activation.
+    auto gdn_qkv_z = [&](const bf16* A, const Qwen35LayerWeights& w, bool norm_deferred,
+                         bool* z_pending = nullptr, const Qwen35LayerWeights* gt = nullptr,
+                         const BonsaiShadowRs* grs = nullptr, bool* z_tern = nullptr) {
         // Checkpoint-native NVFP4: quantize xn to FP4 ONCE (both projections read it) and run two
         // block-scaled GEMMs straight off the packed nibbles. A_i8/sx are not touched, so the int8
         // activation memo stays valid for whatever runs next in the layer.
@@ -2020,6 +2085,42 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                 return !(e && e[0] == '0');
             }();
             bool gdn_grouped = false;
+            if (gt && grs && grs->wqkv && grs->wqkv_gate && (tproj_mask & 8) && !norm_deferred &&
+                gt->wqkv_type == kPtq1GgmlType && gt->wqkv_gate_type == kPtq1GgmlType &&
+                trotq(A, s.bonsai_sign_hidden, H)) {
+                if (z_pending) {
+                    if (kernels::launch_prefill_gemm_qi8_dense(kPtq1GgmlType, A_i8, sx, gt->wqkv,
+                                                               grs->wqkv, b8, N, lqkv, H, st,
+                                                               nullptr, 0, nullptr, apk())) {
+                        *z_pending = true;
+                        if (z_tern) *z_tern = true;
+                        return;
+                    }
+                } else {
+                    const void*  Wt[2]  = { gt->wqkv, gt->wqkv_gate };
+                    const float* rst[2] = { grs->wqkv, grs->wqkv_gate };
+                    void*        Ct[2]  = { b8, lz };
+                    const int    nt[2]  = { lqkv, lvdim };
+                    if (kernels::launch_prefill_gemm_qi8_dense_group(
+                            kPtq1GgmlType, A_i8, sx, Wt, rst, Ct, nt, 2, N, H, st,
+                            qb_partials, QB_SPLITS, qb_partials_cap,
+                            nullptr, nullptr, nullptr, apk()))
+                        return;
+                }
+                // Declined: the folded arms below redo A_i8 (trotq cleared the memo).
+            }
+            if (z_pending && use_i8 && w.wqkv_rs && w.wqkv_gate_rs &&
+                w.wqkv_gate_type == w.wqkv_type &&
+                kernels::pf_dense_gemm_qi8_supported(w.wqkv_type)) {
+                quant_a_i8(A, N, H);
+                // Unsplit: split-K would need qb_partials, which the z GEMM holds on the side stream.
+                if (kernels::launch_prefill_gemm_qi8_dense(w.wqkv_type, A_i8, sx, w.wqkv, w.wqkv_rs,
+                                                           b8, N, lqkv, H, st, nullptr, 0, nullptr,
+                                                           apk())) {
+                    *z_pending = true;
+                    return;
+                }
+            }
             if (gdn_group_on && use_i8 && w.wqkv_rs && w.wqkv_gate_rs &&
                 w.wqkv_gate_type == w.wqkv_type &&
                 kernels::pf_dense_gemm_qi8_supported(w.wqkv_type)) {
@@ -2100,6 +2201,10 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
         // a full-causal layer takes the full table. Identity on an uncapped pool.
         const int* ltab = w.swa ? btable_win : btable;
         a_q = nullptr; a_pk = false;                   // xn/hn are refreshed in place each layer
+        // This layer in the decode shadow, with its legs' row scales, or null (see tproj_resid).
+        const Qwen35LayerWeights* tl =
+            s.bonsai_pf_layers && s.bonsai_pf_rs ? &s.bonsai_pf_layers[L] : nullptr;
+        const BonsaiShadowRs* trs = tl ? &s.bonsai_pf_rs[L] : nullptr;
         bool attn_fused = false;                       // post-attn residual folded into the proj?
         // Set when the o / ffn_down split-K accumulator was left un-reduced for the sandwich
         // norm to consume directly. Per layer: qb_partials is reused by the next GEMM.
@@ -2110,9 +2215,74 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
             // Short-ctx dense: hold GDN on bf16 unless SPARKINFER_PREFILL_I8_GDN=1.
             const bool restore_i8_gdn = use_i8;
             if (use_i8 && !use_i8_gdn) use_i8 = false;
-            gdn_qkv_z(xn, w, attn_norm_deferred);                    // qkv + z gate (fp8: fused)
-            proj(xn, w.ssm_alpha, w.ssm_alpha_type, la, vh,    H);
-            proj(xn, w.ssm_beta,  w.ssm_beta_type,  lb, vh,    H);
+            // The layer's chain is serial: qkv -> conv -> prep -> scan -> gated norm. Two of its
+            // inputs are not on it. alpha/beta read only xn, and z is read only by the gated norm.
+            // So, on the fused quantized-B path, they run on the side stream: alpha/beta alongside
+            // the qkv GEMM (which leaves most block slots free unsplit), z once qkv is done --
+            // alongside conv, prep and scan, which are latency-bound and leave the device idle.
+            // The same kernels on the same inputs, so every output is unchanged.
+            // SPARKINFER_PREFILL_GDN_OVERLAP=0 keeps the single-stream order (A/B).
+            // z moves too only past 128 rows. At 128 the qkv GEMM alone is short, z's blocks crowd
+            // the scan (register-resident, two blocks per SM), and splitting the grouped launch
+            // costs more than the overlap returns. Measured prefill pp, single-stream -> alpha/beta
+            // only -> alpha/beta and z: 128: +2.2% / -2.0%; 256: +1.5% / +3.2%; 512: +0.7% / +2.0%.
+            // SPARKINFER_PREFILL_GDN_OVERLAP: 0 = single stream, 1 = alpha/beta only, 2 = both.
+            static const int gdn_overlap_env_mode = [] {
+                const char* e = getenv("SPARKINFER_PREFILL_GDN_OVERLAP");
+                return e ? atoi(e) : -1;
+            }();
+            const int gdn_overlap_mode =
+                gdn_overlap_env_mode >= 0 ? gdn_overlap_env_mode : (N > 128 ? 2 : 1);
+            const bool gdn_overlap_env = gdn_overlap_mode > 0;
+            static cudaEvent_t gdn_ev[4] = {};                 // fork, alpha/beta, qkv, z
+            const bool gdn_ov = gdn_overlap_env && s.stream_k && s.stream_k != st && !moe &&
+                qb_dense_pass && qb_fires && use_i8 && !attn_norm_deferred &&
+                w.ssm_alpha_type == 0 && w.ssm_beta_type == 0 && w.wqkv_rs && w.wqkv_gate_rs &&
+                w.wqkv_gate_type == w.wqkv_type &&
+                kernels::pf_dense_gemm_qi8_supported(w.wqkv_type) && a_i8_fits(N, H) &&
+                [&] {
+                    for (auto& e : gdn_ev)
+                        if (!e && cudaEventCreateWithFlags(&e, cudaEventDisableTiming) != cudaSuccess)
+                            return false;
+                    return true;
+                }();
+            bool z_pending = false;    // z is running on the side stream; join before the gated norm
+            if (gdn_ov) {
+                cudaStream_t sk = s.stream_k;
+                const bool ab_mma = !moe && (N > bf16_minctx || dense_bf16_mma);
+                pf_cu(cudaEventRecord(gdn_ev[0], st), "gdn fork");
+                pf_cu(cudaStreamWaitEvent(sk, gdn_ev[0], 0), "gdn fork wait");
+                kernels::launch_prefill_gemm(xn, w.ssm_alpha, la, N, vh, H, sk, ab_mma);
+                kernels::launch_prefill_gemm(xn, w.ssm_beta,  lb, N, vh, H, sk, ab_mma);
+                pf_cu(cudaEventRecord(gdn_ev[1], sk), "gdn alpha/beta done");
+                bool z_tern = false;
+                gdn_qkv_z(xn, w, attn_norm_deferred, gdn_overlap_mode >= 2 ? &z_pending : nullptr,
+                          tl, trs, &z_tern);
+                bool z_on_st = false;
+                if (z_pending) {
+                    // After qkv: z reads the same A_i8, and takes qb_partials past qkv's width.
+                    pf_cu(cudaEventRecord(gdn_ev[2], st), "gdn qkv done");
+                    pf_cu(cudaStreamWaitEvent(sk, gdn_ev[2], 0), "gdn qkv wait");
+                    if (kernels::launch_prefill_gemm_qi8_dense(
+                            z_tern ? kPtq1GgmlType : w.wqkv_gate_type, A_i8, sx,
+                            z_tern ? tl->wqkv_gate : w.wqkv_gate,
+                            z_tern ? trs->wqkv_gate : w.wqkv_gate_rs, lz, N, lvdim, H,
+                            sk, qb_partials ? qb_partials + (size_t)N * lqkv : nullptr, QB_SPLITS,
+                            nullptr, apk())) {
+                        pf_cu(cudaEventRecord(gdn_ev[3], sk), "gdn z done");
+                    } else {
+                        z_pending = false;   // nothing launched: z runs on st instead
+                        z_on_st = true;
+                    }
+                }
+                pf_cu(cudaStreamWaitEvent(st, gdn_ev[1], 0), "gdn alpha/beta join");
+                if (z_on_st)
+                    proj_fused(xn, w.wqkv_gate, w.wqkv_gate_type, w.wqkv_gate_rs, lz, lvdim, H);
+            } else {
+                gdn_qkv_z(xn, w, attn_norm_deferred, nullptr, tl, trs);   // qkv + z gate (fp8: fused)
+                proj(xn, w.ssm_alpha, w.ssm_alpha_type, la, vh,    H);
+                proj(xn, w.ssm_beta,  w.ssm_beta_type,  lb, vh,    H);
+            }
             if (multi) {
                 // Each prompt's conv window and recurrence are its own: run both on its slice of the
                 // rows against its session's state -- the same two calls a lone prompt of that
@@ -2148,6 +2318,7 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                     layer_state, att, N, c.linear_q_heads, vh, c.linear_head_dim,
                     c.gdn_qh_block, st, /*carry_in=*/pos0 != 0);
             }
+            if (z_pending) pf_cu(cudaStreamWaitEvent(st, gdn_ev[3], 0), "gdn z join");
             kernels::launch_prefill_gated_norm(att, lz, w.ssm_norm, lnrm, N, vh, c.linear_head_dim, eps, st);
             // out_proj off the same NVFP4 bytes, with the residual folded into the block-scaled
             // GEMM's own epilogue (D = A*B + C, C aliasing D aliasing x) instead of written raw
@@ -2173,14 +2344,23 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                     out_fp4 = true;
                 }
             }
+            if (!out_fp4 && tl && (tproj_mask & 4) && lvdim == qdim &&
+                tl->ssm_out_type == kPtq1GgmlType) {
+                const int r = tproj_resid(lnrm, s.bonsai_sign_out, tl->ssm_out, trs->ssm_out, x,
+                                          ao, H, lvdim);
+                out_fp4 = r != 0;
+                attn_fused = r == 1;
+            }
             if (!out_fp4) {
                 // Same trade the o-projection makes: with row scales, give up proj_resid's fused
                 // residual add (that path materializes W_i8 to get it) for the fused weight decode.
                 // Only where the fused GEMM accepts this M -- past it, it would decline and the
                 // residual add would have been given up for nothing.
                 if (w.ssm_out_rs && qb_fires) {
-                    proj_fused(lnrm, w.ssm_out, w.ssm_out_type, w.ssm_out_rs, ao, H, lvdim);
-                    attn_fused = false;
+                    attn_fused = !c.muse_glimmer &&
+                        proj_fused_resid(lnrm, w.ssm_out, w.ssm_out_type, w.ssm_out_rs, x, H, lvdim);
+                    if (!attn_fused)
+                        proj_fused(lnrm, w.ssm_out, w.ssm_out_type, w.ssm_out_rs, ao, H, lvdim);
                 } else {
                     attn_fused = proj_resid(lnrm, w.ssm_out, w.ssm_out_type, x, H, lvdim);
                     if (!attn_fused) proj(lnrm, w.ssm_out, w.ssm_out_type, ao, H, lvdim);
@@ -2319,7 +2499,20 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                                                        w.wv_fp4_alpha))
                     qkv_fp4 = true;
                 bool grouped = qkv_fp4;
-                if (!qkv_fp4 && use_i8 && w.wq_rs && w.wk_rs && w.wv_rs &&
+                if (!grouped && tl && (tproj_mask & 1) && !attn_norm_deferred && trs->wq &&
+                    trs->wk && trs->wv && tl->wq_type == kPtq1GgmlType &&
+                    tl->wk_type == kPtq1GgmlType && tl->wv_type == kPtq1GgmlType &&
+                    trotq(xn, s.bonsai_sign_hidden, H)) {
+                    const void*  Wa[3]  = { tl->wq, tl->wk, tl->wv };
+                    const float* rsa[3] = { trs->wq, trs->wk, trs->wv };
+                    void*        Ca[3]  = { b8, kf, vf };
+                    const int    na[3]  = { wide, kvdim, kvdim };
+                    grouped = kernels::launch_prefill_gemm_qi8_dense_group(
+                        kPtq1GgmlType, A_i8, sx, Wa, rsa, Ca, na, 3, N, H, st,
+                        qb_partials, QB_SPLITS, qb_partials_cap,
+                        nullptr, nullptr, nullptr, apk());
+                }
+                if (!grouped && use_i8 && w.wq_rs && w.wk_rs && w.wv_rs &&
                     w.wk_type == w.wq_type && w.wv_type == w.wq_type &&
                     kernels::pf_dense_gemm_qi8_supported(w.wq_type)) {
                     const void*  Wa[3]  = { w.wq, w.wk, w.wv };
@@ -2537,9 +2730,14 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                 if (!wo_fp4_done)
                     proj_fused_acc(att, w.wo, w.wo_type, w.wo_rs, ao, H, qdim, &attn_acc);
                 attn_fused = false;
+            } else if (const int r = tl && (tproj_mask & 2) && tl->wo_type == kPtq1GgmlType
+                                         ? tproj_resid(att, s.bonsai_sign_out, tl->wo, trs->wo, x,
+                                                       ao, H, qdim)
+                                         : 0) {
+                attn_fused = r == 1;
             } else if (w.wo_rs && (qb_fires || !qb_dense_pass)) {
-                proj_fused(att, w.wo, w.wo_type, w.wo_rs, ao, H, qdim);
-                attn_fused = false;
+                attn_fused = proj_fused_resid(att, w.wo, w.wo_type, w.wo_rs, x, H, qdim);
+                if (!attn_fused) proj_fused(att, w.wo, w.wo_type, w.wo_rs, ao, H, qdim);
             } else {
                 attn_fused = proj_resid(att, w.wo, w.wo_type, x, H, qdim);
                 if (!attn_fused) proj(att, w.wo, w.wo_type, ao, H, qdim);
@@ -2777,6 +2975,9 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                                           w.up_fp4 && w.up_fp4_sf && fp4_a && fp4_as;
             const bool ffn_fused = !c.muse_glimmer && !ffn_fp4_possible &&
                                    resid_fuse && (ffn_i8 || use_i8) && !ffn_qi8;
+            // Set when the fused-B down GEMM (one chunk, the whole prompt) added its output into x
+            // in its split-K reduce; the trailing x += ao is then already done.
+            bool down_resid = false;
             // The FP4 down projection accumulates the residual in its own epilogue (see the GDN
             // out_proj above). Decided per LAYER, not per chunk, so the whole layer takes one
             // route: a chunk that fuses has already applied its residual to x, so a mix would
@@ -2885,12 +3086,56 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                     }
                     a_q = nullptr;
                     signed char* const qp = apk_dst(fn, ffn);
-                    if (gu_fused_swiglu)       // the grouped GEMM's epilogue already wrote A_i8/sx/qp
+                    // Ternary down: the decode shadow holds this layer's down in its stored blocks,
+                    // which is what every decode step reads. With gate/up back as bf16 and one
+                    // chunk covering the prompt, rotate SwiGLU's output into that basis while
+                    // quantizing it and run down through the fused GEMM's PTQ1 arm, residual
+                    // folded into its reduce. Prefill's down then does the arithmetic decode does
+                    // (the Q4_K refit it replaces is an approximation of these blocks), and the
+                    // PTQ1 arm is the cheaper decode. SPARKINFER_PREFILL_TERNARY_DOWN=0 keeps the
+                    // Q4_K down (A/B).
+                    static const bool tdown_env = [] {
+                        const char* e = getenv("SPARKINFER_PREFILL_TERNARY_DOWN");
+                        return !(e && e[0] == '0');
+                    }();
+                    if (tdown_env && t_gu && !gu_fused_swiglu && fn == N && !ffn_fused &&
+                        !c.muse_glimmer && tl && tl->down_q && tl->down_qtype == kPtq1GgmlType &&
+                        trs->down && s.bonsai_sign_ffn && s.bonsai_block == 1024 &&
+                        (ffn % 1024) == 0 &&
+                        kernels::launch_ptq1_swiglu_rotq_rows_i8(
+                            ffg, ffu, static_cast<const signed char*>(s.bonsai_sign_ffn), A_i8, sx,
+                            qp, fn, ffn, s.bonsai_block, st)) {
                         a_pk = qp != nullptr;
-                    else
+                        const float* drs = trs->down;
+                        if (kernels::launch_prefill_gemm_qi8_dense_resid(
+                                kPtq1GgmlType, A_i8, sx, tl->down_q, drs, x, fn, H, ffn, st,
+                                qb_partials, QB_SPLITS, apk())) {
+                            down_resid = true;
+                            continue;
+                        }
+                        if (kernels::launch_prefill_gemm_qi8_dense(
+                                kPtq1GgmlType, A_i8, sx, tl->down_q, drs, ao + (size_t)fo * H, fn,
+                                H, ffn, st, qb_partials, QB_SPLITS, nullptr, apk()))
+                            continue;
+                        // Neither took it: A_i8 is in the rotated basis, so redo the plain form.
                         a_pk = kernels::launch_prefill_swiglu_quant_i8(ffg, ffu, A_i8, sx, fn, ffn,
                                                                        st, qp) && qp;
+                    } else if (gu_fused_swiglu) {  // the grouped GEMM's epilogue already wrote A_i8/sx/qp
+                        a_pk = qp != nullptr;
+                    } else {
+                        a_pk = kernels::launch_prefill_swiglu_quant_i8(ffg, ffu, A_i8, sx, fn, ffn,
+                                                                       st, qp) && qp;
+                    }
                     bool down_fused = false;
+                    // One chunk covering the prompt: fold the residual add into the down GEMM's
+                    // split-K reduce, and skip the x += ao below.
+                    if (fn == N && !ffn_fused && !c.muse_glimmer && w.down_rs &&
+                        kernels::launch_prefill_gemm_qi8_dense_resid(
+                            down_pf_type, A_i8, sx, down_pf, w.down_rs, x, fn, H, ffn, st,
+                            qb_partials, QB_SPLITS, apk())) {
+                        down_resid = true;
+                        continue;
+                    }
                     if (w.down_rs && kernels::pf_dense_gemm_qi8_supported(down_pf_type)) {
                         down_fused = kernels::launch_prefill_gemm_qi8_dense(
                             down_pf_type, A_i8, sx, down_pf, w.down_rs,
@@ -3082,9 +3327,10 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                                                       w.post_ffn_norm, x, N, H, 1e-8f, st);
                 else if (tail_rows != N)   // re-running rows a chunk already did is harmless
                     kernels::launch_norm_then_add(h, ao, w.post_ffn_norm, x, N, H, 1e-8f, st);
-            } else if (!ffn_fused && !ffn_fp4_resid) {
+            } else if (!ffn_fused && !ffn_fp4_resid && !down_resid) {
                 // x += ffn_out (skipped when the down GEMM already accumulated into x per chunk,
-                // whether through the int8 fused-residual GEMM or the FP4 epilogue's C operand)
+                // whether through the int8 fused-residual GEMM or the FP4 epilogue's C operand,
+                // or its split-K reduce added into x)
                 kernels::launch_prefill_add(x, ao, x, (long)N * H, st);
             }
         } else {
@@ -3662,7 +3908,17 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
         // this BIT-EXACT vs the in-kernel path -- same Q8_1 values, same dp4a -- and it drops the
         // per-block re-quantization of the same 6656-value activation, which at vocab-many rows is the
         // larger half of what that one launch reads after the weights themselves.
-        if (s.w.lm_head_type == 12 && lm_q8 && lm_ad && lm_as) {
+        // The decode shadow's ternary head, through the rotate+quantize and int8 GEMV a decode
+        // step runs on its own xn: the seed then comes from the head every later token reads.
+        if ((tproj_mask & 16) && s.bonsai_dec_head && s.bonsai_hq && s.bonsai_hqd &&
+            s.bonsai_hqs && s.bonsai_sign_hidden &&
+            kernels::launch_ptq1_rotq_bf16(xn_last,
+                                           static_cast<const signed char*>(s.bonsai_sign_hidden),
+                                           s.bonsai_hq, s.bonsai_hqd, s.bonsai_hqs, 1, H,
+                                           s.bonsai_block, st)) {
+            kernels::launch_gemv_ptq1_i8_f32(s.bonsai_hq, s.bonsai_hqd, s.bonsai_hqs,
+                                             s.bonsai_dec_head, s.logits, c.vocab, H, st);
+        } else if (s.w.lm_head_type == 12 && lm_q8 && lm_ad && lm_as) {
             kernels::launch_quantize_q8_1(xn_last, lm_q8, lm_ad, lm_as, H, st);
             kernels::launch_gemv_q_dp4a_pq_f32(lm_q8, lm_ad, lm_as, s.w.lm_head, s.logits, c.vocab, H, st);
         } else if (s.w.lm_head_type == kPtq1GgmlType && s.bonsai_rot && s.bonsai_sign_hidden) {
@@ -3701,6 +3957,7 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                 g_pfb_lin_key = s.lin_state;
                 g_pfb_conv_key = s.lin_conv_state;
                 g_pfb_btable_key = pfb_btable;
+                g_pfb_tleg_key = s.bonsai_pf_layers;
                 g_pfb_arena_gen[0] = keep_a.gen;  g_pfb_arena_gen[1] = keep_a8.gen;
                 g_pfb_arena_gen[2] = keep_am.gen; g_pfb_arena_gen[3] = keep_aw.gen;
                 g_pfb_scratch_epoch = kernels::prefill_scratch_epoch();

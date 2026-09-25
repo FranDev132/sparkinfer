@@ -140,5 +140,11 @@ bool launch_ptq1_rows_i8(const void* w_ptq1, signed char* q, float* scale, int r
 bool launch_ptq1_rotq_rows_i8(const void* x_bf16, const signed char* sign, signed char* q,
                               float* scale, signed char* qp, int rows, int k, int block,
                               cudaStream_t stream);
+// launch_ptq1_rotq_rows_i8 with SwiGLU in front: the row rotated is bf16(silu(gate) * up), the bytes
+// launch_prefill_swiglu_quant_i8 would have quantized. For the FFN's down leg in its stored
+// (rotated) blocks; sign is that width's vector. k <= 17*block.
+bool launch_ptq1_swiglu_rotq_rows_i8(const void* gate_bf16, const void* up_bf16,
+                                     const signed char* sign, signed char* q, float* scale,
+                                     signed char* qp, int rows, int k, int block, cudaStream_t st);
 
 }}  // namespace sparkinfer::kernels

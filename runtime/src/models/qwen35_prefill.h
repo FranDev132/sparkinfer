@@ -31,6 +31,20 @@ inline int gdn_state_slot(const Qwen35Config& c, int layer) {
     return layer - layer / c.full_attn_interval;
 }
 
+// Per-row scales of one layer's Bonsai decode-shadow legs (launch_ptq1_rows_i8's scale), the one
+// thing the fused prefill GEMM's PTQ1 arm needs beyond the ternary blocks themselves. A member is
+// null where that leg stayed folded.
+struct BonsaiShadowRs {
+    const float* wq = nullptr;
+    const float* wk = nullptr;
+    const float* wv = nullptr;
+    const float* wo = nullptr;
+    const float* ssm_out = nullptr;
+    const float* down = nullptr;
+    const float* wqkv = nullptr;
+    const float* wqkv_gate = nullptr;
+};
+
 struct Qwen35PrefillCtx {
     const Qwen35Config&  cfg;
     const Qwen35Weights& w;
@@ -131,6 +145,15 @@ struct Qwen35PrefillCtx {
     // The shadow's ternary LM head, or null: read through the int8 rows kernel, as single-row
     // decode reads it through the int8 GEMV.
     const void* bonsai_dec_head = nullptr;
+    // Batched prefill's view of the same shadow: its layers, and per layer the row scales of each
+    // ternary leg (n_layers entries). Null when the shadow is off or released.
+    const Qwen35LayerWeights* bonsai_pf_layers = nullptr;
+    const BonsaiShadowRs*     bonsai_pf_rs     = nullptr;
+    // One row of single-row decode's int8 activation (q, per-block scales, sums), for the seed
+    // token's pass through the ternary head exactly as a decode step makes it.
+    signed char* bonsai_hq  = nullptr;
+    float*       bonsai_hqd = nullptr;
+    int*         bonsai_hqs = nullptr;
 
     // PACKED PROMPT PREFILL. multi_n > 0 turns the pass's N rows from ONE prompt into multi_n
     // FRESH prompts laid end to end: prompt i is rows [multi_off[i], multi_off[i] + multi_len[i])
