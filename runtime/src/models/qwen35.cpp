@@ -6103,7 +6103,9 @@ bool Qwen35Model::load_gguf(const std::string& path) {
             s.owned.push_back(s.bonsai_rot);
         else
             s.bonsai_rot = nullptr;
-        if ((bonsai_native_proj || bonsai_shadow) && s.cfg.hidden > 0 &&
+        // Only a ternary projection reads it; without one, decode would rotate and quantize xn
+        // every layer for nothing.
+        if ((bonsai_native_proj || shadow_proj) && s.cfg.hidden > 0 &&
             cudaMalloc((void**)&s.bonsai_rot_xn, (size_t)s.cfg.hidden * sizeof(bf16)) == cudaSuccess)
             s.owned.push_back(s.bonsai_rot_xn);
         else
