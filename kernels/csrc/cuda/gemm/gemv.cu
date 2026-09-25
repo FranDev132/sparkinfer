@@ -3075,14 +3075,20 @@ bool launch_gemv_rows(const void* x, const void* W, void* y,
 bool launch_gemv_rows2(const void* x, const void* W0, const void* W1, void* y0, void* y1,
                        int M, int N0, int N1, int K, cudaStream_t stream) {
     if (M < 1 || N0 < 1 || N1 < 1 || (K & 7)) return false;
-    if (M > 8) {                       // chunk: see launch_gemv_nvfp4_rows_dp4a
-        for (int r0 = 0; r0 < M; r0 += 8) {
-            const int m = (M - r0) < 8 ? (M - r0) : 8;
+    // A row's sum does not depend on how many rows share the launch, so a packed batch of 16 or
+    // 32 takes one grid instead of 8-row chunks: the grid is only N0 + N1 CTAs, each reading its
+    // weight row once for every activation row. Other counts chunk (see
+    // launch_gemv_nvfp4_rows_dp4a).
+    if (M > 8 && M != 16 && M != 32) {
+        for (int r0 = 0; r0 < M;) {
+            const int left = M - r0;
+            const int m = left >= 32 ? 32 : left >= 16 ? 16 : (left < 8 ? left : 8);
             if (!launch_gemv_rows2(reinterpret_cast<const __nv_bfloat16*>(x) + (size_t)r0 * K,
                                    W0, W1,
                                    reinterpret_cast<__nv_bfloat16*>(y0) + (size_t)r0 * N0,
                                    reinterpret_cast<__nv_bfloat16*>(y1) + (size_t)r0 * N1,
                                    m, N0, N1, K, stream)) return false;
+            r0 += m;
         }
         return true;
     }
@@ -3105,7 +3111,8 @@ bool launch_gemv_rows2(const void* x, const void* W0, const void* W1, void* y0, 
         case 1: SI_GEMV_ROWS2(1); break;  case 2: SI_GEMV_ROWS2(2); break;
         case 3: SI_GEMV_ROWS2(3); break;  case 4: SI_GEMV_ROWS2(4); break;
         case 5: SI_GEMV_ROWS2(5); break;  case 6: SI_GEMV_ROWS2(6); break;
-        case 7: SI_GEMV_ROWS2(7); break;  default: SI_GEMV_ROWS2(8); break;
+        case 7: SI_GEMV_ROWS2(7); break;  case 16: SI_GEMV_ROWS2(16); break;
+        case 32: SI_GEMV_ROWS2(32); break; default: SI_GEMV_ROWS2(8); break;
     }
 #undef SI_GEMV_ROWS2
     return true;

@@ -1857,8 +1857,9 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
     if (pf_win < 0) { const char* e = getenv("SPARKINFER_MG_L2PF_WIN"); pf_win = e ? atoi(e) : 7; }
 
     for (int L = 0; L < c.n_layers; L++) {
-        // The decode shadow's weights, read through the dp4a GEMV. Native residency keeps the
-        // float kernels its packed batch also runs, so a row decodes the same alone or batched.
+        // The decode shadow's weights: the FFN read through the dp4a GEMV, the attention and output
+        // projections through the int8 one. Native residency keeps the float kernels its packed
+        // batch also runs, so a row decodes the same alone or batched.
         const bool dec_shadow = !s.bonsai_dec_layers.empty();
         const Qwen35LayerWeights& w = dec_shadow ? s.bonsai_dec_layers[L] : s.w.layers[L];
         // Which block table this layer's KV lives in. A sliding-window layer may sit in a capped
@@ -1955,7 +1956,31 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
                 kernels::launch_gemm(s.xn, W, y, 1, N, H, 1.f, 0.f, gc, pst);
             }
         };
+        // A decode-shadow projection: its input rotated at its own width and quantized per 128
+        // (a launch_ptq1_*rotq_bf16 kernel), then the int8 GEMV. The packed step runs the same
+        // kernels at N rows (dflash_verify_short_run), so a row decodes the same bits batched or
+        // alone. The sign vector is null unless this layer reads a shadow copy through them.
+        auto shadow_sign = [&](int type, long k) -> const signed char* {
+            if (!dec_shadow || type != kPtq1GgmlType || !s.bonsai_ffn_q) return nullptr;
+            const auto sg = s.bonsai_sign_dev.find(k);
+            return sg == s.bonsai_sign_dev.end() ? nullptr
+                                                 : static_cast<const signed char*>(sg->second);
+        };
+        auto gemv_t = [&](const void* W, void* y, int N, int K) {
+            kernels::launch_gemv_ptq1_i8_bf16(s.bonsai_ffn_q, s.bonsai_ffn_qd, s.bonsai_ffn_qs, W,
+                                              nullptr, y, nullptr, N, K, st);
+        };
+        auto proj_t = [&](const void* x, const void* W, void* y, int N, int K) -> bool {
+            const signed char* sg = shadow_sign(kPtq1GgmlType, K);
+            if (!sg || !kernels::launch_ptq1_rotq_bf16(x, sg, s.bonsai_ffn_q, s.bonsai_ffn_qd,
+                                                       s.bonsai_ffn_qs, 1, K,
+                                                       (int)s.bonsai_block, st))
+                return false;
+            gemv_t(W, y, N, K);
+            return true;
+        };
         auto proj_from = [&](const void* x, const void* W, int t, void* y, int N, int K) {
+            if (dec_shadow && t == kPtq1GgmlType && proj_t(x, W, y, N, K)) return;
             if (s.gguf) {
                 if (s.use_pq && t == 12) {
                     if (s.use_llama) {
@@ -2086,7 +2111,15 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
             const bool gdn_gn_q8 = s.gguf && s.use_pq && s.use_llama &&
                                    (w.ssm_out_type == 12 || w.ssm_out_type == 8) &&
                                    c.linear_head_dim == 128;
-            if (gdn_gn_q8) {
+            // The decode shadow's ssm_out: the gated norm, the rotation and the int8 quantize in
+            // one kernel, then the int8 GEMV.
+            const signed char* so_sign = shadow_sign(w.ssm_out_type, s.linear_vdim);
+            if (so_sign && kernels::launch_ptq1_gnorm_rotq_bf16(
+                               s.lin_gdn, s.lin_z, w.ssm_norm, c.rms_eps, so_sign, s.bonsai_ffn_q,
+                               s.bonsai_ffn_qd, s.bonsai_ffn_qs, 1, (int)s.linear_vdim,
+                               c.linear_head_dim, (int)s.bonsai_block, st)) {
+                gemv_t(w.ssm_out, s.ao, (int)H, (int)s.linear_vdim);
+            } else if (gdn_gn_q8) {
                 static int gn_q8 = -1;
                 if (gn_q8 < 0) {
                     const char* e = getenv("SPARKINFER_GDN_GNORM_Q8");
@@ -2147,7 +2180,22 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
                 const bool attn_qkv = !sep_gate && s.use_attn_qkv && s.use_pq && s.use_llama
                                    && (H == 2048 || H == 4096 || H == 5120)
                                    && w.wq_type == 12 && w.wk_type == 12 && w.wv_type == 12;
-                if (attn_qkv) {
+                // The decode shadow's q/k/v: xn rotated and quantized once, then q, and k with v
+                // as one two-matrix launch -- kvdim rows apiece is a sliver of the device alone.
+                const bool attn_t = dec_shadow && s.bonsai_ffn_q && s.bonsai_sign_h && !sep_gate &&
+                                    w.wq_type == kPtq1GgmlType && w.wk_type == kPtq1GgmlType &&
+                                    w.wv_type == kPtq1GgmlType;
+                if (attn_t) {
+                    kernels::launch_ptq1_rotq_bf16(s.xn, s.bonsai_sign_h, s.bonsai_ffn_q,
+                                                   s.bonsai_ffn_qd, s.bonsai_ffn_qs, 1, (int)H,
+                                                   (int)s.bonsai_block, st);
+                    kernels::launch_gemv_ptq1_i8_bf16(s.bonsai_ffn_q, s.bonsai_ffn_qd,
+                                                      s.bonsai_ffn_qs, w.wq, nullptr, q_dst,
+                                                      nullptr, nq, (int)H, st);
+                    kernels::launch_gemv_ptq1_i8_bf16(s.bonsai_ffn_q, s.bonsai_ffn_qd,
+                                                      s.bonsai_ffn_qs, w.wk, w.wv, s.k, s.v,
+                                                      s.kvdim, (int)H, st);
+                } else if (attn_qkv) {
                     kernels::launch_attn_qkv_mmvq_q4k(s.aq81, w.wq, w.wk, w.wv,
                         q_dst, s.k, s.v, nq, s.kvdim, s.kvdim, H, st);
                 } else if (s.use_qkvstream) {
@@ -2381,14 +2429,24 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
                                                mg_gate_ok ? 1 : 0);
             }
             dbg_bf16(s.attn, s.qdim, 30, L);   // tag 30: SDPA output, pre-gate
-            if (w.q_has_gate && !attn_gate_q8) {
+            // The decode shadow's o_proj takes the sigmoid gate inside its rotation (below).
+            const signed char* wo_sign = shadow_sign(w.wo_type, s.qdim);
+            if (w.q_has_gate && !attn_gate_q8 && !wo_sign) {
                 kernels::launch_qwen36_mul_sigmoid(s.attn, s.qgate, s.qdim, st);
             }
             dbg_bf16(s.attn, s.qdim, 31, L);   // tag 31: SDPA output, post sigmoid-gate
 
             // ---- O projection (int8 mmvq path) ----
             if (pf_win & 1) pf_join();   // window 1 lands here: w.wo is read next
-            if (s.gguf && s.use_pq && w.wo_type == 12) {
+            if (wo_sign && (w.q_has_gate
+                                ? kernels::launch_ptq1_gate_rotq_bf16(
+                                      s.attn, s.qgate, wo_sign, s.bonsai_ffn_q, s.bonsai_ffn_qd,
+                                      s.bonsai_ffn_qs, 1, (int)s.qdim, (int)s.bonsai_block, st)
+                                : kernels::launch_ptq1_rotq_bf16(
+                                      s.attn, wo_sign, s.bonsai_ffn_q, s.bonsai_ffn_qd,
+                                      s.bonsai_ffn_qs, 1, (int)s.qdim, (int)s.bonsai_block, st)))
+                gemv_t(w.wo, s.ao, (int)H, (int)s.qdim);
+            else if (s.gguf && s.use_pq && w.wo_type == 12) {
                 if (s.use_llama) {
                     if (!emit_attn_q8 && !attn_gate_q8) kernels::launch_quantize_q8_1_blocks(s.attn, s.aq81, s.qdim, st);
                     kernels::launch_mmvq_q4k(s.aq81, w.wo, s.ao, H, s.qdim, st);
@@ -4323,8 +4381,11 @@ bool Qwen35Model::decode_packed(const int* tokens, const int* positions,
         const char* e = getenv("SPARKINFER_BONSAI_CB_SHADOW");
         return !(e && e[0] == '0');
     }();
-    if (kCbShadow && !s.bonsai_dec_layers.empty())
+    if (kCbShadow && !s.bonsai_dec_layers.empty()) {
         ctx.bonsai_dec_layers = s.bonsai_dec_layers.data();
+        const auto so = s.bonsai_sign_dev.find(s.qdim);
+        if (so != s.bonsai_sign_dev.end()) ctx.bonsai_sign_out = so->second;
+    }
     const int consumed = dflash_verify_short_run(ctx, tokens, n, positions[0],
                                                  nullptr, 0, nullptr, out_sampled);
     return consumed == n;
@@ -6077,16 +6138,23 @@ bool Qwen35Model::load_gguf(const std::string& path) {
     }();
     const bool bonsai_shadow = had.present && bonsai_shadow_env && !bonsai_native_ffn &&
                                !bonsai_native_proj && !bonsai_native_head && !bonsai_native_embed;
-    // Which parts get a ternary copy: "head", "proj", "ffn", comma-separated. Default: the FFN,
-    // ~70% of the weight bytes. The head and the projections add speed but each moves the
-    // logits further from the folded path's (KL vs main 0.018 FFN-only, 0.026 all three).
+    // Which parts get a ternary copy: "head", "proj", "ffn", "attn", "out", comma-separated.
+    // "proj" is every residual-width projection; "attn" only the full-attention layers' q/k/v;
+    // "out" the two projections back into the residual (attn_output, ssm_out), which read the
+    // 6144-wide head output. Default: the FFN, the attention q/k/v and both outputs -- 3.2B
+    // weights (0.7 GB) on top of the FFN's 17.1B, each read through the int8-activation GEMV, and
+    // in a packed step through the tensor-core rows kernel that reproduces it bit for bit. Against
+    // the FFN alone that moves the logits by KL 0.019 (top-1 0.956, PPL 3.672 -> 3.642). The head
+    // and the GDN in-projections stay folded.
     static const std::string bonsai_shadow_parts = [] {
         const char* e = getenv("SPARKINFER_BONSAI_SHADOW_PARTS");
-        return std::string(e ? e : "ffn");
+        return std::string(e ? e : "ffn,attn,out");
     }();
     const bool shadow_head = bonsai_shadow && bonsai_shadow_parts.find("head") != std::string::npos;
     const bool shadow_proj = bonsai_shadow && bonsai_shadow_parts.find("proj") != std::string::npos;
     const bool shadow_ffn = bonsai_shadow && bonsai_shadow_parts.find("ffn") != std::string::npos;
+    const bool shadow_attn = bonsai_shadow && bonsai_shadow_parts.find("attn") != std::string::npos;
+    const bool shadow_out = bonsai_shadow && bonsai_shadow_parts.find("out") != std::string::npos;
     std::unordered_map<const void*, void*> shadow_of;   // folded weight -> its ternary copy
     if (bonsai_native || bonsai_shadow) {
         s.bonsai_block = had.block_size;
@@ -6627,12 +6695,24 @@ bool Qwen35Model::load_gguf(const std::string& path) {
             return dev_quant_requant_q4k(name, type, req_attn_q4(name, t->ggml_type));
         type = 0; return dense(name, false);
     };
-    // attn_w_base, plus the decode shadow's ternary copy of every residual-width projection.
+    // attn_w_base, plus the decode shadow's ternary copy of the projections its parts name.
+    // "proj" reads the rotated xn through the dp4a GEMV; "attn" and "out" quantize their own
+    // input for the int8 GEMV, so they need its scratch instead.
     auto attn_w = [&](const std::string& name, int& type) -> const void* {
         const GGUFTensor* t = g.tensor(name);
         void* sh = nullptr;
-        if (shadow_proj && t && t->ggml_type == kPtq1GgmlType && s.bonsai_rot_xn &&
-            t->dims[0] == s.cfg.hidden && s.bonsai_sign_dev.count(t->dims[0])) {
+        const bool resid = t && t->dims[0] == s.cfg.hidden;
+        const bool attn_part = resid && (name.find(".attn_q.") != std::string::npos ||
+                                         name.find(".attn_k.") != std::string::npos ||
+                                         name.find(".attn_v.") != std::string::npos);
+        // ssm_out's rotation carries the gated norm, one 128-wide v head per warp, and the packed
+        // step reads it at the same width as attn_output.
+        const bool out_part = name.find(".attn_output.") != std::string::npos ||
+                              (name.find(".ssm_out.") != std::string::npos &&
+                               s.cfg.linear_head_dim == 128 && s.linear_vdim == s.qdim);
+        const bool want = (shadow_proj && resid && s.bonsai_rot_xn) ||
+                          (s.bonsai_ffn_q && ((shadow_attn && attn_part) || (shadow_out && out_part)));
+        if (want && t && t->ggml_type == kPtq1GgmlType && s.bonsai_sign_dev.count(t->dims[0])) {
             UnrotateJob j;
             if (unrotate_job_init(j, t, name, *had.signs_for(t->dims[0]), had.block_size, false))
                 sh = upload_proj_native(t, name, j);
@@ -7694,7 +7774,8 @@ bool Qwen35Model::load_gguf(const std::string& path) {
         for (auto& d : s.bonsai_dec_layers) {
             n_proj += swap_in(d.wqkv, d.wqkv_type) + swap_in(d.wqkv_gate, d.wqkv_gate_type) +
                       swap_in(d.wq, d.wq_type) + swap_in(d.wgate, d.wgate_type) +
-                      swap_in(d.wk, d.wk_type) + swap_in(d.wv, d.wv_type);
+                      swap_in(d.wk, d.wk_type) + swap_in(d.wv, d.wv_type) +
+                      swap_in(d.wo, d.wo_type) + swap_in(d.ssm_out, d.ssm_out_type);
             // A leg loaded ternary (gate/up under "gu") needs no copy; the rest must have one.
             auto ternary = [&](const void* p, int t) {
                 return p && (t == kPtq1GgmlType || shadow_of.count(p));
