@@ -64,6 +64,16 @@ bool launch_prefill_gemm_qi8_dense(int ggml_type, const signed char* A_i8, const
                                    // row-major addressing. Output is bit-identical either way.
                                    const signed char* A_pack = nullptr);
 
+// The same GEMM with the residual add folded into its split-K reduce:
+// X[m][n] = bf16(X[m][n] + bf16(acc * sx[m] * row_scale[n])), exactly what the reduce into a
+// scratch output followed by launch_prefill_add(X, out, X) computes. Returns false, launching
+// nothing, unless the launch takes the split-K arm (then the caller runs the two-step form).
+// SPARKINFER_QB_RESID_REDUCE=0 disables it.
+bool launch_prefill_gemm_qi8_dense_resid(int ggml_type, const signed char* A_i8, const float* sx,
+                                         const void* W_q, const float* row_scale, void* X_bf16,
+                                         int M, int N, int K, cudaStream_t stream, int* partials,
+                                         int partials_splits, const signed char* A_pack = nullptr);
+
 // Fuse up to 4 projections sharing A_i8/sx (same M, same K) into ONE grid. At prefill's M=128 a
 // projection's grid is ceil(N/64) CTAs -- 64 for a 4096-wide q/gate but only 4 for a 256-wide
 // k/v -- all far under a 5090's 170 SMs, so every launch costs a full CTA-duration regardless of

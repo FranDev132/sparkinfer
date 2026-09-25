@@ -1190,19 +1190,33 @@ __global__ __launch_bounds__(256, 2) void pf_dense_gemm_qi8_kernel_g(
 // eight warps finish a super-block's MMAs and then stop to decode the next weight super-block, so
 // decode and MMA serialize (and two resident blocks tend to decode at the same time). Here the
 // roles are split: four DECODE warps fetch and decode super-blocks into a ring of WS_NS Bs planes,
-// one A warp streams the activation into a ring of WS_NA K-steps with cp.async, and the eight MMA
+// one A warp streams the activation into a ring of NA K-steps with cp.async, and the eight MMA
 // warps only wait on per-stage mbarriers and issue ldmatrix + mma -- no block-wide barrier in the
 // K loop. Measured on Ternary-Bonsai-2's shapes (16 cycled weight copies): prefill@128's fused GEMMs
 // 19.97 -> 19.33 ms per forward. SPARKINFER_PREFILL_QB_WS=0 keeps the single-role kernel.
 constexpr int WS_NS = 2;                                  // Bs planes in the ring
-constexpr int WS_NA = 3;                                  // A 32-wide K steps in flight
-constexpr int WS_CONS = 256, WS_DEC = 128, WS_AW = 32;
-constexpr int WS_THREADS = WS_CONS + WS_DEC + WS_AW;
-// mbarriers: fullB[NS] (WS_DEC arrivals), emptyB[NS] (8 consumer warps), fullA[NA] (WS_AW cp.async
-// arrivals), emptyA[NA] (8 consumer warps)
-constexpr size_t WS_OFF_A = (size_t)WS_NS * QM_BND * QM_LD;
-constexpr size_t WS_OFF_MB = WS_OFF_A + (size_t)WS_NA * QM_BM * QM_BK;
-constexpr size_t WS_SMEM = WS_OFF_MB + 2 * (WS_NS + WS_NA) * 8;
+// The block for a WBN-wide output tile. WBN = 64: eight MMA warps at 32x32, four decode warps
+// (two threads per weight row), one A warp, two blocks an SM. WBN = 128 is those two blocks merged
+// into one: sixteen MMA warps and eight decode warps behind the same single A warp, so the
+// activation rows both halves read are staged into the SM once instead of twice -- A is re-read
+// from L2 by every N-tile, and that stream costs as much as the weight decode at M=128. Its A ring
+// is 4 K-steps: a power of two that divides a super-block's 8, so in the unrolled K loop every ring
+// slot and parity is a constant (6 and 7 deep measured 13.88 and 13.99 ms per forward, 4 deep 13.47).
+// mbarriers: fullB[NS] (DEC arrivals), emptyB[NS] (one per MMA warp), fullA[NA] (AW cp.async
+// arrivals), emptyA[NA] (one per MMA warp)
+template <int WBN>
+struct WsCfg {
+    static constexpr int CONS = 4 * WBN, DEC = 2 * WBN, AW = 32;
+    static constexpr int THREADS = CONS + DEC + AW;
+    static constexpr int NA = WBN == 64 ? 3 : 4;           // A 32-wide K steps in flight
+    static constexpr int MINB = WBN == 64 ? 2 : 1;
+    static constexpr size_t OFF_A = (size_t)WS_NS * WBN * QM_LD;
+    static constexpr size_t OFF_MB = OFF_A + (size_t)NA * QM_BM * QM_BK;
+    static constexpr size_t SMEM = OFF_MB + 2 * (WS_NS + NA) * 8;
+};
+constexpr int WS_THREADS = WsCfg<64>::THREADS;
+constexpr size_t WS_SMEM = WsCfg<64>::SMEM;
+constexpr int QM_WBN = 128;
 
 __device__ __forceinline__ void ws_mb_init(unsigned a, unsigned cnt) {
     asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;" :: "r"(a), "r"(cnt) : "memory");
@@ -1234,14 +1248,15 @@ __device__ __forceinline__ void ws_cp16(unsigned dst, const void* src) {
     asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" :: "r"(dst), "l"(src) : "memory");
 }
 
-template <bool GROUPED, bool SPLIT>
-__global__ __launch_bounds__(WS_THREADS, 2) void pf_dense_gemm_qi8_ws_kernel(
+template <int QT, bool GROUPED, bool SPLIT, int WBN = 64>
+__global__ __launch_bounds__(WsCfg<WBN>::THREADS, WsCfg<WBN>::MINB) void pf_dense_gemm_qi8_ws_kernel(
         const signed char* __restrict__ A_i8, const float* __restrict__ sx,
         const unsigned char* __restrict__ W_q_arg, const float* __restrict__ row_scale_arg,
         __nv_bfloat16* __restrict__ C_arg, int Mtot, int N_arg, int K, PfQGroup gd,
         int* __restrict__ partials = nullptr, int sb_per_split = 0, int atomic_acc = 0,
         const signed char* __restrict__ A_pack = nullptr, int m_fast = 0) {
-    constexpr int QT = QMQ_Q4_K;
+    static_assert(QT == QMQ_Q4_K || QT == QMQ_PTQ1, "the decode warps' stage split");
+    using CF = WsCfg<WBN>;
     constexpr int BS = qm_bs<QT>();
     const int zsl  = SPLIT ? (int)blockIdx.x : 0;
     const int btil = SPLIT ? (int)blockIdx.y : (m_fast ? (int)blockIdx.y : (int)blockIdx.x);
@@ -1258,42 +1273,42 @@ __global__ __launch_bounds__(WS_THREADS, 2) void pf_dense_gemm_qi8_ws_kernel(
     if (GROUPED) {
         #pragma unroll
         for (int i = 1; i < PF_QGROUP_MAX; i++)
-            if (i < gd.ngroup && btil >= gd.first[i]) grp = i;
+            if (i < gd.ngroup && btil * (WBN / QM_BND) >= gd.first[i]) grp = i;
         W_q = gd.W[grp]; row_scale = gd.rs[grp]; C = gd.C[grp]; N = gd.N[grp];
-        xtile = btil - gd.first[grp];
+        xtile = btil - gd.first[grp] / (WBN / QM_BND);
     }
     const size_t pbase = GROUPED ? (size_t)gd.poff[grp] : 0;
-    const int n0  = xtile * QM_BND;
+    const int n0  = xtile * WBN;
     const int nsb = K >> 8;
     const int sb_lo = SPLIT ? zsl * sb_per_split : 0;
     const int sb_hi = SPLIT ? min(nsb, sb_lo + sb_per_split) : nsb;
     if (sb_lo >= sb_hi) return;
 
     extern __shared__ __align__(16) signed char ws_smem[];
-    auto Bs = reinterpret_cast<signed char (*)[QM_BND][QM_LD]>(ws_smem);
-    auto As = reinterpret_cast<signed char (*)[QM_BM][QM_BK]>(ws_smem + WS_OFF_A);
-    const unsigned mb0 = (unsigned)__cvta_generic_to_shared(ws_smem + WS_OFF_MB);
+    auto Bs = reinterpret_cast<signed char (*)[WBN][QM_LD]>(ws_smem);
+    auto As = reinterpret_cast<signed char (*)[QM_BM][QM_BK]>(ws_smem + CF::OFF_A);
+    const unsigned mb0 = (unsigned)__cvta_generic_to_shared(ws_smem + CF::OFF_MB);
     auto fullB  = [&](int s) { return mb0 + 8u * (unsigned)s; };
     auto emptyB = [&](int s) { return mb0 + 8u * (unsigned)(WS_NS + s); };
     auto fullA  = [&](int s) { return mb0 + 8u * (unsigned)(2 * WS_NS + s); };
-    auto emptyA = [&](int s) { return mb0 + 8u * (unsigned)(2 * WS_NS + WS_NA + s); };
+    auto emptyA = [&](int s) { return mb0 + 8u * (unsigned)(2 * WS_NS + CF::NA + s); };
     const int tid = threadIdx.x;
     const int nsteps = (sb_hi - sb_lo) * (QM_SB / QM_BK);
     if (tid == 0) {
-        for (int s = 0; s < WS_NS; s++) { ws_mb_init(fullB(s), WS_DEC); ws_mb_init(emptyB(s), 8); }
-        for (int s = 0; s < WS_NA; s++) { ws_mb_init(fullA(s), WS_AW); ws_mb_init(emptyA(s), 8); }
+        for (int s = 0; s < WS_NS; s++) { ws_mb_init(fullB(s), CF::DEC); ws_mb_init(emptyB(s), CF::CONS / 32); }
+        for (int s = 0; s < CF::NA; s++) { ws_mb_init(fullA(s), CF::AW); ws_mb_init(emptyA(s), CF::CONS / 32); }
         ws_mb_fence_init();
     }
     // Rows past M never receive a cp.async: zero them once in every A slot.
-    for (int e = tid; e < WS_NA * QM_BM * 2; e += WS_THREADS) {
+    for (int e = tid; e < CF::NA * QM_BM * 2; e += CF::THREADS) {
         const int s = e / (QM_BM * 2), r = (e >> 1) % QM_BM, c = (e & 1) * 16;
         if (r >= M) *reinterpret_cast<uint4*>(&As[s][r][c]) = make_uint4(0u, 0u, 0u, 0u);
     }
     __syncthreads();
 
-    if (tid >= WS_CONS + WS_DEC) {
+    if (tid >= CF::CONS + CF::DEC) {
         // ---------------- A-staging warp: 8 of the 256 16-byte chunks per lane per K step ----------------
-        const int lane = tid - (WS_CONS + WS_DEC);
+        const int lane = tid - (CF::CONS + CF::DEC);
         const bool apk = A_pack != nullptr;
         const size_t a_step = apk ? (size_t)Mtot * 32 : (size_t)QM_BK;
         const signed char* srcs[8]; unsigned dsts[8]; bool oks[8];
@@ -1308,8 +1323,8 @@ __global__ __launch_bounds__(WS_THREADS, 2) void pf_dense_gemm_qi8_ws_kernel(
             dsts[u] = (unsigned)__cvta_generic_to_shared(&As[0][r][c16 ^ (16 * ((r >> 2) & 1))]);
         }
         for (int t = 0; t < nsteps; t++) {
-            const int s = t % WS_NA;
-            if (t >= WS_NA) ws_mb_wait(emptyA(s), ((t / WS_NA) - 1) & 1);
+            const int s = t % CF::NA;
+            if (t >= CF::NA) ws_mb_wait(emptyA(s), ((t / CF::NA) - 1) & 1);
             const unsigned so = (unsigned)s * (QM_BM * QM_BK);
             #pragma unroll
             for (int u = 0; u < 8; u++)
@@ -1318,9 +1333,9 @@ __global__ __launch_bounds__(WS_THREADS, 2) void pf_dense_gemm_qi8_ws_kernel(
         }
         return;
     }
-    if (tid >= WS_CONS) {
+    if (tid >= CF::CONS) {
         // ---------------- decode warps: 2 threads per weight row, two 64-value pairs each ----------------
-        const int pt = tid - WS_CONS;
+        const int pt = tid - CF::CONS;
         const int dr = pt >> 1, jb = (pt & 1) * 2;
         const int dgn = n0 + dr;
         const bool drow_ok = dgn < N;
@@ -1376,8 +1391,8 @@ __global__ __launch_bounds__(WS_THREADS, 2) void pf_dense_gemm_qi8_ws_kernel(
         const int it = sb - sb_lo, s = it % WS_NS;
         ws_mb_wait(fullB(s), (it / WS_NS) & 1);
         for (int kk = 0; kk < QM_SB; kk += QM_BK, t++) {
-            const int sa = t % WS_NA;
-            ws_mb_wait(fullA(sa), (t / WS_NA) & 1);
+            const int sa = t % CF::NA;
+            ws_mb_wait(fullA(sa), (t / CF::NA) & 1);
             const unsigned ab = a_sm + (unsigned)sa * (QM_BM * QM_BK);
             unsigned af32[2][4];
 #pragma unroll
@@ -1386,7 +1401,7 @@ __global__ __launch_bounds__(WS_THREADS, 2) void pf_dense_gemm_qi8_ws_kernel(
 #pragma unroll
             for (int j2 = 0; j2 < 2; j2++) {
                 unsigned bb[4];
-                qm_ldsm_x4(bb, b_sm + (unsigned)s * (QM_BND * QM_LD)
+                qm_ldsm_x4(bb, b_sm + (unsigned)s * (WBN * QM_LD)
                                     + (unsigned)(j2 * 16 * QM_LD) + (unsigned)kk);
 #pragma unroll
                 for (int i = 0; i < 2; i++) {
@@ -1403,7 +1418,7 @@ __global__ __launch_bounds__(WS_THREADS, 2) void pf_dense_gemm_qi8_ws_kernel(
 
     // Epilogue, staged through Bs[0] once every MMA warp is past its last read of either plane.
     // The decode warps are finished: their last write preceded the fullB arrival waited on above.
-    asm volatile("bar.sync 1, 256;" ::: "memory");
+    asm volatile("bar.sync 1, %0;" :: "n"(CF::CONS) : "memory");
     int* Cs = reinterpret_cast<int*>(&Bs[0][0][0]);
 #pragma unroll
     for (int i = 0; i < 2; i++) {
@@ -1471,7 +1486,7 @@ struct QmTall {
     static_assert(DEC % GBN == 0 && 4 % DTPR == 0 && ACH % AW == 0 && NF % 2 == 0, "tile config");
 };
 
-template <int GBM, int GBN, int GWM, int GWN, int GDW, int GAW, int GNA, int GNS, bool GROUPED>
+template <int QT, int GBM, int GBN, int GWM, int GWN, int GDW, int GAW, int GNA, int GNS, bool GROUPED>
 __global__ __launch_bounds__(QmTall<GBM, GBN, GWM, GWN, GDW, GAW, GNA, GNS>::THREADS, 1)
 void pf_dense_gemm_qi8_tall_kernel(
         const signed char* __restrict__ A_i8, const float* __restrict__ sx,
@@ -1479,7 +1494,7 @@ void pf_dense_gemm_qi8_tall_kernel(
         __nv_bfloat16* __restrict__ C_arg, int Mtot, int N_arg, int K, PfQGroup gd,
         const signed char* __restrict__ A_pack, int m_fast) {
     using T = QmTall<GBM, GBN, GWM, GWN, GDW, GAW, GNA, GNS>;
-    constexpr int QT = QMQ_Q4_K;
+    static_assert(QT == QMQ_Q4_K || QT == QMQ_PTQ1, "the decode warps' stage split");
     constexpr int BS = qm_bs<QT>();
     constexpr int CONS = T::CONS, DEC = T::DEC, AW = T::AW, THREADS = T::THREADS;
     constexpr int MF = T::MF, NF = T::NF, WTM = T::WTM, WTN = T::WTN;
@@ -1682,9 +1697,13 @@ static bool qm_tall_on() {
     static const bool on = [] {
         const char* e = getenv("SPARKINFER_PREFILL_QB_TALL");
         if ((e && e[0] == '0') || !qm_sm90()) return false;
-        cudaFuncSetAttribute(pf_dense_gemm_qi8_tall_kernel<QM_TALL, false>,
+        cudaFuncSetAttribute(pf_dense_gemm_qi8_tall_kernel<QMQ_Q4_K, QM_TALL, false>,
                              cudaFuncAttributeMaxDynamicSharedMemorySize, (int)QmTallCfg::SMEM);
-        cudaFuncSetAttribute(pf_dense_gemm_qi8_tall_kernel<QM_TALL, true>,
+        cudaFuncSetAttribute(pf_dense_gemm_qi8_tall_kernel<QMQ_Q4_K, QM_TALL, true>,
+                             cudaFuncAttributeMaxDynamicSharedMemorySize, (int)QmTallCfg::SMEM);
+        cudaFuncSetAttribute(pf_dense_gemm_qi8_tall_kernel<QMQ_PTQ1, QM_TALL, false>,
+                             cudaFuncAttributeMaxDynamicSharedMemorySize, (int)QmTallCfg::SMEM);
+        cudaFuncSetAttribute(pf_dense_gemm_qi8_tall_kernel<QMQ_PTQ1, QM_TALL, true>,
                              cudaFuncAttributeMaxDynamicSharedMemorySize, (int)QmTallCfg::SMEM);
         return true;
     }();
@@ -1780,6 +1799,23 @@ __global__ void pf_dense_splitk_reduce_kernel(const int* __restrict__ partials,
     C[idx] = __float2bfloat16((float)acc * sx[m] * row_scale[n]);
 }
 
+// The split-K reduce with the residual add folded in: the bf16 projection it would have stored,
+// added to X and rounded again -- launch_prefill_add's arithmetic on the same two bf16 values.
+__global__ void pf_dense_splitk_reduce_resid_kernel(const int* __restrict__ partials,
+                                                    const float* __restrict__ sx,
+                                                    const float* __restrict__ row_scale,
+                                                    __nv_bfloat16* __restrict__ X,
+                                                    int Mtot, int N, int splits) {
+    const size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= (size_t)Mtot * (size_t)N) return;
+    const int m = (int)(idx / (size_t)N);
+    const int n = (int)(idx - (size_t)m * (size_t)N);
+    int acc = 0;
+    for (int s = 0; s < splits; s++) acc += partials[((size_t)s * Mtot + m) * N + n];
+    const __nv_bfloat16 v = __float2bfloat16((float)acc * sx[m] * row_scale[n]);
+    X[idx] = __float2bfloat16(__bfloat162float(X[idx]) + __bfloat162float(v));
+}
+
 // Grouped split-K reduce. One launch covers every group: the flattened column picks the group
 // from the same tile prefix sum the GEMM prologue uses, so no per-group reduce launches are needed.
 __global__ void pf_dense_splitk_reduce_group_kernel(const int* __restrict__ partials,
@@ -1873,17 +1909,45 @@ static int qm_wave_pick(int ntiles, int nsb, int want) {
     return best;
 }
 
+// Split K only while the plain grid leaves SMs without a block. Once every SM has one and the
+// tile is nearly full of rows, a split only adds work: the int32 partial traffic, the memset that
+// zeroes its accumulator, the reduce launch that reads it back, and a prologue per slice.
+// Measured on Ternary-Bonsai-2's shapes (the 5090's 170 SMs), per launch, split -> unsplit:
+//   M=128: ternary gate+up (544 tiles) 129.6 -> 111.2 us, GDN qkv+z (256) 74.7 -> 62.4 us,
+//          attention q/k/v (224) 62.4 -> 59.5 us;
+//   M=100: 118.5 -> 106.0, 68.1 -> 61.0, 57.8 -> 57.8.
+// With few rows the kernel streams weights and the extra slices are what keep enough of them in
+// flight (M=17: 87.4 -> 94.6, 51.9 -> 53.4, 46.5 -> 52.8), hence the row floor. Grids with fewer
+// tiles than SMs (the 80-tile o/ssm_out/down) keep their split. SPARKINFER_QB_SPLIT_FULL_GRID=1
+// restores splitting everything (A/B; int32 sums are exact, so the output is bit-identical).
+static bool qm_split_full_grid() {
+    static int e = -1;
+    if (e < 0) { const char* v = getenv("SPARKINFER_QB_SPLIT_FULL_GRID"); e = (v && v[0] == '1') ? 1 : 0; }
+    return e != 0;
+}
+
 // K slices per launch. Shared by the single and grouped launchers so both fan out the same way.
-static int qm_pick_splits(int ntiles, int K, int mtiles, bool have_partials, int partials_splits) {
+static int qm_pick_splits(int ntiles, int K, int M, int mtiles, bool have_partials,
+                          int partials_splits, bool ws_q4k = false) {
     static int sk_env = -1;
     if (sk_env < 0) { const char* e = getenv("SPARKINFER_MUSE_QB_SPLITK"); sk_env = e ? atoi(e) : -2; }
     int splits = 1;
+    const int sms = qm_block_slots() / 2;
+    if (sk_env < 0 && !qm_split_full_grid() && M >= 96 && ntiles >= sms)
+        return 1;
     if (have_partials && partials_splits > 1 && mtiles == 1 && sk_env != 0) {
         const int nsb = K >> 8;
         splits = (sk_env > 0) ? sk_env : (QM_TARGET_BLOCKS + ntiles - 1) / ntiles;
         if (splits > partials_splits) splits = partials_splits;
         if (splits > nsb / 2) splits = nsb / 2;
         if (splits < 1) splits = 1;
+        // The warp-specialized Q4_K kernel on a grid of at most half the SMs: one block per SM
+        // beats two. Measured at M=128, 80 tiles, K=6144 (ssm_out / o): 2 slices 28.1 us, the
+        // picker's 4 slices 30.0 us. PTQ1 and the single-role kernel keep the picker (the ternary
+        // down measures 55.2 at 2, 53.9 at 4).
+        if (sk_env < 0 && !qm_split_full_grid() && ws_q4k && M >= 96 && 2 * ntiles <= sms &&
+            sms / ntiles <= splits)
+            return sms / ntiles;
         splits = qm_wave_pick(ntiles, nsb, splits);
     }
     return splits;
@@ -1895,19 +1959,54 @@ static bool qm_ws_on() {
     static const bool on = [] {
         const char* e = getenv("SPARKINFER_PREFILL_QB_WS");
         if ((e && e[0] == '0') || !qm_sm90()) return false;
-        cudaFuncSetAttribute(pf_dense_gemm_qi8_ws_kernel<false, false>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)WS_SMEM);
-        cudaFuncSetAttribute(pf_dense_gemm_qi8_ws_kernel<false, true>,  cudaFuncAttributeMaxDynamicSharedMemorySize, (int)WS_SMEM);
-        cudaFuncSetAttribute(pf_dense_gemm_qi8_ws_kernel<true, false>,  cudaFuncAttributeMaxDynamicSharedMemorySize, (int)WS_SMEM);
-        cudaFuncSetAttribute(pf_dense_gemm_qi8_ws_kernel<true, true>,   cudaFuncAttributeMaxDynamicSharedMemorySize, (int)WS_SMEM);
+        cudaFuncSetAttribute(pf_dense_gemm_qi8_ws_kernel<QMQ_Q4_K, false, false>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)WS_SMEM);
+        cudaFuncSetAttribute(pf_dense_gemm_qi8_ws_kernel<QMQ_Q4_K, false, true>,  cudaFuncAttributeMaxDynamicSharedMemorySize, (int)WS_SMEM);
+        cudaFuncSetAttribute(pf_dense_gemm_qi8_ws_kernel<QMQ_Q4_K, true, false>,  cudaFuncAttributeMaxDynamicSharedMemorySize, (int)WS_SMEM);
+        cudaFuncSetAttribute(pf_dense_gemm_qi8_ws_kernel<QMQ_Q4_K, true, true>,   cudaFuncAttributeMaxDynamicSharedMemorySize, (int)WS_SMEM);
+        cudaFuncSetAttribute(pf_dense_gemm_qi8_ws_kernel<QMQ_PTQ1, false, false>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)WS_SMEM);
+        cudaFuncSetAttribute(pf_dense_gemm_qi8_ws_kernel<QMQ_PTQ1, false, true>,  cudaFuncAttributeMaxDynamicSharedMemorySize, (int)WS_SMEM);
+        cudaFuncSetAttribute(pf_dense_gemm_qi8_ws_kernel<QMQ_PTQ1, true, false>,  cudaFuncAttributeMaxDynamicSharedMemorySize, (int)WS_SMEM);
+        cudaFuncSetAttribute(pf_dense_gemm_qi8_ws_kernel<QMQ_PTQ1, true, true>,   cudaFuncAttributeMaxDynamicSharedMemorySize, (int)WS_SMEM);
+        constexpr int WSM = (int)WsCfg<QM_WBN>::SMEM;
+        cudaFuncSetAttribute(pf_dense_gemm_qi8_ws_kernel<QMQ_Q4_K, false, false, QM_WBN>, cudaFuncAttributeMaxDynamicSharedMemorySize, WSM);
+        cudaFuncSetAttribute(pf_dense_gemm_qi8_ws_kernel<QMQ_Q4_K, false, true, QM_WBN>,  cudaFuncAttributeMaxDynamicSharedMemorySize, WSM);
+        cudaFuncSetAttribute(pf_dense_gemm_qi8_ws_kernel<QMQ_Q4_K, true, false, QM_WBN>,  cudaFuncAttributeMaxDynamicSharedMemorySize, WSM);
+        cudaFuncSetAttribute(pf_dense_gemm_qi8_ws_kernel<QMQ_Q4_K, true, true, QM_WBN>,   cudaFuncAttributeMaxDynamicSharedMemorySize, WSM);
+        cudaFuncSetAttribute(pf_dense_gemm_qi8_ws_kernel<QMQ_PTQ1, false, false, QM_WBN>, cudaFuncAttributeMaxDynamicSharedMemorySize, WSM);
+        cudaFuncSetAttribute(pf_dense_gemm_qi8_ws_kernel<QMQ_PTQ1, false, true, QM_WBN>,  cudaFuncAttributeMaxDynamicSharedMemorySize, WSM);
+        cudaFuncSetAttribute(pf_dense_gemm_qi8_ws_kernel<QMQ_PTQ1, true, false, QM_WBN>,  cudaFuncAttributeMaxDynamicSharedMemorySize, WSM);
+        cudaFuncSetAttribute(pf_dense_gemm_qi8_ws_kernel<QMQ_PTQ1, true, true, QM_WBN>,   cudaFuncAttributeMaxDynamicSharedMemorySize, WSM);
         return true;
     }();
     return on;
 }
+// Ternary-Bonsai-2's stored PTQ1_0 blocks take the warp-specialized and tall kernels too: their
+// decode is the same per-thread stage fetch/decode (one 128-value block per thread pair of j64s),
+// so the outputs are the single-role kernel's, byte for byte. SPARKINFER_PREFILL_QB_PTQ1_WS=0
+// keeps PTQ1 on the single-role kernel (A/B).
+static bool qm_ptq1_ws() {
+    static int e = -1;
+    if (e < 0) { const char* v = getenv("SPARKINFER_PREFILL_QB_PTQ1_WS"); e = (v && v[0] == '0') ? 0 : 1; }
+    return e != 0;
+}
+static bool qm_ws_type(int ty) { return ty == QMQ_Q4_K || (ty == QMQ_PTQ1 && qm_ptq1_ws()); }
+
+// The tall tile for this M. A 256-row tile decodes each weight once per 256 rows but runs its MMA
+// over all 256 of them, so a ragged last tile wastes MMA work; with PTQ1's cheaper decode that waste
+// decides it. Measured per launch, 128-row -> tall: M=512 gate+up 353.2 -> 319.0 us, down 181.2 ->
+// 149.0; M=300 gate+up 258.9 -> 283.6. PTQ1 takes it only when the last tall tile is at least three
+// quarters full; Q4_K keeps its rule.
+static bool qm_tall_for(int ty, int M) {
+    if (M <= 256 || !qm_ws_type(ty)) return false;
+    if (ty == QMQ_PTQ1 && ((M + QM_TALL_BM - 1) / QM_TALL_BM) * QM_TALL_BM - M > QM_TALL_BM / 4)
+        return false;
+    return true;
+}
 #define QM_LAUNCH_ONE(TY, GRP, SPL, ...)                                                           \
     do {                                                                                           \
-        if (TY == QMQ_Q4_K && qm_mma_k32() && qm_ws_on())                                          \
-            pf_dense_gemm_qi8_ws_kernel<GRP, SPL>                                                  \
-                <<<grid, WS_THREADS, WS_SMEM, stream>>>(__VA_ARGS__);                       \
+        if (qm_ws_type(TY) && qm_mma_k32() && qm_ws_on())                                          \
+            pf_dense_gemm_qi8_ws_kernel<(TY == QMQ_PTQ1 ? QMQ_PTQ1 : QMQ_Q4_K), GRP, SPL>          \
+                <<<grid, WS_THREADS, WS_SMEM, stream>>>(__VA_ARGS__);                              \
         else if (qm_mma_k32()) pf_dense_gemm_qi8_kernel_g<TY, GRP, SPL, true>                      \
                               <<<grid, 256, 0, stream>>>(__VA_ARGS__);                             \
         else              pf_dense_gemm_qi8_kernel_g<TY, GRP, SPL, false>                          \
@@ -1921,6 +2020,44 @@ static bool qm_ws_on() {
         else if (ggml_type == QMQ_PTQ1) QM_LAUNCH_ONE(QMQ_PTQ1, GRP, SPL, __VA_ARGS__);            \
         else                            QM_LAUNCH_ONE(QMQ_Q6_K, GRP, SPL, __VA_ARGS__);            \
     } while (0)
+// The wide tile's launch (see WsCfg); the caller has checked qm_wide_for.
+#define QM_LAUNCH_WIDE(GRP, SPL, ...)                                                              \
+    do {                                                                                           \
+        if (ggml_type == QMQ_PTQ1)                                                                 \
+            pf_dense_gemm_qi8_ws_kernel<QMQ_PTQ1, GRP, SPL, QM_WBN>                                \
+                <<<grid, WsCfg<QM_WBN>::THREADS, WsCfg<QM_WBN>::SMEM, stream>>>(__VA_ARGS__);      \
+        else                                                                                       \
+            pf_dense_gemm_qi8_ws_kernel<QMQ_Q4_K, GRP, SPL, QM_WBN>                                \
+                <<<grid, WsCfg<QM_WBN>::THREADS, WsCfg<QM_WBN>::SMEM, stream>>>(__VA_ARGS__);      \
+    } while (0)
+
+// The 128-wide tile (see WsCfg) for one M-tile of 96..128 rows. Measured per launch on
+// Ternary-Bonsai-2's shapes at M=128 (16 cycled weight copies), 64-wide -> 128-wide: PTQ1 gate+up
+// 107.6 -> 92.1 us, q/k/v 49.5 -> 43.1, down 53.9 -> 50.1, all six shapes 15.23 -> 13.47 ms per
+// forward; Q4_K GDN qkv+z 63.1 -> 60.0. With two M-tiles the 64-wide grid's extra blocks win back
+// (M=256: 27.1 -> 30.0 ms), and a Q4_K launch the wide tile would split measured 28.1 -> 28.9 at
+// K=6144, so the launchers keep the 64-wide tile for those. The launchers also require every output
+// width to be a whole number of wide tiles. SPARKINFER_PREFILL_QB_WIDE=0 keeps the 64-wide tile
+// (A/B; bit-identical either way: the int32 sums are exact and every output takes the same
+// epilogue expression).
+static bool qm_wide_for(int ty, int M) {
+    static int e = -1;
+    if (e < 0) { const char* v = getenv("SPARKINFER_PREFILL_QB_WIDE"); e = (v && v[0] == '0') ? 0 : 1; }
+    return e && M >= 96 && M <= QM_BM && qm_ws_type(ty) && qm_mma_k32() && qm_ws_on();
+}
+// Split-K for the wide tile, stated per SM since one wide block fills one: none once the grid
+// covers half the SMs (the 64-wide tile's rule, ntiles >= SMs, in its own tiles), else one block
+// per SM -- what the 64-wide warp-specialized kernel measured best at 80 tiles.
+static int qm_pick_splits_wide(int ntw, int K, int mtiles, bool have_partials, int partials_splits) {
+    static int sk_env = -1;
+    if (sk_env < 0) { const char* e = getenv("SPARKINFER_MUSE_QB_SPLITK"); sk_env = e ? atoi(e) : -2; }
+    if (!have_partials || partials_splits <= 1 || mtiles != 1 || sk_env == 0) return 1;
+    const int sms = qm_block_slots() / 2, nsb = K >> 8;
+    int splits = sk_env > 0 ? sk_env : (2 * ntw >= sms ? 1 : sms / ntw);
+    if (splits > partials_splits) splits = partials_splits;
+    if (splits > nsb / 2) splits = nsb / 2;
+    return splits < 1 ? 1 : splits;
+}
 
 // Unsplit grids with more than one M-tile ran N-tiles fastest, so the M-tiles that read the same
 // weight tile sat a whole grid row apart and each fetched it from DRAM again (the weight loads are
@@ -1950,13 +2087,19 @@ bool launch_prefill_gemm_qi8_dense(int ggml_type, const signed char* A_i8, const
     if (N <= 0 || (N % QM_BND) != 0) return false;               // tile-aligned output width
     auto* C = reinterpret_cast<__nv_bfloat16*>(C_bf16);
     const auto* W = reinterpret_cast<const unsigned char*>(W_q);
-    const int ntiles = (N + QM_BND - 1) / QM_BND;
     const int mtiles = (M + QM_BM - 1) / QM_BM;
+    const bool wide = qm_wide_for(ggml_type, M) && (N % QM_WBN) == 0 &&
+                      (ggml_type == QMQ_PTQ1 ||
+                       qm_pick_splits_wide(N / QM_WBN, K, mtiles, partials != nullptr,
+                                           partials_splits) == 1);
+    const int ntiles = wide ? N / QM_WBN : (N + QM_BND - 1) / QM_BND;
 
     // Split K only when the plain grid leaves the device idle. With more than one M-tile the grid
     // already fans out over M and a split would only add the reduce pass. Each slice must own whole
     // super-blocks, at least 2, or the per-block prologue dominates it.
-    int splits = qm_pick_splits(ntiles, K, mtiles, partials != nullptr, partials_splits);
+    int splits = wide ? qm_pick_splits_wide(ntiles, K, mtiles, partials != nullptr, partials_splits)
+                      : qm_pick_splits(ntiles, K, M, mtiles, partials != nullptr, partials_splits,
+                                       ggml_type == QMQ_Q4_K && qm_mma_k32() && qm_ws_on());
     if (splits > 1) {
         const int nsb_all = K >> 8;
         const int sb_per_split = (nsb_all + splits - 1) / splits;
@@ -1972,9 +2115,14 @@ bool launch_prefill_gemm_qi8_dense(int ggml_type, const signed char* A_i8, const
             // The atomic accumulator must start at zero; one [m][n] plane, not `splits` of them.
             if (atomic) cudaMemsetAsync(partials, 0, total * sizeof(int), stream);
             dim3 grid(splits, ntiles, mtiles);
-            QM_LAUNCH_DENSE(false, true,
-                    A_i8, sx, W, row_scale, C, M, N, K, PfQGroup{}, partials, sb_per_split, atomic,
-                    A_pack);
+            if (wide)
+                QM_LAUNCH_WIDE(false, true,
+                        A_i8, sx, W, row_scale, C, M, N, K, PfQGroup{}, partials, sb_per_split,
+                        atomic, A_pack);
+            else
+                QM_LAUNCH_DENSE(false, true,
+                        A_i8, sx, W, row_scale, C, M, N, K, PfQGroup{}, partials, sb_per_split,
+                        atomic, A_pack);
             // With the atomic accumulator every slice has already been summed, so the reduce pass
             // reads the single plane (splits=1 indexes exactly the [m][n] the atomics wrote).
             if (atomic && out_acc) { *out_acc = 1; return true; }   // consumer reads the int32
@@ -1983,18 +2131,67 @@ bool launch_prefill_gemm_qi8_dense(int ggml_type, const signed char* A_i8, const
             return true;
         }
     }
-    if (ggml_type == QMQ_Q4_K && qm_mma_k32() && M > 256 && qm_tall_on()) {
+    if (qm_tall_for(ggml_type, M) && qm_mma_k32() && qm_tall_on()) {
         const int mt2 = (M + QM_TALL_BM - 1) / QM_TALL_BM;
         const int mf2 = qm_m_fast() ? 1 : 0;
         dim3 grid = mf2 ? dim3(mt2, N / QM_TALL_BN) : dim3(N / QM_TALL_BN, mt2);
-        pf_dense_gemm_qi8_tall_kernel<QM_TALL, false><<<grid, QmTallCfg::THREADS, QmTallCfg::SMEM, stream>>>(
+        auto kern = ggml_type == QMQ_PTQ1 ? pf_dense_gemm_qi8_tall_kernel<QMQ_PTQ1, QM_TALL, false>
+                                          : pf_dense_gemm_qi8_tall_kernel<QMQ_Q4_K, QM_TALL, false>;
+        kern<<<grid, QmTallCfg::THREADS, QmTallCfg::SMEM, stream>>>(
             A_i8, sx, W, row_scale, C, M, N, K, PfQGroup{}, A_pack, mf2);
         return true;
     }
     const int mf = (mtiles > 1 && qm_m_fast()) ? 1 : 0;
     dim3 grid = mf ? dim3(mtiles, ntiles) : dim3(ntiles, mtiles);
-    QM_LAUNCH_DENSE(false, false, A_i8, sx, W, row_scale, C, M, N, K, PfQGroup{}, nullptr, 0, 0,
-                    A_pack, mf);
+    if (wide)
+        QM_LAUNCH_WIDE(false, false, A_i8, sx, W, row_scale, C, M, N, K, PfQGroup{}, nullptr, 0, 0,
+                       A_pack, mf);
+    else
+        QM_LAUNCH_DENSE(false, false, A_i8, sx, W, row_scale, C, M, N, K, PfQGroup{}, nullptr, 0,
+                        0, A_pack, mf);
+    return true;
+}
+
+bool launch_prefill_gemm_qi8_dense_resid(int ggml_type, const signed char* A_i8, const float* sx,
+                                         const void* W_q, const float* row_scale, void* X_bf16,
+                                         int M, int N, int K, cudaStream_t stream, int* partials,
+                                         int partials_splits, const signed char* A_pack) {
+    static const bool on = [] {
+        const char* e = getenv("SPARKINFER_QB_RESID_REDUCE");
+        return !(e && e[0] == '0');
+    }();
+    if (!on || !partials || !pf_dense_gemm_qi8_supported(ggml_type)) return false;
+    if (!row_scale || M <= 0 || M > qb_max_m()) return false;
+    if (K <= 0 || (K & (QM_SB - 1)) != 0 || N <= 0 || (N % QM_BND) != 0) return false;
+    const int mtiles = (M + QM_BM - 1) / QM_BM;
+    const bool wide = qm_wide_for(ggml_type, M) && (N % QM_WBN) == 0 &&
+                      (ggml_type == QMQ_PTQ1 ||
+                       qm_pick_splits_wide(N / QM_WBN, K, mtiles, true, partials_splits) == 1);
+    const int ntiles = wide ? N / QM_WBN : N / QM_BND;
+    int splits = wide ? qm_pick_splits_wide(ntiles, K, mtiles, true, partials_splits)
+                      : qm_pick_splits(ntiles, K, M, mtiles, true, partials_splits,
+                                       ggml_type == QMQ_Q4_K && qm_mma_k32() && qm_ws_on());
+    if (splits <= 1) return false;
+    const int nsb_all = K >> 8;
+    const int sb_per_split = (nsb_all + splits - 1) / splits;
+    splits = (nsb_all + sb_per_split - 1) / sb_per_split;   // every slice owns a super-block
+    if (splits <= 1) return false;
+    const int atomic = qm_atomic_acc();
+    const size_t total = (size_t)M * (size_t)N;
+    if (atomic) cudaMemsetAsync(partials, 0, total * sizeof(int), stream);
+    auto* X = reinterpret_cast<__nv_bfloat16*>(X_bf16);
+    const auto* W = reinterpret_cast<const unsigned char*>(W_q);
+    dim3 grid(splits, ntiles, mtiles);
+    if (wide)
+        QM_LAUNCH_WIDE(false, true,
+                A_i8, sx, W, row_scale, X, M, N, K, PfQGroup{}, partials, sb_per_split, atomic,
+                A_pack);
+    else
+        QM_LAUNCH_DENSE(false, true,
+                A_i8, sx, W, row_scale, X, M, N, K, PfQGroup{}, partials, sb_per_split, atomic,
+                A_pack);
+    pf_dense_splitk_reduce_resid_kernel<<<(unsigned)((total + 255) / 256), 256, 0, stream>>>(
+        partials, sx, row_scale, X, M, N, atomic ? 1 : splits);
     return true;
 }
 
@@ -2024,6 +2221,14 @@ bool launch_prefill_gemm_qi8_dense_group(int ggml_type, const signed char* A_i8,
         tiles += N[i] / QM_BND;
     }
     const int mtiles = (M + QM_BM - 1) / QM_BM;
+    bool wide = qm_wide_for(ggml_type, M);
+    for (int i = 0; i < ngroup; i++) wide = wide && (N[i] % QM_WBN) == 0;
+    if (wide && ggml_type != QMQ_PTQ1 &&
+        qm_pick_splits_wide(tiles / (QM_WBN / QM_BND), K, mtiles, partials != nullptr,
+                            partials_splits) > 1)
+        wide = false;
+    // The launch's tile count; d.first stays in 64-wide tiles, which the kernel converts.
+    const int ltiles = wide ? tiles / (QM_WBN / QM_BND) : tiles;
 
     // The grouped launch is the one the K split never reached, and at M=128 it is also the emptiest:
     // q+gate+k+v is 136 tiles of a 510-block device, a quarter of one wave for the full K. Splitting
@@ -2032,7 +2237,8 @@ bool launch_prefill_gemm_qi8_dense_group(int ggml_type, const signed char* A_i8,
     static int gsk_env = -1;
     if (gsk_env < 0) { const char* e = getenv("SPARKINFER_MUSE_GROUP_SPLITK"); gsk_env = e ? atoi(e) : 1; }
     int splits = gsk_env == 0 ? 1
-                              : qm_pick_splits(tiles, K, mtiles, partials != nullptr, partials_splits);
+               : wide ? qm_pick_splits_wide(ltiles, K, mtiles, partials != nullptr, partials_splits)
+                      : qm_pick_splits(tiles, K, M, mtiles, partials != nullptr, partials_splits);
     // The caller sizes `partials` for one projection at a time; a group needs the sum of its
     // widths, so clamp the slice count to what actually fits rather than trusting it. The atomic
     // accumulator needs one plane whatever the slice count, so there it is a yes/no test.
@@ -2057,10 +2263,15 @@ bool launch_prefill_gemm_qi8_dense_group(int ggml_type, const signed char* A_i8,
             for (int i = 0; i < ngroup; i++) { d.poff[i] = off; off += planes * M * N[i]; }
             // Every group's plane is packed back to back from `partials`, so one memset covers them.
             if (atomic) cudaMemsetAsync(partials, 0, (size_t)off * sizeof(int), stream);
-            dim3 grid(splits, tiles, mtiles);
-            QM_LAUNCH_DENSE(true, true,
-                    A_i8, sx, nullptr, nullptr, nullptr, M, 0, K, d, partials, sb_per_split, atomic,
-                    A_pack);
+            dim3 grid(splits, ltiles, mtiles);
+            if (wide)
+                QM_LAUNCH_WIDE(true, true,
+                        A_i8, sx, nullptr, nullptr, nullptr, M, 0, K, d, partials, sb_per_split,
+                        atomic, A_pack);
+            else
+                QM_LAUNCH_DENSE(true, true,
+                        A_i8, sx, nullptr, nullptr, nullptr, M, 0, K, d, partials, sb_per_split,
+                        atomic, A_pack);
             // The FFN's gate/up pair is consumed by nothing except the SwiGLU + int8 quantize that
             // follows it, so when the caller asks for that, apply the scale inside it and never
             // materialize gate/up as bf16 at all: 20.4 MB of DRAM and one launch per layer gone.
@@ -2077,19 +2288,25 @@ bool launch_prefill_gemm_qi8_dense_group(int ggml_type, const signed char* A_i8,
             return true;
         }
     }
-    if (ggml_type == QMQ_Q4_K && qm_mma_k32() && M > 256 && qm_tall_on()) {
+    if (qm_tall_for(ggml_type, M) && qm_mma_k32() && qm_tall_on()) {
         const int mt2 = (M + QM_TALL_BM - 1) / QM_TALL_BM;
         const int mf2 = qm_m_fast() ? 1 : 0;
         const int tl_tiles = tiles * (QM_BND / QM_TALL_BN);
         dim3 grid = mf2 ? dim3(mt2, tl_tiles) : dim3(tl_tiles, mt2);
-        pf_dense_gemm_qi8_tall_kernel<QM_TALL, true><<<grid, QmTallCfg::THREADS, QmTallCfg::SMEM, stream>>>(
+        auto kern = ggml_type == QMQ_PTQ1 ? pf_dense_gemm_qi8_tall_kernel<QMQ_PTQ1, QM_TALL, true>
+                                          : pf_dense_gemm_qi8_tall_kernel<QMQ_Q4_K, QM_TALL, true>;
+        kern<<<grid, QmTallCfg::THREADS, QmTallCfg::SMEM, stream>>>(
             A_i8, sx, nullptr, nullptr, nullptr, M, 0, K, d, A_pack, mf2);
         return true;
     }
     const int mf = (mtiles > 1 && qm_m_fast()) ? 1 : 0;
-    dim3 grid = mf ? dim3(mtiles, tiles) : dim3(tiles, mtiles);
-    QM_LAUNCH_DENSE(true, false, A_i8, sx, nullptr, nullptr, nullptr, M, 0, K, d, nullptr, 0, 0,
-                    A_pack, mf);
+    dim3 grid = mf ? dim3(mtiles, ltiles) : dim3(ltiles, mtiles);
+    if (wide)
+        QM_LAUNCH_WIDE(true, false, A_i8, sx, nullptr, nullptr, nullptr, M, 0, K, d, nullptr, 0,
+                       0, A_pack, mf);
+    else
+        QM_LAUNCH_DENSE(true, false, A_i8, sx, nullptr, nullptr, nullptr, M, 0, K, d, nullptr, 0,
+                        0, A_pack, mf);
     return true;
 }
 

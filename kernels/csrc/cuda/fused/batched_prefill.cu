@@ -682,7 +682,7 @@ __global__ void pf_gdn_conv_par_kernel(const __nv_bfloat16* __restrict__ qkv,
 // L2-norm reduction are unchanged, and the boundary "add w*0" equals the parallel kernel's
 // predicated skip exactly -- output is bit-identical.
 // ============================================================================
-constexpr int PF_CONV_TT = 16;                     // tokens per block
+template <int PF_CONV_TT>                          // tokens per block
 __global__ void pf_gdn_conv_tile_kernel(const __nv_bfloat16* __restrict__ qkv,
                                         const __nv_bfloat16* __restrict__ conv_w,
                                         __nv_bfloat16* __restrict__ conv_state,
@@ -1935,9 +1935,19 @@ void launch_prefill_gdn_conv(const void* qkv, const void* conv_w, void* conv_sta
         const char* e = getenv("SPARKINFER_PREFILL_GDN_CONV_TILE");
         return (e && e[0] == '0') ? 0 : 1;
     }();
+    // Eight tokens per block, not sixteen: each block walks its tokens one after another (three
+    // barriers per token for the q/k L2 norm), so at prefill's short prompts the walk, not the
+    // 1.1x window re-read, is what the kernel waits on. Every token's taps, SiLU and norm are
+    // unchanged, so the output is too. Measured prefill pp at 128 and 512: +0.4% each.
+    // SPARKINFER_PREFILL_GDN_CONV_TT=16 restores sixteen (A/B).
+    static const int conv_tt = [] {
+        const char* e = getenv("SPARKINFER_PREFILL_GDN_CONV_TT");
+        return (e && atoi(e) == 16) ? 16 : 8;
+    }();
     if (!seq && tile && conv_kernel <= 8) {
-        dim3 grid((n_tokens + PF_CONV_TT - 1) / PF_CONV_TT, blocks);
-        pf_gdn_conv_tile_kernel<<<grid, head_dim, 0, stream>>>(
+        auto conv = conv_tt == 16 ? pf_gdn_conv_tile_kernel<16> : pf_gdn_conv_tile_kernel<8>;
+        dim3 grid((n_tokens + conv_tt - 1) / conv_tt, blocks);
+        conv<<<grid, head_dim, 0, stream>>>(
             reinterpret_cast<const __nv_bfloat16*>(qkv), reinterpret_cast<const __nv_bfloat16*>(conv_w),
             reinterpret_cast<__nv_bfloat16*>(conv_state), reinterpret_cast<__nv_bfloat16*>(q),
             reinterpret_cast<__nv_bfloat16*>(k), reinterpret_cast<__nv_bfloat16*>(v),

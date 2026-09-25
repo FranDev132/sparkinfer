@@ -842,6 +842,9 @@ struct Qwen35Model::Impl {
     // tensors -- 0.21875 bytes/weight against Q4_K's 0.5625 -- is what a single-row decode step
     // reads. Empty when off; forward_token then reads s.w.layers as before.
     std::vector<Qwen35LayerWeights> bonsai_dec_layers;
+    // Per-row scales of the shadow's ternary legs (n_layers entries, launch_ptq1_rows_i8's scale),
+    // so batched prefill can read them through the fused GEMM's PTQ1 arm. Empty when not computed.
+    std::vector<BonsaiShadowRs> bonsai_dec_rs;
     const void* bonsai_dec_head = nullptr;
     // Its allocations, held here rather than in `owned` because it is releasable: the copy is
     // ~5.5 GB, and concurrent requests need that VRAM more (each carries ~151 MB of GDN state).
@@ -3828,8 +3831,21 @@ int Qwen35Model::prefill_batched(const int* prompt_ids, int n, bool want_seed_lo
                           s.d_vision_emb, s.d_vision_pos, s.vision_n,
                           // MRoPE rotary positions, null unless set_pending_mrope ran for this prompt.
                           s.d_mrope_pos };
-    // The Bonsai decode shadow's VRAM is decode-only -- this pass reads the folded Q4_K weights
-    // either way -- so on a scratch-alloc failure it is pure margin to give back and retry once.
+    // The shadow's ternary legs for batched prefill, while it holds them (see prefill_batched_run).
+    if (!s.bonsai_dec_layers.empty() && s.bonsai_dec_rs.size() == s.bonsai_dec_layers.size()) {
+        ctx.bonsai_pf_layers = s.bonsai_dec_layers.data();
+        ctx.bonsai_pf_rs = s.bonsai_dec_rs.data();
+        const auto so = s.bonsai_sign_dev.find(s.qdim);
+        if (so != s.bonsai_sign_dev.end()) ctx.bonsai_sign_out = so->second;
+        if (s.bonsai_ffn_q && s.bonsai_ffn_qd && s.bonsai_ffn_qs) {
+            ctx.bonsai_dec_head = s.bonsai_dec_head;
+            ctx.bonsai_hq = s.bonsai_ffn_q;
+            ctx.bonsai_hqd = s.bonsai_ffn_qd;
+            ctx.bonsai_hqs = s.bonsai_ffn_qs;
+        }
+    }
+    // This pass reads the Bonsai decode shadow where it has it and the folded weights otherwise,
+    // so on a scratch-alloc failure the shadow's VRAM is margin to give back and retry once.
     // #1154 was rejected for exactly the failure this skips: at a long --ctx the KV pool leaves
     // too little room for prefill's own arena once the shadow is also resident, every batched
     // prefill falls back to the ~30x-slower token loop, and nothing ever recovered because
@@ -3839,6 +3855,9 @@ int Qwen35Model::prefill_batched(const int* prompt_ids, int n, bool want_seed_lo
     int seed = prefill_batched_run(ctx, prompt_ids, n, pos0);
     if (seed < 0 && scratch_oom && release_bonsai_shadow(s)) {
         scratch_oom = false;
+        ctx.bonsai_pf_layers = nullptr;   // freed with the shadow: the retry reads the folded legs
+        ctx.bonsai_pf_rs = nullptr;
+        ctx.bonsai_dec_head = nullptr;
         seed = prefill_batched_run(ctx, prompt_ids, n, pos0);
     }
     // Consume it. This is PER-REQUEST state, not model state: leaving it set would splice the
@@ -7832,6 +7851,60 @@ bool Qwen35Model::load_gguf(const std::string& path) {
         }
         fprintf(stderr, "[bonsai] decode shadow: %d projections, %d/%d FFNs, head %s\n",
                 n_proj, n_ffn, c.n_layers, s.bonsai_dec_head ? "yes" : "no");
+        // Row scales for the shadow's ternary legs, the one piece the fused prefill GEMM needs
+        // beyond the blocks themselves: the scale launch_ptq1_rows_i8 computes, as place_t does
+        // for gate/up. 6.7 MB on this checkpoint; a 64 MB int8 scratch is borrowed to compute it.
+        // Only the legs the shadow swapped in: gate/up are the same ternary tensors either way.
+        if (n_ffn == c.n_layers) {
+            const long H = c.hidden, F = c.moe_ffn;
+            s.bonsai_dec_rs.assign(c.n_layers, BonsaiShadowRs{});
+            struct Leg { const void* w; long rows, k; const float** rs; };
+            std::vector<Leg> legs;
+            long total = 0;
+            for (int L = 0; L < c.n_layers; ++L) {
+                const auto& d = s.bonsai_dec_layers[L];
+                const auto& f = s.w.layers[L];
+                BonsaiShadowRs& r = s.bonsai_dec_rs[L];
+                auto leg = [&](const void* p, int t, const void* folded, long rows, long k,
+                               const float** rs) {
+                    if (!p || p == folded || t != kPtq1GgmlType || rows <= 0 ||
+                        k <= 0 || k % kPtq1BlockElems) return;
+                    legs.push_back({p, rows, k, rs});
+                    total += rows;
+                };
+                leg(d.wq, d.wq_type, f.wq, (d.q_has_gate ? 2L : 1L) * s.qdim, H, &r.wq);
+                leg(d.wk, d.wk_type, f.wk, s.kvdim, H, &r.wk);
+                leg(d.wv, d.wv_type, f.wv, s.kvdim, H, &r.wv);
+                leg(d.wo, d.wo_type, f.wo, H, s.qdim, &r.wo);
+                leg(d.ssm_out, d.ssm_out_type, f.ssm_out, H, s.linear_vdim, &r.ssm_out);
+                leg(d.down_q, d.down_qtype, f.down_q, H, F, &r.down);
+                leg(d.wqkv, d.wqkv_type, f.wqkv, s.linear_qkvdim, H, &r.wqkv);
+                leg(d.wqkv_gate, d.wqkv_gate_type, f.wqkv_gate, s.linear_vdim, H, &r.wqkv_gate);
+            }
+            float* rs_buf = nullptr;
+            signed char* tmp = nullptr;
+            const size_t tmp_bytes = 64u << 20;
+            bool ok = total > 0 &&
+                      cudaMalloc(&rs_buf, (size_t)total * sizeof(float)) == cudaSuccess;
+            if (ok) s.owned.push_back(rs_buf);
+            ok = ok && cudaMalloc(&tmp, tmp_bytes) == cudaSuccess;
+            long off = 0;
+            for (const Leg& g : legs) {
+                const size_t row_bytes = (size_t)(g.k / kPtq1BlockElems) * kPtq1BlockBytes;
+                const long chunk = (long)(tmp_bytes / (size_t)g.k);
+                for (long r0 = 0; ok && r0 < g.rows; r0 += chunk) {
+                    const long nr = std::min(chunk, g.rows - r0);
+                    ok = kernels::launch_ptq1_rows_i8(
+                        static_cast<const char*>(g.w) + (size_t)r0 * row_bytes, tmp,
+                        rs_buf + off + r0, (int)nr, (int)g.k, s.stream);
+                }
+                *g.rs = rs_buf + off;
+                off += g.rows;
+            }
+            if (ok) ok = cudaStreamSynchronize(s.stream) == cudaSuccess;
+            if (tmp) cudaFree(tmp);
+            if (!ok) s.bonsai_dec_rs.clear();   // rs_buf stays owned, freed at teardown
+        }
     }
     // decode scratch (mf_* / fa_*) is allocated in the constructor for all paths.
     return true;

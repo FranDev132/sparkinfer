@@ -747,11 +747,15 @@ ptq1_rows_i8_kernel(const unsigned char* __restrict__ w, signed char* __restrict
 // whole row to int8 with one scale -- d = amax/127, q = round(v/d), the per-row quantizer's rule
 // -- writing the row-major copy and, when asked, the k-tiled [k/32][row][32] copy the fused GEMM
 // stages from. One CTA per row; the row stays in registers between the two passes.
-template <int NS>
+// SWIGLU: x is the gate and u the up projection; the row rotated is SwiGLU's output rounded to
+// bf16 exactly as launch_prefill_swiglu_quant_i8 forms it, bf16(g / (1 + exp(-g)) * u), which is
+// also what the decode shadow's down reads (launch_ptq1_swiglu_rotq_bf16).
+template <int NS, bool SWIGLU = false>
 __global__ void __launch_bounds__(256)
 ptq1_rotq_rows_i8_kernel(const __nv_bfloat16* __restrict__ x, const signed char* __restrict__ sign,
                          signed char* __restrict__ q, float* __restrict__ scale,
-                         signed char* __restrict__ qp, int rows, int k) {
+                         signed char* __restrict__ qp, int rows, int k,
+                         const __nv_bfloat16* __restrict__ u = nullptr) {
     __shared__ float sh[kSpan];
     __shared__ float sred[8];
     const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
@@ -763,7 +767,19 @@ ptq1_rotq_rows_i8_kernel(const __nv_bfloat16* __restrict__ x, const signed char*
     for (int sp = 0; sp < NS; ++sp) {
         if (sp < ns) {
             const int e0 = sp * kSpan + t * 4;
-            const uint2 raw = *reinterpret_cast<const uint2*>(x + (size_t)row * k + e0);
+            uint2 raw = *reinterpret_cast<const uint2*>(x + (size_t)row * k + e0);
+            if constexpr (SWIGLU) {
+                const uint2 ur = *reinterpret_cast<const uint2*>(u + (size_t)row * k + e0);
+                const __nv_bfloat16* gh = reinterpret_cast<const __nv_bfloat16*>(&raw);
+                const __nv_bfloat16* uh = reinterpret_cast<const __nv_bfloat16*>(&ur);
+                __nv_bfloat16 o[4];
+#pragma unroll
+                for (int j = 0; j < 4; j++) {
+                    const float g = __bfloat162float(gh[j]);
+                    o[j] = __float2bfloat16(g / (1.f + __expf(-g)) * __bfloat162float(uh[j]));
+                }
+                raw = *reinterpret_cast<const uint2*>(o);
+            }
             const __nv_bfloat162 a = *reinterpret_cast<const __nv_bfloat162*>(&raw.x);
             const __nv_bfloat162 b = *reinterpret_cast<const __nv_bfloat162*>(&raw.y);
             const char4 sg = *reinterpret_cast<const char4*>(sign + e0);
@@ -916,6 +932,19 @@ bool launch_ptq1_rows_i8(const void* w_ptq1, signed char* q, float* scale, int r
     }
     ptq1_rows_i8_kernel<WPC><<<(rows + WPC - 1) / WPC, WPC * 32, shm, st>>>(
         static_cast<const unsigned char*>(w_ptq1), q, scale, rows, k / kBlk);
+    return true;
+}
+
+bool launch_ptq1_swiglu_rotq_rows_i8(const void* gate_bf16, const void* up_bf16,
+                                     const signed char* sign, signed char* q, float* scale,
+                                     signed char* qp, int rows, int k, int block, cudaStream_t st) {
+    if (rows <= 0 || block != kSpan || k % kSpan != 0 || k > 17 * kSpan) return false;
+    const auto* g = static_cast<const __nv_bfloat16*>(gate_bf16);
+    const auto* u = static_cast<const __nv_bfloat16*>(up_bf16);
+    if (k <= 8 * kSpan)
+        ptq1_rotq_rows_i8_kernel<8, true><<<rows, 256, 0, st>>>(g, sign, q, scale, qp, rows, k, u);
+    else
+        ptq1_rotq_rows_i8_kernel<17, true><<<rows, 256, 0, st>>>(g, sign, q, scale, qp, rows, k, u);
     return true;
 }
 
