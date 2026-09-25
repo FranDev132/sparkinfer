@@ -5571,14 +5571,42 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
             const Qwen35LayerWeights* dw =
                 (packed && s.bonsai_dec_layers && N <= kCbShadowMaxRows) ? &s.bonsai_dec_layers[L]
                                                                           : nullptr;
+            // From two rows, the same legs on the int8 tensor cores: hn rotated and quantized per
+            // row, gate and up in one launch that decodes each weight block once for every row,
+            // SwiGLU folded into the FFN-width rotation, then down with k split across CTAs (its
+            // 5120 rows are only 40 of them). The whole leg is 50-52 us per layer at 2-8 rows
+            // against the dp4a GEMMs' 61-109, and a row's result does not depend on how many rows
+            // share the step. One row keeps the dp4a path, bit-identical to single-row decode.
+            // SPARKINFER_BONSAI_CB_SHADOW_TC=0 keeps the dp4a GEMMs below.
+            static const bool cb_shadow_tc = [] {
+                const char* e = getenv("SPARKINFER_BONSAI_CB_SHADOW_TC");
+                return !(e && e[0] == '0');
+            }();
+            const bool shadow_tc =
+                cb_shadow_tc && dw && N > 1 && topk == 1 && bt_q && s.bonsai_sign_hidden &&
+                s.bonsai_sign_ffn && dw->gate_qtype == kPtq1GgmlType &&
+                dw->up_qtype == kPtq1GgmlType && dw->down_qtype == kPtq1GgmlType &&
+                kernels::launch_ptq1_rotq_bf16(
+                    hn, static_cast<const signed char*>(s.bonsai_sign_hidden), bt_q, bt_qd, bt_qs,
+                    N, H, s.bonsai_block, st) &&
+                kernels::launch_gemm_ptq1_i8_rows_bf16(bt_q, bt_qd, bt_qs, dw->gate_q, dw->up_q,
+                                                       sg, su, N, ffn, H, st) &&
+                kernels::launch_ptq1_swiglu_rotq_bf16(
+                    sg, su, static_cast<const signed char*>(s.bonsai_sign_ffn), bt_q, bt_qd, bt_qs,
+                    N, ffn, s.bonsai_block, st) &&
+                kernels::launch_gemm_ptq1_i8_rows_bf16(bt_q, bt_qd, bt_qs, dw->down_q, nullptr,
+                                                       routed, nullptr, N, H, ffn, st, bt_part,
+                                                       bt_part_cap);
             int shadow_hq = -1;
-            if (dw && topk == 1 && bonsai_rot_n && s.bonsai_sign_hidden && s.bonsai_sign_ffn &&
-                dw->gate_qtype == kPtq1GgmlType && dw->up_qtype == kPtq1GgmlType &&
-                dw->down_qtype == kPtq1GgmlType)
+            if (!shadow_tc && dw && topk == 1 && bonsai_rot_n && s.bonsai_sign_hidden &&
+                s.bonsai_sign_ffn && dw->gate_qtype == kPtq1GgmlType &&
+                dw->up_qtype == kPtq1GgmlType && dw->down_qtype == kPtq1GgmlType)
                 shadow_hq = kernels::launch_ptq1_rotate_quant_rows(
                     hn, bonsai_rot_n, static_cast<const signed char*>(s.bonsai_sign_hidden), H, N,
                     s.bonsai_block, st);
-            if (shadow_hq >= 0) {
+            if (shadow_tc) {
+                // routed already holds the FFN output.
+            } else if (shadow_hq >= 0) {
                 // The rotation buffer now holds hn's rotation, not the layer body's staging.
                 bonsai_rot_src = nullptr;
                 bonsai_rot_k = 0;
