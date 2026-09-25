@@ -56,7 +56,7 @@ namespace kernels {
 
 namespace {
 
-enum { QMQ_Q4_K = 12, QMQ_Q5_K = 13, QMQ_Q6_K = 14 };
+enum { QMQ_Q4_K = 12, QMQ_Q5_K = 13, QMQ_Q6_K = 14, QMQ_PTQ1 = 143 };
 
 constexpr int PF_QGROUP_MAX = 4;   // projections fusable into one grouped launch
 // Block-slot budget the split-K fan-out aims at: ~3 passes over a 5090's 170 SMs x 3 blocks/SM.
@@ -86,7 +86,8 @@ constexpr int QM_BND = 64;
 
 template <int QT>
 __device__ __forceinline__ constexpr int qm_bs() {
-    return (QT == QMQ_Q4_K) ? 144 : (QT == QMQ_Q5_K) ? 176 : 210;
+    // PTQ1_0: two 28-byte ternary blocks make one 256-value stage.
+    return (QT == QMQ_PTQ1) ? 56 : (QT == QMQ_Q4_K) ? 144 : (QT == QMQ_Q5_K) ? 176 : 210;
 }
 
 __device__ __forceinline__ float qm_h2f(const unsigned char* p) {
@@ -334,7 +335,60 @@ template <int QT>
 struct QmStage {
     const unsigned char* blk;      // Q5_K / Q6_K: decoded straight from global, as before
     uint4 hdr, q0, q1;             // Q4_K: the header and this thread's 32 quant bytes
+    unsigned tw[4];                // PTQ1_0: words 2h, 2h+1, 4+h and 6 of this thread's block
 };
+
+// ---- PTQ1_0 (Ternary-Bonsai-2's stored ternary blocks) --------------------------------------
+// A stage is two 28-byte blocks; thread j64 takes block j64>>1 and half h = j64&1 of it: carrier
+// words 2h and 2h+1 (trits m*16 + 8h + 0..7 for m = 0..4), word 4+h (trits 80 + 8m + 4h + 0..3)
+// and one pair of the four-trit carriers (trits 120 + 4h + 0..3). Sixteen groups of four
+// consecutive trits either way, so the two halves run the same code.
+//
+// The int8 a trit becomes is t * round(s_b / row_scale), s_b the block's fp16 scale -- what
+// launch_ptq1_rows_i8 writes for the materialize path, from the same expression, so the two agree
+// byte for byte. The three possible values sit in one register and the trit digits (0..2) select
+// among them with byte_perm.
+__device__ __forceinline__ unsigned qm_t_lut(unsigned w6, float inv) {
+    const float sb = __half2float(__ushort_as_half((unsigned short)(w6 >> 16)));
+    int mq = (int)roundf(sb * inv);
+    mq = mq > 127 ? 127 : (mq < -127 ? -127 : mq);
+    return ((unsigned)(-mq) & 0xFFu) | (((unsigned)mq & 0xFFu) << 16);
+}
+// Four digits packed one per byte -> the four int8 values, via the lut above.
+__device__ __forceinline__ unsigned qm_t_sel(unsigned lut, unsigned dg) {
+    const unsigned w = dg | (dg >> 4);
+    return __byte_perm(lut, 0u, __byte_perm(w, 0u, 0x4420u));
+}
+// Word w -> five groups, digits for 3^0..3^4, each already mapped through the lut.
+__device__ __forceinline__ void qm_t_word5(unsigned w, unsigned lut, unsigned (&o)[5]) {
+    unsigned ql = w & 0x00FF00FFu, qh = (w >> 8) & 0x00FF00FFu;
+#pragma unroll
+    for (int m = 0; m < 5; ++m) {
+        const unsigned ul = ql * 3u, uh = qh * 3u;
+        o[m] = qm_t_sel(lut, __byte_perm(ul, uh, 0x7351));
+        ql = ul & 0x00FF00FFu;
+        qh = uh & 0x00FF00FFu;
+    }
+}
+// One half-block into dst (the block's 128-value row segment).
+__device__ __forceinline__ void qm_t_half(const unsigned (&tw)[4], int h, float inv,
+                                          signed char* __restrict__ dst) {
+    const unsigned lut = qm_t_lut(tw[3], inv);
+    unsigned a[5], b[5], c[5];
+    qm_t_word5(tw[0], lut, a);
+    qm_t_word5(tw[1], lut, b);
+    qm_t_word5(tw[2], lut, c);
+#pragma unroll
+    for (int m = 0; m < 5; ++m) {
+        *reinterpret_cast<uint2*>(dst + m * 16 + 8 * h) = make_uint2(a[m], b[m]);
+        *reinterpret_cast<unsigned*>(dst + 80 + 8 * m + 4 * h) = c[m];
+    }
+    const unsigned x = (tw[3] & 0xFFu) | ((tw[3] & 0xFF00u) << 8);
+    const unsigned u0 = x * 3u, u1 = (u0 & 0x00FF00FFu) * 3u;
+    const unsigned u2 = (u1 & 0x00FF00FFu) * 3u, u3 = (u2 & 0x00FF00FFu) * 3u;
+    const unsigned dg = h ? __byte_perm(u2, u3, 0x7531) : __byte_perm(u0, u1, 0x7531);
+    *reinterpret_cast<unsigned*>(dst + 120 + 4 * h) = qm_t_sel(lut, dg);
+}
 
 template <int QT>
 __device__ __forceinline__ void qm_stage_fetch(const unsigned char* __restrict__ blk, int j64,
@@ -350,6 +404,13 @@ __device__ __forceinline__ void qm_stage_fetch(const unsigned char* __restrict__
         const unsigned char* qb = blk + 16 + j64 * 32;
         s.q0 = __ldcs(reinterpret_cast<const uint4*>(qb));
         s.q1 = __ldcs(reinterpret_cast<const uint4*>(qb + 16));
+    } else if constexpr (QT == QMQ_PTQ1) {
+        const unsigned* bw = reinterpret_cast<const unsigned*>(blk + (j64 >> 1) * 28);
+        const int h = j64 & 1;
+        s.tw[0] = __ldcs(bw + 2 * h);
+        s.tw[1] = __ldcs(bw + 2 * h + 1);
+        s.tw[2] = __ldcs(bw + 4 + h);
+        s.tw[3] = __ldcs(bw + 6);
     } else {
         s.blk = blk;
     }
@@ -387,6 +448,8 @@ __device__ __forceinline__ void qm_stage_decode(const QmStage<QT>& s, int j64, f
             *reinterpret_cast<uint4*>(dst + j64 * 64 + c * 16) = vlo;
             *reinterpret_cast<uint4*>(dst + j64 * 64 + 32 + c * 16) = vhi;
         }
+    } else if constexpr (QT == QMQ_PTQ1) {
+        qm_t_half(s.tw, j64 & 1, inv, dst + (j64 >> 1) * 128);
     } else {
         qm_decode_j64<QT>(s.blk, j64, inv, dst);
     }
@@ -1132,7 +1195,8 @@ bool pfm_moe_gemm_qi8_supported(int ggml_type) {
 // This GGUF gives 26 of its 52 layers a Q6_K attn_v, and those were the layers whose v fell out
 // of the fused path into a full materialize round trip (measured: 0.47 ms of a 30.4 ms prefill).
 bool pf_dense_gemm_qi8_supported(int ggml_type) {
-    return ggml_type == QMQ_Q4_K || ggml_type == QMQ_Q5_K || ggml_type == QMQ_Q6_K;
+    return ggml_type == QMQ_Q4_K || ggml_type == QMQ_Q5_K || ggml_type == QMQ_Q6_K ||
+           ggml_type == QMQ_PTQ1;
 }
 
 // Decoding Q4_K inside the GEMM skips the int8 materialize (dequant -> W_i8 -> reload), which is
@@ -1330,6 +1394,7 @@ static int qm_pick_splits(int ntiles, int K, int mtiles, bool have_partials, int
     do {                                                                                           \
         if (ggml_type == QMQ_Q4_K)      QM_LAUNCH_ONE(QMQ_Q4_K, GRP, SPL, __VA_ARGS__);            \
         else if (ggml_type == QMQ_Q5_K) QM_LAUNCH_ONE(QMQ_Q5_K, GRP, SPL, __VA_ARGS__);            \
+        else if (ggml_type == QMQ_PTQ1) QM_LAUNCH_ONE(QMQ_PTQ1, GRP, SPL, __VA_ARGS__);            \
         else                            QM_LAUNCH_ONE(QMQ_Q6_K, GRP, SPL, __VA_ARGS__);            \
     } while (0)
 

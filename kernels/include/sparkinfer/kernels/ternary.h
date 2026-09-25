@@ -81,4 +81,45 @@ void launch_embedding_ptq1_unrotate(const int* tokens, const void* table_ptq1,
                                     const signed char* sign, void* out_bf16,
                                     int n_tokens, int k, int block, cudaStream_t stream);
 
+// ---- int8-activation arm ----------------------------------------------------------------------
+// The activation is taken into the weights' basis and quantized in one pass: signs, a
+// `block`-point Hadamard (1024 is the only span supported), then int8 with one float scale and
+// one integer sum per 128 values -- the weight block's own granularity, so each block's dot
+// product is exact in int32. q is [rows, k] int8, qd/qs are [rows, k/128]. Returns false for a
+// shape it does not cover.
+bool launch_ptq1_rotq_bf16(const void* x_bf16, const signed char* sign, signed char* q,
+                           float* qd, int* qs, int rows, int k, int block, cudaStream_t stream);
+// The same applied to bf16(silu(gate) * up), the value launch_prefill_swiglu would write: the
+// down projection's activation straight from gate and up.
+bool launch_ptq1_swiglu_rotq_bf16(const void* gate_bf16, const void* up_bf16,
+                                  const signed char* sign, signed char* q, float* qd, int* qs,
+                                  int rows, int k, int block, cudaStream_t stream);
+
+// y[n] = sum_k W[n,k] * x[k] with x given as launch_ptq1_rotq_*'s output (one row). w1/y1 run a
+// second matrix of the same shape against the same activation in the same launch (gate and up);
+// pass nullptr for one matrix.
+bool launch_gemv_ptq1_i8_bf16(const signed char* xq, const float* xd, const int* xs,
+                              const void* w0, const void* w1, void* y0_bf16, void* y1_bf16,
+                              int n_rows, int k, cudaStream_t stream);
+// The same for m activation rows (rotq output for m rows), y[m, n_rows] row-major. One row takes
+// the GEMV above; up to 32 at a time take an int8 tensor-core kernel that decodes each weight
+// block once for all of them. part (optional, part_cap floats): scratch for splitting k across
+// CTAs when the matrix alone cannot fill the device (the down projection); results are then
+// summed in split order by a second kernel.
+bool launch_gemm_ptq1_i8_rows_bf16(const signed char* xq, const float* xd, const int* xs,
+                                   const void* w0, const void* w1, void* y0_bf16, void* y1_bf16,
+                                   int m, int n_rows, int k, cudaStream_t stream,
+                                   float* part = nullptr, size_t part_cap = 0);
+
+// Prefill's int8 GEMM operands. launch_ptq1_rows_i8: weight rows [rows, k] -> int8 in the STORED
+// (rotated) basis, t * round(s_b / scale), scale = max_b |s_b| / 127 per row -- the bytes the
+// fused GEMM's PTQ1 arm decodes to. launch_ptq1_rotq_rows_i8: bf16 activation rows -> rotated,
+// then int8 with one scale per row (d = amax/127), plus the k-tiled copy when qp is non-null.
+// Only for a weight read against an activation that went through the second.
+bool launch_ptq1_rows_i8(const void* w_ptq1, signed char* q, float* scale, int rows, int k,
+                         cudaStream_t stream);
+bool launch_ptq1_rotq_rows_i8(const void* x_bf16, const signed char* sign, signed char* q,
+                              float* scale, signed char* qp, int rows, int k, int block,
+                              cudaStream_t stream);
+
 }}  // namespace sparkinfer::kernels
