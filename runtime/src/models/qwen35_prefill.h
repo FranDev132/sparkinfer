@@ -121,9 +121,13 @@ struct Qwen35PrefillCtx {
     // The packed rows' recurrent state is the compacted bf16 form (see Qwen35Model::decode_packed).
     bool                 packed_state_b16 = false;
     // The Bonsai decode shadow's layers (n_layers entries), or null. A packed step reads its FFN
-    // from their ternary legs through the dp4a arithmetic single-row decode runs on them, so every
-    // row decodes bit-identically batched or alone; everything else still comes from `w`.
+    // and its attention q/k/v and output projections from their ternary legs through the
+    // arithmetic single-row decode runs on them, so every row decodes bit-identically batched or
+    // alone; everything else still comes from `w`.
     const Qwen35LayerWeights* bonsai_dec_layers = nullptr;
+    // int8[qdim] on device, or null: the sign vector attn_output reads at, and ssm_out too when
+    // the GDN value width is the same.
+    const void* bonsai_sign_out = nullptr;
 
     // PACKED PROMPT PREFILL. multi_n > 0 turns the pass's N rows from ONE prompt into multi_n
     // FRESH prompts laid end to end: prompt i is rows [multi_off[i], multi_off[i] + multi_len[i])

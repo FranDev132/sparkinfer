@@ -1,6 +1,6 @@
 // PTQ1_0 ternary weights against an int8 activation: the kernels that let Ternary-Bonsai-2 read
 // its FFN in the stored 1.75-bit blocks -- gate/up on every path, and the decode shadow's down in
-// the packed batch.
+// the packed batch -- and the decode shadow's attention and output projections.
 //
 //   decode      ptq1_rotq_kernel takes the activation into the weights' basis (sign flip, then a
 //               1024-point Hadamard) and quantizes it to int8 in the same pass, one scale per 128
@@ -41,12 +41,19 @@ __device__ __forceinline__ void ld4_bf16(const __nv_bfloat16* p, float v[4]) {
     v[0] = __low2float(a); v[1] = __high2float(a); v[2] = __low2float(b); v[3] = __high2float(b);
 }
 
-// SWIGLU: x is the gate and u the up projection, and the value rotated is SwiGLU's output
-// rounded to bf16 exactly as launch_prefill_swiglu writes it (bf16(g / (1 + exp(-g)) * u), both
-// translation units fast-math), so the result equals that kernel followed by this one.
-template <bool SWIGLU>
+// What is rotated, each rounded to bf16 exactly as the kernel it replaces writes it (every
+// translation unit involved is fast-math), so the result equals that kernel followed by this one:
+//   kRotPlain   x itself.
+//   kRotSwiglu  x the gate, u the up projection: launch_prefill_swiglu's bf16(g/(1+exp(-g)) * u).
+//   kRotGnorm   x the GDN output, u its z gate: the gated RMSNorm of one 128-wide v head per warp,
+//               bf16(x * rsqrt(mean(x^2) + eps) * nw * silu(z)), the square sum formed in
+//               gated_norm_warp_kernel's lane order so the norm is that kernel's to the bit.
+//   kRotGate    x the attention output, u its gate: launch_qwen36_mul_sigmoid's bf16(x*sigmoid(u)).
+enum : int { kRotPlain = 0, kRotSwiglu = 1, kRotGnorm = 2, kRotGate = 3 };
+template <int MODE>
 __global__ void __launch_bounds__(256)
 ptq1_rotq_kernel(const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* __restrict__ u,
+                 const __nv_bfloat16* __restrict__ nw, float eps,
                  const signed char* __restrict__ sign, signed char* __restrict__ q,
                  float* __restrict__ qd, int* __restrict__ qs, int k) {
     __shared__ float sh[kSpan];
@@ -56,12 +63,36 @@ ptq1_rotq_kernel(const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* __res
     const size_t off = (size_t)row * k + e0;
     float v[4];
     ld4_bf16(x + off, v);
-    if (SWIGLU) {
+    if (MODE == kRotSwiglu) {
         float w[4];
         ld4_bf16(u + off, w);
 #pragma unroll
         for (int i = 0; i < 4; ++i)
             v[i] = __bfloat162float(__float2bfloat16(v[i] / (1.f + __expf(-v[i])) * w[i]));
+    } else if (MODE == kRotGate) {
+        float g[4];
+        ld4_bf16(u + off, g);
+#pragma unroll
+        for (int i = 0; i < 4; ++i)
+            v[i] = __bfloat162float(__float2bfloat16(v[i] * (1.f / (1.f + __expf(-g[i])))));
+    } else if (MODE == kRotGnorm) {
+        const __nv_bfloat16* hx = x + (off - (size_t)lane * 4);   // this warp's head
+        float ss = 0.f;
+#pragma unroll
+        for (int r = 0; r < kBlk / 32; ++r) {
+            const float xr = __bfloat162float(hx[lane + 32 * r]);
+            ss += xr * xr;
+        }
+#pragma unroll
+        for (int m = 16; m > 0; m >>= 1) ss += __shfl_xor_sync(0xffffffffu, ss, m);
+        const float inv = rsqrtf(ss / kBlk + eps);
+        float z[4], w[4];
+        ld4_bf16(u + off, z);
+        ld4_bf16(nw + lane * 4, w);
+#pragma unroll
+        for (int i = 0; i < 4; ++i)
+            v[i] = __bfloat162float(
+                __float2bfloat16(v[i] * inv * w[i] * (z[i] / (1.f + __expf(-z[i])))));
     }
     const char4 sg = *reinterpret_cast<const char4*>(sign + e0);
     v[0] *= (float)sg.x; v[1] *= (float)sg.y; v[2] *= (float)sg.z; v[3] *= (float)sg.w;
@@ -804,8 +835,8 @@ ptq1_rotq_rows_i8_kernel(const __nv_bfloat16* __restrict__ x, const signed char*
 bool launch_ptq1_rotq_bf16(const void* x_bf16, const signed char* sign, signed char* q,
                            float* qd, int* qs, int rows, int k, int block, cudaStream_t st) {
     if (rows <= 0 || block != kSpan || k % kSpan != 0) return false;
-    ptq1_rotq_kernel<false><<<dim3((unsigned)(k / kSpan), (unsigned)rows), 256, 0, st>>>(
-        static_cast<const __nv_bfloat16*>(x_bf16), nullptr, sign, q, qd, qs, k);
+    ptq1_rotq_kernel<kRotPlain><<<dim3((unsigned)(k / kSpan), (unsigned)rows), 256, 0, st>>>(
+        static_cast<const __nv_bfloat16*>(x_bf16), nullptr, nullptr, 0.f, sign, q, qd, qs, k);
     return true;
 }
 
@@ -813,9 +844,30 @@ bool launch_ptq1_swiglu_rotq_bf16(const void* gate_bf16, const void* up_bf16,
                                   const signed char* sign, signed char* q, float* qd, int* qs,
                                   int rows, int k, int block, cudaStream_t st) {
     if (rows <= 0 || block != kSpan || k % kSpan != 0) return false;
-    ptq1_rotq_kernel<true><<<dim3((unsigned)(k / kSpan), (unsigned)rows), 256, 0, st>>>(
+    ptq1_rotq_kernel<kRotSwiglu><<<dim3((unsigned)(k / kSpan), (unsigned)rows), 256, 0, st>>>(
         static_cast<const __nv_bfloat16*>(gate_bf16), static_cast<const __nv_bfloat16*>(up_bf16),
-        sign, q, qd, qs, k);
+        nullptr, 0.f, sign, q, qd, qs, k);
+    return true;
+}
+
+bool launch_ptq1_gnorm_rotq_bf16(const void* x_bf16, const void* z_bf16, const void* norm_bf16,
+                                 float eps, const signed char* sign, signed char* q, float* qd,
+                                 int* qs, int rows, int k, int head_dim, int block,
+                                 cudaStream_t st) {
+    if (rows <= 0 || block != kSpan || k % kSpan != 0 || head_dim != kBlk) return false;
+    ptq1_rotq_kernel<kRotGnorm><<<dim3((unsigned)(k / kSpan), (unsigned)rows), 256, 0, st>>>(
+        static_cast<const __nv_bfloat16*>(x_bf16), static_cast<const __nv_bfloat16*>(z_bf16),
+        static_cast<const __nv_bfloat16*>(norm_bf16), eps, sign, q, qd, qs, k);
+    return true;
+}
+
+bool launch_ptq1_gate_rotq_bf16(const void* x_bf16, const void* gate_bf16,
+                                const signed char* sign, signed char* q, float* qd, int* qs,
+                                int rows, int k, int block, cudaStream_t st) {
+    if (rows <= 0 || block != kSpan || k % kSpan != 0) return false;
+    ptq1_rotq_kernel<kRotGate><<<dim3((unsigned)(k / kSpan), (unsigned)rows), 256, 0, st>>>(
+        static_cast<const __nv_bfloat16*>(x_bf16), static_cast<const __nv_bfloat16*>(gate_bf16),
+        nullptr, 0.f, sign, q, qd, qs, k);
     return true;
 }
 

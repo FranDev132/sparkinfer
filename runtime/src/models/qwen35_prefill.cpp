@@ -4872,6 +4872,19 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
         vdbg_snapshot(xn, L);
         if (L == 0) vdbg_snapshot2(x, 4);   // raw pre-norm residual stream (h = x + ao)
         const Qwen35LayerWeights& w = s.w.layers[L];
+        // The decode shadow's view of this layer, for the projections a packed step reads there.
+        const Qwen35LayerWeights* tw =
+            (packed && s.bonsai_dec_layers && bt_q) ? &s.bonsai_dec_layers[L] : nullptr;
+        // A shadow projection at N rows: launch_ptq1_rotq_bf16 at the input's width, then the
+        // rows kernel -- the kernels single-row decode runs, per row bit for bit.
+        auto proj_t = [&](const bf16* in, const void* sgn, const void* w0, const void* w1,
+                          bf16* y0, bf16* y1, int no, int k) -> bool {
+            return sgn &&
+                   kernels::launch_ptq1_rotq_bf16(in, static_cast<const signed char*>(sgn), bt_q,
+                                                  bt_qd, bt_qs, N, k, s.bonsai_block, st) &&
+                   kernels::launch_gemm_ptq1_i8_rows_bf16(bt_q, bt_qd, bt_qs, w0, w1, y0, y1, N,
+                                                          no, k, st, bt_part, bt_part_cap);
+        };
         if (muse) {
             // ---- MUSE GLIMMER LAYER (packed continuous-batch decode) ----
             // Every kernel here is the one AR decode already drives for this architecture
@@ -5315,21 +5328,33 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
             // kernel already holds the bf16-rounded lnrm in registers, so it can write it and the
             // standalone quantize node goes away. Claim the A/B slot exactly as quant_nv_rows
             // would, so the buffer and the alternation are unchanged.
+            // The decode shadow's ssm_out instead takes the gated norm, the rotation and the int8
+            // quantize in one kernel, then the rows kernel: single-row decode's pair at N rows.
+            const bool out_t = tw && tw->ssm_out_type == kPtq1GgmlType && s.bonsai_sign_out &&
+                               lvdim == qdim &&
+                               kernels::launch_ptq1_gnorm_rotq_bf16(
+                                   att, lz, w.ssm_norm, c.rms_eps,
+                                   static_cast<const signed char*>(s.bonsai_sign_out), bt_q, bt_qd,
+                                   bt_qs, N, lvdim, c.linear_head_dim, s.bonsai_block, st);
             signed char* gnq = nullptr; float* gns = nullptr;
-            const bool gn_nv = kNormFold && kernels::qwen38_nvfp4_dp4a_proj() &&
+            const bool gn_nv = !out_t && kNormFold && kernels::qwen38_nvfp4_dp4a_proj() &&
                                w.ssm_out_type == kernels::SI_QTYPE_NVFP4;
             if (gn_nv) quant_nv_claim(&gnq, &gns);
             if (gn_nv && kernels::launch_prefill_gated_norm_nvfp4(
                              att, lz, w.ssm_norm, lnrm, gnq, gns, N, vh,
                              c.linear_head_dim, c.rms_eps, st)) {
                 quant_nv_commit(lnrm, lvdim);
-            } else {
+            } else if (!out_t) {
                 kernels::launch_prefill_gated_norm(att, lz, w.ssm_norm, lnrm, N, vh,
                                                     c.linear_head_dim, c.rms_eps, st);
             }
             const bool gdn_out_gemm = packed && fp4_a && fp4_asf && N >= kProjGemmMinRows &&
                                       w.gdn_out_fp4 && w.gdn_out_fp4_sf;
-            if (gdn_out_gemm)
+            if (out_t)
+                supported = kernels::launch_gemm_ptq1_i8_rows_bf16(
+                    bt_q, bt_qd, bt_qs, tw->ssm_out, nullptr, ao, nullptr, N, H, lvdim, st,
+                    bt_part, bt_part_cap);
+            else if (gdn_out_gemm)
                 supported = kernels::launch_prefill_nvfp4_quant_a(lnrm, fp4_a, fp4_asf, Ng, lvdim, st) &&
                             kernels::launch_prefill_nvfp4_gemm(
                                 fp4_a, fp4_asf, w.gdn_out_fp4, w.gdn_out_fp4_sf,
@@ -5347,7 +5372,9 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
                 (w.wq_type == kernels::SI_QTYPE_NVFP4 ||
                  w.wk_type == kernels::SI_QTYPE_NVFP4 ||
                  w.wv_type == kernels::SI_QTYPE_NVFP4)) quant_nv_rows(xn, H);
-            const bool fork_attn = fork_shared && q81_src == xn && q81_k == H &&
+            const bool attn_t = tw && s.bonsai_sign_hidden && tw->wq_type == kPtq1GgmlType &&
+                                tw->wk_type == kPtq1GgmlType && tw->wv_type == kPtq1GgmlType;
+            const bool fork_attn = !attn_t && fork_shared && q81_src == xn && q81_k == H &&
                                    !((kAttnGemm & 4) && (kAttnGemm & 1) && packed && fp4_a &&
                                      fp4_asf && N >= kProjGemmMinRows &&
                                      w.wq_fp4 && w.wk_fp4 && w.wv_fp4);
@@ -5366,7 +5393,7 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
             // eight CTAs of a 128-wide tile -- 5% of the machine -- so the GEMM would be far
             // slower than the GEMV there even reading the weights once. They are also only
             // 2.78 MB apiece, a twentieth of what wq and wo move.
-            const bool attn_q_gemm = (kAttnGemm & 1) && packed && fp4_a && fp4_asf &&
+            const bool attn_q_gemm = !attn_t && (kAttnGemm & 1) && packed && fp4_a && fp4_asf &&
                                      N >= kProjGemmMinRows && w.wq_fp4 && w.wq_fp4_sf;
             // quant_nv_rows(xn, H) above still runs unconditionally, so the int8 staging that
             // proj_pair_nv_on expects to find already cached is there whether or not wq took the
@@ -5381,7 +5408,15 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
             // a machine with a different SM count without a rebuild.
             const bool attn_kv_gemm = attn_q_gemm && (kAttnGemm & 4) &&
                                       w.wk_fp4 && w.wk_fp4_sf && w.wv_fp4 && w.wv_fp4_sf;
-            if (attn_q_gemm)
+            if (attn_t)
+                // q, then k with v as one pair: the pairing sets the k split, which has to be the
+                // one single-row decode used for the same pair.
+                supported = proj_t(xn, s.bonsai_sign_hidden, tw->wq, nullptr, b8, nullptr,
+                                   2 * qdim, H) &&
+                            kernels::launch_gemm_ptq1_i8_rows_bf16(
+                                bt_q, bt_qd, bt_qs, tw->wk, tw->wv, kf, vf, N, kvdim, H, st,
+                                bt_part, bt_part_cap);
+            else if (attn_q_gemm)
                 supported = kernels::launch_prefill_nvfp4_quant_a(xn, fp4_a, fp4_asf, Ng, H, st) &&
                             kernels::launch_prefill_nvfp4_gemm(
                                 fp4_a, fp4_asf, w.wq_fp4, w.wq_fp4_sf,
@@ -5396,7 +5431,7 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
                             kernels::launch_prefill_nvfp4_gemm(
                                 fp4_a, fp4_asf, w.wv_fp4, w.wv_fp4_sf,
                                 vf, Ng, kvdim, H, fp4_ws, st, w.wv_fp4_alpha);
-            else
+            else if (!attn_t)
                 supported = supported &&
                             (proj_pair_nv_on(ast, xn, w.wk, w.wk_type, w.wv, w.wv_type,
                                              kf, vf, kvdim, H) ||
@@ -5463,12 +5498,21 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
             // att/qg rows are contiguous at stride qdim, and the gate is elementwise, so one
             // launch covers the whole block. N separate nodes cost N times the graph-node
             // dependency latency for the same work.
-            if (!int8_gate_fused) {
+            // The decode shadow's o_proj takes the sigmoid gate inside its rotation (below).
+            const bool wo_t = tw && tw->wo_type == kPtq1GgmlType && s.bonsai_sign_out;
+            if (!int8_gate_fused && !wo_t) {
                 kernels::launch_qwen36_mul_sigmoid(att, qg, N * qdim, st);
             }
             const bool attn_o_gemm = (kAttnGemm & 2) && packed && fp4_a && fp4_asf &&
                                      N >= kProjGemmMinRows && w.wo_fp4 && w.wo_fp4_sf;
-            if (attn_o_gemm)
+            if (wo_t)
+                supported = kernels::launch_ptq1_gate_rotq_bf16(
+                                att, qg, static_cast<const signed char*>(s.bonsai_sign_out), bt_q,
+                                bt_qd, bt_qs, N, qdim, s.bonsai_block, st) &&
+                            kernels::launch_gemm_ptq1_i8_rows_bf16(
+                                bt_q, bt_qd, bt_qs, tw->wo, nullptr, ao, nullptr, N, H, qdim, st,
+                                bt_part, bt_part_cap);
+            else if (attn_o_gemm)
                 supported = kernels::launch_prefill_nvfp4_quant_a(att, fp4_a, fp4_asf, Ng, qdim, st) &&
                             kernels::launch_prefill_nvfp4_gemm(
                                 fp4_a, fp4_asf, w.wo_fp4, w.wo_fp4_sf,

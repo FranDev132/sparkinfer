@@ -94,6 +94,18 @@ bool launch_ptq1_rotq_bf16(const void* x_bf16, const signed char* sign, signed c
 bool launch_ptq1_swiglu_rotq_bf16(const void* gate_bf16, const void* up_bf16,
                                   const signed char* sign, signed char* q, float* qd, int* qs,
                                   int rows, int k, int block, cudaStream_t stream);
+// The same applied to the GDN gated RMSNorm of x with gate z and weight norm (head_dim 128 only),
+// the value launch_qwen36_gated_norm / launch_prefill_gated_norm would write: ssm_out's
+// activation straight from the recurrence output.
+bool launch_ptq1_gnorm_rotq_bf16(const void* x_bf16, const void* z_bf16, const void* norm_bf16,
+                                 float eps, const signed char* sign, signed char* q, float* qd,
+                                 int* qs, int rows, int k, int head_dim, int block,
+                                 cudaStream_t stream);
+// The same applied to bf16(x * sigmoid(gate)), launch_qwen36_mul_sigmoid's value: the gated
+// attention output straight into the output projection's activation.
+bool launch_ptq1_gate_rotq_bf16(const void* x_bf16, const void* gate_bf16,
+                                const signed char* sign, signed char* q, float* qd, int* qs,
+                                int rows, int k, int block, cudaStream_t stream);
 
 // y[n] = sum_k W[n,k] * x[k] with x given as launch_ptq1_rotq_*'s output (one row). w1/y1 run a
 // second matrix of the same shape against the same activation in the same launch (gate and up);
