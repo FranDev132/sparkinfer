@@ -921,7 +921,17 @@ bool launch_prefill_gdn_chunk(const void* q, const void* k, const void* v,
         return !(e && e[0] == '0');
     }();
     constexpr size_t sm_regs = gdnc_scan_smem<C, HD, JC_S, true>();
-    const bool use_regs = regs_on && spills && n_tokens >= bigjc_minctx &&
+    // The register-resident shape has its own, lower floor. The wide block's reason for 2048 (a
+    // 4-chunk chain cannot repay 1.65x the per-block time) does not apply to it: it keeps the
+    // narrow block and only packs two per SM, so it just removes the second wave. Measured on
+    // Ternary-Bonsai-2's 48 v-heads, per layer, byte-identical out and state: N=256 0.098 ->
+    // 0.064 ms, N=384 0.137 -> 0.092, N=512 0.172 -> 0.115.
+    // SPARKINFER_PREFILL_GDN_SCAN_REGS_MINCTX restores 2048 (or any floor) for an A/B.
+    static const int regs_minctx = [] {
+        const char* e = getenv("SPARKINFER_PREFILL_GDN_SCAN_REGS_MINCTX");
+        return e ? atoi(e) : 256;
+    }();
+    const bool use_regs = regs_on && spills && n_tokens >= regs_minctx &&
                           2 * sm_regs <= (size_t)102400 &&
                           gdnc_scan_smem_ok<C, HD, JC_S, true>(dev);
     const bool use_big = !use_regs && spills && n_tokens >= bigjc_minctx &&

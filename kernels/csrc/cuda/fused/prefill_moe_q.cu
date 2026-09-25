@@ -1183,6 +1183,514 @@ __global__ __launch_bounds__(256, 2) void pf_dense_gemm_qi8_kernel_g(
     }
 }
 
+
+// ---------------------------------------------------------------------------------------------
+// Warp-specialized Q4_K dense GEMM (K32 only), for M <= 256. Same 128x64 tile, grid, split-K
+// and epilogue as pf_dense_gemm_qi8_kernel_g, so every output is bit-identical to it. There, all
+// eight warps finish a super-block's MMAs and then stop to decode the next weight super-block, so
+// decode and MMA serialize (and two resident blocks tend to decode at the same time). Here the
+// roles are split: four DECODE warps fetch and decode super-blocks into a ring of WS_NS Bs planes,
+// one A warp streams the activation into a ring of WS_NA K-steps with cp.async, and the eight MMA
+// warps only wait on per-stage mbarriers and issue ldmatrix + mma -- no block-wide barrier in the
+// K loop. Measured on Ternary-Bonsai-2's shapes (16 cycled weight copies): prefill@128's fused GEMMs
+// 19.97 -> 19.33 ms per forward. SPARKINFER_PREFILL_QB_WS=0 keeps the single-role kernel.
+constexpr int WS_NS = 2;                                  // Bs planes in the ring
+constexpr int WS_NA = 3;                                  // A 32-wide K steps in flight
+constexpr int WS_CONS = 256, WS_DEC = 128, WS_AW = 32;
+constexpr int WS_THREADS = WS_CONS + WS_DEC + WS_AW;
+// mbarriers: fullB[NS] (WS_DEC arrivals), emptyB[NS] (8 consumer warps), fullA[NA] (WS_AW cp.async
+// arrivals), emptyA[NA] (8 consumer warps)
+constexpr size_t WS_OFF_A = (size_t)WS_NS * QM_BND * QM_LD;
+constexpr size_t WS_OFF_MB = WS_OFF_A + (size_t)WS_NA * QM_BM * QM_BK;
+constexpr size_t WS_SMEM = WS_OFF_MB + 2 * (WS_NS + WS_NA) * 8;
+
+__device__ __forceinline__ void ws_mb_init(unsigned a, unsigned cnt) {
+    asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;" :: "r"(a), "r"(cnt) : "memory");
+}
+__device__ __forceinline__ void ws_mb_arrive(unsigned a) {
+    asm volatile("{ .reg .b64 st; mbarrier.arrive.shared::cta.b64 st, [%0]; }" :: "r"(a) : "memory");
+}
+__device__ __forceinline__ void ws_mb_cp_arrive(unsigned a) {
+    asm volatile("cp.async.mbarrier.arrive.noinc.shared::cta.b64 [%0];" :: "r"(a) : "memory");
+}
+// mbarrier.try_wait and the init fence are sm_90+. The default build also emits sm_89, which never
+// launches these kernels (qm_sm90() gates both on the host), so there they compile to a trap.
+__device__ __forceinline__ void ws_mb_wait(unsigned a, unsigned parity) {
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 900
+    asm volatile("{ .reg .pred p; WSW%=: mbarrier.try_wait.parity.shared::cta.b64 p, [%0], %1; @!p bra WSW%=; }"
+                 :: "r"(a), "r"(parity) : "memory");
+#else
+    __trap();
+#endif
+}
+__device__ __forceinline__ void ws_mb_fence_init() {
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 900
+    asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
+#else
+    __trap();
+#endif
+}
+__device__ __forceinline__ void ws_cp16(unsigned dst, const void* src) {
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" :: "r"(dst), "l"(src) : "memory");
+}
+
+template <bool GROUPED, bool SPLIT>
+__global__ __launch_bounds__(WS_THREADS, 2) void pf_dense_gemm_qi8_ws_kernel(
+        const signed char* __restrict__ A_i8, const float* __restrict__ sx,
+        const unsigned char* __restrict__ W_q_arg, const float* __restrict__ row_scale_arg,
+        __nv_bfloat16* __restrict__ C_arg, int Mtot, int N_arg, int K, PfQGroup gd,
+        int* __restrict__ partials = nullptr, int sb_per_split = 0, int atomic_acc = 0,
+        const signed char* __restrict__ A_pack = nullptr, int m_fast = 0) {
+    constexpr int QT = QMQ_Q4_K;
+    constexpr int BS = qm_bs<QT>();
+    const int zsl  = SPLIT ? (int)blockIdx.x : 0;
+    const int btil = SPLIT ? (int)blockIdx.y : (m_fast ? (int)blockIdx.y : (int)blockIdx.x);
+    const int bmt  = SPLIT ? (int)blockIdx.z : (m_fast ? (int)blockIdx.x : (int)blockIdx.y);
+    const int p0 = bmt * QM_BM;
+    const int M  = min(QM_BM, Mtot - p0);
+    if (M <= 0) return;
+    const unsigned char* W_q = W_q_arg;
+    const float* row_scale = row_scale_arg;
+    __nv_bfloat16* C = C_arg;
+    int N = N_arg;
+    int xtile = btil;
+    int grp = 0;
+    if (GROUPED) {
+        #pragma unroll
+        for (int i = 1; i < PF_QGROUP_MAX; i++)
+            if (i < gd.ngroup && btil >= gd.first[i]) grp = i;
+        W_q = gd.W[grp]; row_scale = gd.rs[grp]; C = gd.C[grp]; N = gd.N[grp];
+        xtile = btil - gd.first[grp];
+    }
+    const size_t pbase = GROUPED ? (size_t)gd.poff[grp] : 0;
+    const int n0  = xtile * QM_BND;
+    const int nsb = K >> 8;
+    const int sb_lo = SPLIT ? zsl * sb_per_split : 0;
+    const int sb_hi = SPLIT ? min(nsb, sb_lo + sb_per_split) : nsb;
+    if (sb_lo >= sb_hi) return;
+
+    extern __shared__ __align__(16) signed char ws_smem[];
+    auto Bs = reinterpret_cast<signed char (*)[QM_BND][QM_LD]>(ws_smem);
+    auto As = reinterpret_cast<signed char (*)[QM_BM][QM_BK]>(ws_smem + WS_OFF_A);
+    const unsigned mb0 = (unsigned)__cvta_generic_to_shared(ws_smem + WS_OFF_MB);
+    auto fullB  = [&](int s) { return mb0 + 8u * (unsigned)s; };
+    auto emptyB = [&](int s) { return mb0 + 8u * (unsigned)(WS_NS + s); };
+    auto fullA  = [&](int s) { return mb0 + 8u * (unsigned)(2 * WS_NS + s); };
+    auto emptyA = [&](int s) { return mb0 + 8u * (unsigned)(2 * WS_NS + WS_NA + s); };
+    const int tid = threadIdx.x;
+    const int nsteps = (sb_hi - sb_lo) * (QM_SB / QM_BK);
+    if (tid == 0) {
+        for (int s = 0; s < WS_NS; s++) { ws_mb_init(fullB(s), WS_DEC); ws_mb_init(emptyB(s), 8); }
+        for (int s = 0; s < WS_NA; s++) { ws_mb_init(fullA(s), WS_AW); ws_mb_init(emptyA(s), 8); }
+        ws_mb_fence_init();
+    }
+    // Rows past M never receive a cp.async: zero them once in every A slot.
+    for (int e = tid; e < WS_NA * QM_BM * 2; e += WS_THREADS) {
+        const int s = e / (QM_BM * 2), r = (e >> 1) % QM_BM, c = (e & 1) * 16;
+        if (r >= M) *reinterpret_cast<uint4*>(&As[s][r][c]) = make_uint4(0u, 0u, 0u, 0u);
+    }
+    __syncthreads();
+
+    if (tid >= WS_CONS + WS_DEC) {
+        // ---------------- A-staging warp: 8 of the 256 16-byte chunks per lane per K step ----------------
+        const int lane = tid - (WS_CONS + WS_DEC);
+        const bool apk = A_pack != nullptr;
+        const size_t a_step = apk ? (size_t)Mtot * 32 : (size_t)QM_BK;
+        const signed char* srcs[8]; unsigned dsts[8]; bool oks[8];
+        #pragma unroll
+        for (int u = 0; u < 8; u++) {
+            const int ch = lane + 32 * u;                // 0..255: row = ch >> 1, half = ch & 1
+            const int r = ch >> 1, c16 = (ch & 1) * 16;
+            oks[u] = r < M;
+            const int a_row = oks[u] ? p0 + r : p0;
+            srcs[u] = apk ? (A_pack + (size_t)p0 * 32 + (size_t)ch * 16 + (size_t)(sb_lo << 3) * (size_t)Mtot * 32)
+                          : (A_i8 + (size_t)a_row * K + c16 + (size_t)(sb_lo << 8));
+            dsts[u] = (unsigned)__cvta_generic_to_shared(&As[0][r][c16 ^ (16 * ((r >> 2) & 1))]);
+        }
+        for (int t = 0; t < nsteps; t++) {
+            const int s = t % WS_NA;
+            if (t >= WS_NA) ws_mb_wait(emptyA(s), ((t / WS_NA) - 1) & 1);
+            const unsigned so = (unsigned)s * (QM_BM * QM_BK);
+            #pragma unroll
+            for (int u = 0; u < 8; u++)
+                if (oks[u]) ws_cp16(dsts[u] + so, srcs[u] + (size_t)t * a_step);
+            ws_mb_cp_arrive(fullA(s));
+        }
+        return;
+    }
+    if (tid >= WS_CONS) {
+        // ---------------- decode warps: 2 threads per weight row, two 64-value pairs each ----------------
+        const int pt = tid - WS_CONS;
+        const int dr = pt >> 1, jb = (pt & 1) * 2;
+        const int dgn = n0 + dr;
+        const bool drow_ok = dgn < N;
+        const unsigned char* drow = W_q + (size_t)(drow_ok ? dgn : 0) * (size_t)nsb * BS;
+        const float dscale = drow_ok ? row_scale[dgn] : 0.f;
+        const float dinv = (dscale > 0.f) ? (1.f / dscale) : 0.f;
+        if (!drow_ok) {
+            for (int s = 0; s < WS_NS; s++)
+                #pragma unroll
+                for (int i = 0; i < 8; i++)
+                    *reinterpret_cast<uint4*>(&Bs[s][dr][jb * 64 + i * 16]) = make_uint4(0u, 0u, 0u, 0u);
+        }
+        QmStage<QT> a0, a1, b0, b1;
+        if (drow_ok) {
+            qm_stage_fetch<QT>(drow + (size_t)sb_lo * BS, jb, a0);
+            qm_stage_fetch<QT>(drow + (size_t)sb_lo * BS, jb + 1, a1);
+        }
+        for (int sb = sb_lo; sb < sb_hi; sb++) {
+            const int it = sb - sb_lo, s = it % WS_NS;
+            const bool more = sb + 1 < sb_hi;
+            if (more && drow_ok) {
+                qm_stage_fetch<QT>(drow + (size_t)(sb + 1) * BS, jb, b0);
+                qm_stage_fetch<QT>(drow + (size_t)(sb + 1) * BS, jb + 1, b1);
+            }
+            if (it >= WS_NS) ws_mb_wait(emptyB(s), ((it / WS_NS) - 1) & 1);
+            if (drow_ok) {
+                qm_stage_decode<QT>(a0, jb, dinv, &Bs[s][dr][0]);
+                qm_stage_decode<QT>(a1, jb + 1, dinv, &Bs[s][dr][0]);
+            }
+            ws_mb_arrive(fullB(s));
+            a0 = b0; a1 = b1;
+        }
+        return;
+    }
+
+    // ---------------- MMA warps: pf_dense_gemm_qi8_kernel_g's K32 step, no block barriers ----------------
+    const int warp = tid >> 5, lane = tid & 31;
+    const int wm = warp & 3, wn = warp >> 2;
+    int acc[2][4][4];
+#pragma unroll
+    for (int i = 0; i < 2; i++)
+#pragma unroll
+        for (int j = 0; j < 4; j++)
+#pragma unroll
+            for (int e = 0; e < 4; e++) acc[i][j][e] = 0;
+    const int arr = (lane & 7) + 8 * ((lane >> 3) & 1);
+    const unsigned a_sm = (unsigned)__cvta_generic_to_shared(
+        &As[0][wm * 32 + arr][16 * (((lane >> 4) & 1) ^ ((arr >> 2) & 1))]);
+    const unsigned b_sm = (unsigned)__cvta_generic_to_shared(
+        &Bs[0][wn * 32 + ((lane >> 4) & 1) * 8 + (lane & 7)][16 * ((lane >> 3) & 1)]);
+    int t = 0;
+    for (int sb = sb_lo; sb < sb_hi; sb++) {
+        const int it = sb - sb_lo, s = it % WS_NS;
+        ws_mb_wait(fullB(s), (it / WS_NS) & 1);
+        for (int kk = 0; kk < QM_SB; kk += QM_BK, t++) {
+            const int sa = t % WS_NA;
+            ws_mb_wait(fullA(sa), (t / WS_NA) & 1);
+            const unsigned ab = a_sm + (unsigned)sa * (QM_BM * QM_BK);
+            unsigned af32[2][4];
+#pragma unroll
+            for (int i = 0; i < 2; i++)
+                qm_ldsm_x4(af32[i], ab + (unsigned)(i * 16 * QM_BK));
+#pragma unroll
+            for (int j2 = 0; j2 < 2; j2++) {
+                unsigned bb[4];
+                qm_ldsm_x4(bb, b_sm + (unsigned)s * (QM_BND * QM_LD)
+                                    + (unsigned)(j2 * 16 * QM_LD) + (unsigned)kk);
+#pragma unroll
+                for (int i = 0; i < 2; i++) {
+                    qm_mma_16832(acc[i][2 * j2],     af32[i], bb[0], bb[1]);
+                    qm_mma_16832(acc[i][2 * j2 + 1], af32[i], bb[2], bb[3]);
+                }
+            }
+            __syncwarp();
+            if (lane == 0) ws_mb_arrive(emptyA(sa));
+        }
+        __syncwarp();
+        if (lane == 0) ws_mb_arrive(emptyB(s));
+    }
+
+    // Epilogue, staged through Bs[0] once every MMA warp is past its last read of either plane.
+    // The decode warps are finished: their last write preceded the fullB arrival waited on above.
+    asm volatile("bar.sync 1, 256;" ::: "memory");
+    int* Cs = reinterpret_cast<int*>(&Bs[0][0][0]);
+#pragma unroll
+    for (int i = 0; i < 2; i++) {
+#pragma unroll
+        for (int j = 0; j < 2; j++) {
+            const int rm0 = wm * 32 + i * 16, gn0 = n0 + wn * 32 + j * 16;
+#pragma unroll
+            for (int hh = 0; hh < 2; hh++) {
+                const int* d = acc[i][2 * j + hh];
+                const int rb = lane >> 2, cb = hh * 8 + 2 * (lane & 3);
+                Cs[warp * 256 + rb * 16 + cb]            = d[0];
+                Cs[warp * 256 + rb * 16 + cb + 1]        = d[1];
+                Cs[warp * 256 + (rb + 8) * 16 + cb]      = d[2];
+                Cs[warp * 256 + (rb + 8) * 16 + cb + 1]  = d[3];
+            }
+            __syncwarp();
+            if (SPLIT && atomic_acc) {
+                for (int el = lane; el < 256; el += 32) {
+                    const int rm = rm0 + (el >> 4), rn = gn0 + (el & 15);
+                    if (rm < M && rn < N)
+                        qm_red_add(&partials[pbase + (size_t)(p0 + rm) * N + rn], Cs[warp * 256 + el]);
+                }
+            } else if (SPLIT) {
+                for (int el = lane; el < 256; el += 32) {
+                    const int rm = rm0 + (el >> 4), rn = gn0 + (el & 15);
+                    if (rm < M && rn < N)
+                        partials[pbase + (((size_t)zsl * Mtot) + (p0 + rm)) * N + rn] =
+                            Cs[warp * 256 + el];
+                }
+            } else {
+                for (int el = lane; el < 256; el += 32) {
+                    const int rm = rm0 + (el >> 4), rn = gn0 + (el & 15);
+                    if (rm < M && rn < N) {
+                        const int p = p0 + rm;
+                        const float v = (float)Cs[warp * 256 + el] * sx[p] * row_scale[rn];
+                        C[(size_t)p * N + rn] = __float2bfloat16(v);
+                    }
+                }
+            }
+            __syncwarp();
+        }
+    }
+}
+
+
+// ---------------------------------------------------------------------------------------------
+// Tall-tile variant for M > 256 (prefill@512), generic over the tile. pf_dense_gemm_qi8_kernel_g
+// decodes a weight tile once per 128-row M-tile, so at M=512 every weight is decoded four times.
+// A GBM-row tile decodes it M/GBM times. GWM x GWN MMA warps at (GBM/GWM) x (GBN/GWN), GDW decode
+// warps, GAW A-staging warps, all synchronized by mbarriers. Unsplit only. Bit-identical: same
+// decode, same per-accumulator K order, same epilogue expression.
+template <int GBM, int GBN, int GWM, int GWN, int GDW, int GAW, int GNA, int GNS>
+struct QmTall {
+    static constexpr int BM = GBM, BN = GBN;
+    static constexpr int CONS = GWM * GWN * 32, DEC = GDW * 32, AW = GAW * 32;
+    static constexpr int THREADS = CONS + DEC + AW;
+    static constexpr int WTM = GBM / GWM, WTN = GBN / GWN, MF = WTM / 16, NF = WTN / 8;
+    static constexpr int DTPR = DEC / GBN;                 // decode threads per weight row
+    static constexpr int JPT = 4 / DTPR;                   // 64-value pairs per decode thread
+    static constexpr int ACH = GBM * 2;                    // 16 B A chunks per K step
+    static constexpr int APL = ACH / AW;                   // chunks per A lane
+    static constexpr size_t OFF_A = (size_t)GNS * GBN * QM_LD;
+    static constexpr size_t OFF_MB = OFF_A + (size_t)GNA * GBM * QM_BK;
+    static constexpr size_t SMEM = OFF_MB + 2 * (GNS + GNA) * 8;
+    static_assert(DEC % GBN == 0 && 4 % DTPR == 0 && ACH % AW == 0 && NF % 2 == 0, "tile config");
+};
+
+template <int GBM, int GBN, int GWM, int GWN, int GDW, int GAW, int GNA, int GNS, bool GROUPED>
+__global__ __launch_bounds__(QmTall<GBM, GBN, GWM, GWN, GDW, GAW, GNA, GNS>::THREADS, 1)
+void pf_dense_gemm_qi8_tall_kernel(
+        const signed char* __restrict__ A_i8, const float* __restrict__ sx,
+        const unsigned char* __restrict__ W_q_arg, const float* __restrict__ row_scale_arg,
+        __nv_bfloat16* __restrict__ C_arg, int Mtot, int N_arg, int K, PfQGroup gd,
+        const signed char* __restrict__ A_pack, int m_fast) {
+    using T = QmTall<GBM, GBN, GWM, GWN, GDW, GAW, GNA, GNS>;
+    constexpr int QT = QMQ_Q4_K;
+    constexpr int BS = qm_bs<QT>();
+    constexpr int CONS = T::CONS, DEC = T::DEC, AW = T::AW, THREADS = T::THREADS;
+    constexpr int MF = T::MF, NF = T::NF, WTM = T::WTM, WTN = T::WTN;
+    const int btil = m_fast ? (int)blockIdx.y : (int)blockIdx.x;
+    const int bmt  = m_fast ? (int)blockIdx.x : (int)blockIdx.y;
+    const int p0 = bmt * GBM;
+    const int M  = min(GBM, Mtot - p0);
+    if (M <= 0) return;
+    const unsigned char* W_q = W_q_arg;
+    const float* row_scale = row_scale_arg;
+    __nv_bfloat16* C = C_arg;
+    int N = N_arg;
+    int xtile = btil;
+    if (GROUPED) {
+        int grp = 0;
+        #pragma unroll
+        for (int i = 1; i < PF_QGROUP_MAX; i++)
+            if (i < gd.ngroup && btil * GBN >= gd.first[i] * QM_BND) grp = i;
+        W_q = gd.W[grp]; row_scale = gd.rs[grp]; C = gd.C[grp]; N = gd.N[grp];
+        xtile = btil - gd.first[grp] * (QM_BND / GBN);
+    }
+    const int n0  = xtile * GBN;
+    const int nsb = K >> 8;
+
+    extern __shared__ __align__(16) signed char tl_smem[];
+    auto Bs = reinterpret_cast<signed char (*)[GBN][QM_LD]>(tl_smem);
+    auto As = reinterpret_cast<signed char (*)[GBM][QM_BK]>(tl_smem + T::OFF_A);
+    const unsigned mb0 = (unsigned)__cvta_generic_to_shared(tl_smem + T::OFF_MB);
+    auto fullB  = [&](int s) { return mb0 + 8u * (unsigned)s; };
+    auto emptyB = [&](int s) { return mb0 + 8u * (unsigned)(GNS + s); };
+    auto fullA  = [&](int s) { return mb0 + 8u * (unsigned)(2 * GNS + s); };
+    auto emptyA = [&](int s) { return mb0 + 8u * (unsigned)(2 * GNS + GNA + s); };
+    const int tid = threadIdx.x;
+    const int nsteps = nsb * (QM_SB / QM_BK);
+    if (tid == 0) {
+        for (int s = 0; s < GNS; s++) { ws_mb_init(fullB(s), DEC); ws_mb_init(emptyB(s), GWM * GWN); }
+        for (int s = 0; s < GNA; s++) { ws_mb_init(fullA(s), AW); ws_mb_init(emptyA(s), GWM * GWN); }
+        ws_mb_fence_init();
+    }
+    for (int e = tid; e < GNA * GBM * 2; e += THREADS) {
+        const int s = e / (GBM * 2), r = (e >> 1) % GBM, c = (e & 1) * 16;
+        if (r >= M) *reinterpret_cast<uint4*>(&As[s][r][c]) = make_uint4(0u, 0u, 0u, 0u);
+    }
+    __syncthreads();
+
+    if (tid >= CONS + DEC) {
+        const int al = tid - (CONS + DEC);
+        const bool apk = A_pack != nullptr;
+        const size_t a_step = apk ? (size_t)Mtot * 32 : (size_t)QM_BK;
+        const signed char* srcs[T::APL]; unsigned dsts[T::APL]; bool oks[T::APL];
+        #pragma unroll
+        for (int u = 0; u < T::APL; u++) {
+            const int ch = al + AW * u;
+            const int r = ch >> 1, c16 = (ch & 1) * 16;
+            oks[u] = r < M;
+            const int a_row = oks[u] ? p0 + r : p0;
+            srcs[u] = apk ? (A_pack + (size_t)p0 * 32 + (size_t)ch * 16)
+                          : (A_i8 + (size_t)a_row * K + c16);
+            dsts[u] = (unsigned)__cvta_generic_to_shared(&As[0][r][c16 ^ (16 * ((r >> 2) & 1))]);
+        }
+        for (int t = 0; t < nsteps; t++) {
+            const int s = t % GNA;
+            if (t >= GNA) ws_mb_wait(emptyA(s), ((t / GNA) - 1) & 1);
+            const unsigned so = (unsigned)s * (GBM * QM_BK);
+            #pragma unroll
+            for (int u = 0; u < T::APL; u++)
+                if (oks[u]) ws_cp16(dsts[u] + so, srcs[u] + (size_t)t * a_step);
+            ws_mb_cp_arrive(fullA(s));
+        }
+        return;
+    }
+    if (tid >= CONS) {
+        const int pt = tid - CONS;
+        const int dr = pt / T::DTPR, jb = (pt % T::DTPR) * T::JPT;
+        const int dgn = n0 + dr;
+        const bool drow_ok = dgn < N;
+        const unsigned char* drow = W_q + (size_t)(drow_ok ? dgn : 0) * (size_t)nsb * BS;
+        const float dscale = drow_ok ? row_scale[dgn] : 0.f;
+        const float dinv = (dscale > 0.f) ? (1.f / dscale) : 0.f;
+        if (!drow_ok) {
+            for (int s = 0; s < GNS; s++)
+                for (int i = 0; i < 4 * T::JPT; i++)
+                    *reinterpret_cast<uint4*>(&Bs[s][dr][jb * 64 + i * 16]) = make_uint4(0u, 0u, 0u, 0u);
+        }
+        QmStage<QT> a[T::JPT], b[T::JPT];
+        if (drow_ok) {
+            #pragma unroll
+            for (int j = 0; j < T::JPT; j++) qm_stage_fetch<QT>(drow, jb + j, a[j]);
+        }
+        for (int sb = 0; sb < nsb; sb++) {
+            const int s = sb % GNS;
+            if (sb + 1 < nsb && drow_ok) {
+                #pragma unroll
+                for (int j = 0; j < T::JPT; j++) qm_stage_fetch<QT>(drow + (size_t)(sb + 1) * BS, jb + j, b[j]);
+            }
+            if (sb >= GNS) ws_mb_wait(emptyB(s), ((sb / GNS) - 1) & 1);
+            if (drow_ok) {
+                #pragma unroll
+                for (int j = 0; j < T::JPT; j++) qm_stage_decode<QT>(a[j], jb + j, dinv, &Bs[s][dr][0]);
+            }
+            ws_mb_arrive(fullB(s));
+            #pragma unroll
+            for (int j = 0; j < T::JPT; j++) a[j] = b[j];
+        }
+        return;
+    }
+
+    const int warp = tid >> 5, lane = tid & 31;
+    const int wm = warp % GWM, wn = warp / GWM;
+    int acc[MF][NF][4];
+#pragma unroll
+    for (int i = 0; i < MF; i++)
+#pragma unroll
+        for (int j = 0; j < NF; j++)
+#pragma unroll
+            for (int e = 0; e < 4; e++) acc[i][j][e] = 0;
+    const int arr = (lane & 7) + 8 * ((lane >> 3) & 1);
+    const unsigned a_sm = (unsigned)__cvta_generic_to_shared(
+        &As[0][wm * WTM + arr][16 * (((lane >> 4) & 1) ^ ((arr >> 2) & 1))]);
+    const unsigned b_sm = (unsigned)__cvta_generic_to_shared(
+        &Bs[0][wn * WTN + ((lane >> 4) & 1) * 8 + (lane & 7)][16 * ((lane >> 3) & 1)]);
+    int t = 0;
+    for (int sb = 0; sb < nsb; sb++) {
+        const int s = sb % GNS;
+        ws_mb_wait(fullB(s), (sb / GNS) & 1);
+        for (int kk = 0; kk < QM_SB; kk += QM_BK, t++) {
+            const int sa = t % GNA;
+            ws_mb_wait(fullA(sa), (t / GNA) & 1);
+            const unsigned ab = a_sm + (unsigned)sa * (GBM * QM_BK);
+            unsigned af32[MF][4];
+#pragma unroll
+            for (int i = 0; i < MF; i++)
+                qm_ldsm_x4(af32[i], ab + (unsigned)(i * 16 * QM_BK));
+#pragma unroll
+            for (int j2 = 0; j2 < NF / 2; j2++) {
+                unsigned bb[4];
+                qm_ldsm_x4(bb, b_sm + (unsigned)s * (GBN * QM_LD)
+                                    + (unsigned)(j2 * 16 * QM_LD) + (unsigned)kk);
+#pragma unroll
+                for (int i = 0; i < MF; i++) {
+                    qm_mma_16832(acc[i][2 * j2],     af32[i], bb[0], bb[1]);
+                    qm_mma_16832(acc[i][2 * j2 + 1], af32[i], bb[2], bb[3]);
+                }
+            }
+            __syncwarp();
+            if (lane == 0) ws_mb_arrive(emptyA(sa));
+        }
+        __syncwarp();
+        if (lane == 0) ws_mb_arrive(emptyB(s));
+    }
+    asm volatile("bar.sync 1, %0;" :: "r"(CONS) : "memory");
+    int* Cs = reinterpret_cast<int*>(&Bs[0][0][0]);
+    static_assert((size_t)GWM * GWN * 256 * 4 <= (size_t)GNS * GBN * QM_LD, "epilogue staging fits Bs");
+#pragma unroll
+    for (int i = 0; i < MF; i++) {
+#pragma unroll
+        for (int j = 0; j < NF / 2; j++) {
+            const int rm0 = wm * WTM + i * 16, gn0 = n0 + wn * WTN + j * 16;
+#pragma unroll
+            for (int hh = 0; hh < 2; hh++) {
+                const int* d = acc[i][2 * j + hh];
+                const int rb = lane >> 2, cb = hh * 8 + 2 * (lane & 3);
+                Cs[warp * 256 + rb * 16 + cb]            = d[0];
+                Cs[warp * 256 + rb * 16 + cb + 1]        = d[1];
+                Cs[warp * 256 + (rb + 8) * 16 + cb]      = d[2];
+                Cs[warp * 256 + (rb + 8) * 16 + cb + 1]  = d[3];
+            }
+            __syncwarp();
+            for (int el = lane; el < 256; el += 32) {
+                const int rm = rm0 + (el >> 4), rn = gn0 + (el & 15);
+                if (rm < M && rn < N) {
+                    const int p = p0 + rm;
+                    const float v = (float)Cs[warp * 256 + el] * sx[p] * row_scale[rn];
+                    C[(size_t)p * N + rn] = __float2bfloat16(v);
+                }
+            }
+            __syncwarp();
+        }
+    }
+}
+
+// The shipped tall shape. Measured at M=512 (per forward, all Ternary-Bonsai-2 fused shapes):
+// 256x64 46.3 ms vs 59.4 for the 128-row kernel; 512x32 (each weight decoded once, but A staged
+// twice as often) 68 ms; a third Bs plane, a 6-deep A ring or four A warps all within noise.
+#define QM_TALL 256, 64, 4, 2, 4, 2, 4, 2
+using QmTallCfg = QmTall<QM_TALL>;
+constexpr int QM_TALL_BM = QmTallCfg::BM, QM_TALL_BN = QmTallCfg::BN;
+// The mbarrier-synchronized kernels need sm_90+ (see ws_mb_wait).
+static bool qm_sm90() {
+    static const bool ok = [] {
+        int dev = 0, major = 0;
+        return cudaGetDevice(&dev) == cudaSuccess &&
+               cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) == cudaSuccess &&
+               major >= 9;
+    }();
+    return ok;
+}
+// SPARKINFER_PREFILL_QB_TALL=0 keeps M > 256 on the 128-row kernels (A/B; bit-identical either way).
+static bool qm_tall_on() {
+    static const bool on = [] {
+        const char* e = getenv("SPARKINFER_PREFILL_QB_TALL");
+        if ((e && e[0] == '0') || !qm_sm90()) return false;
+        cudaFuncSetAttribute(pf_dense_gemm_qi8_tall_kernel<QM_TALL, false>,
+                             cudaFuncAttributeMaxDynamicSharedMemorySize, (int)QmTallCfg::SMEM);
+        cudaFuncSetAttribute(pf_dense_gemm_qi8_tall_kernel<QM_TALL, true>,
+                             cudaFuncAttributeMaxDynamicSharedMemorySize, (int)QmTallCfg::SMEM);
+        return true;
+    }();
+    return on;
+}
+
 } // namespace
 
 bool pfm_moe_gemm_qi8_supported(int ggml_type) {
@@ -1382,9 +1890,25 @@ static int qm_pick_splits(int ntiles, int K, int mtiles, bool have_partials, int
 }
 
 // Dispatch on weight type and on the mma shape (K32 -> mma.m16n8k32, else the wmma inner loop).
+// SPARKINFER_PREFILL_QB_WS=0 keeps the single-role kernel for Q4_K (A/B; bit-identical either way).
+static bool qm_ws_on() {
+    static const bool on = [] {
+        const char* e = getenv("SPARKINFER_PREFILL_QB_WS");
+        if ((e && e[0] == '0') || !qm_sm90()) return false;
+        cudaFuncSetAttribute(pf_dense_gemm_qi8_ws_kernel<false, false>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)WS_SMEM);
+        cudaFuncSetAttribute(pf_dense_gemm_qi8_ws_kernel<false, true>,  cudaFuncAttributeMaxDynamicSharedMemorySize, (int)WS_SMEM);
+        cudaFuncSetAttribute(pf_dense_gemm_qi8_ws_kernel<true, false>,  cudaFuncAttributeMaxDynamicSharedMemorySize, (int)WS_SMEM);
+        cudaFuncSetAttribute(pf_dense_gemm_qi8_ws_kernel<true, true>,   cudaFuncAttributeMaxDynamicSharedMemorySize, (int)WS_SMEM);
+        return true;
+    }();
+    return on;
+}
 #define QM_LAUNCH_ONE(TY, GRP, SPL, ...)                                                           \
     do {                                                                                           \
-        if (qm_mma_k32()) pf_dense_gemm_qi8_kernel_g<TY, GRP, SPL, true>                           \
+        if (TY == QMQ_Q4_K && qm_mma_k32() && qm_ws_on())                                          \
+            pf_dense_gemm_qi8_ws_kernel<GRP, SPL>                                                  \
+                <<<grid, WS_THREADS, WS_SMEM, stream>>>(__VA_ARGS__);                       \
+        else if (qm_mma_k32()) pf_dense_gemm_qi8_kernel_g<TY, GRP, SPL, true>                      \
                               <<<grid, 256, 0, stream>>>(__VA_ARGS__);                             \
         else              pf_dense_gemm_qi8_kernel_g<TY, GRP, SPL, false>                          \
                               <<<grid, 256, 0, stream>>>(__VA_ARGS__);                             \
@@ -1458,6 +1982,14 @@ bool launch_prefill_gemm_qi8_dense(int ggml_type, const signed char* A_i8, const
                 partials, sx, row_scale, C, M, N, atomic ? 1 : splits);
             return true;
         }
+    }
+    if (ggml_type == QMQ_Q4_K && qm_mma_k32() && M > 256 && qm_tall_on()) {
+        const int mt2 = (M + QM_TALL_BM - 1) / QM_TALL_BM;
+        const int mf2 = qm_m_fast() ? 1 : 0;
+        dim3 grid = mf2 ? dim3(mt2, N / QM_TALL_BN) : dim3(N / QM_TALL_BN, mt2);
+        pf_dense_gemm_qi8_tall_kernel<QM_TALL, false><<<grid, QmTallCfg::THREADS, QmTallCfg::SMEM, stream>>>(
+            A_i8, sx, W, row_scale, C, M, N, K, PfQGroup{}, A_pack, mf2);
+        return true;
     }
     const int mf = (mtiles > 1 && qm_m_fast()) ? 1 : 0;
     dim3 grid = mf ? dim3(mtiles, ntiles) : dim3(ntiles, mtiles);
@@ -1544,6 +2076,15 @@ bool launch_prefill_gemm_qi8_dense_group(int ggml_type, const signed char* A_i8,
                 partials, sx, d, M, tiles * QM_BND, atomic ? 1 : splits);
             return true;
         }
+    }
+    if (ggml_type == QMQ_Q4_K && qm_mma_k32() && M > 256 && qm_tall_on()) {
+        const int mt2 = (M + QM_TALL_BM - 1) / QM_TALL_BM;
+        const int mf2 = qm_m_fast() ? 1 : 0;
+        const int tl_tiles = tiles * (QM_BND / QM_TALL_BN);
+        dim3 grid = mf2 ? dim3(mt2, tl_tiles) : dim3(tl_tiles, mt2);
+        pf_dense_gemm_qi8_tall_kernel<QM_TALL, true><<<grid, QmTallCfg::THREADS, QmTallCfg::SMEM, stream>>>(
+            A_i8, sx, nullptr, nullptr, nullptr, M, 0, K, d, A_pack, mf2);
+        return true;
     }
     const int mf = (mtiles > 1 && qm_m_fast()) ? 1 : 0;
     dim3 grid = mf ? dim3(mtiles, tiles) : dim3(tiles, mtiles);
