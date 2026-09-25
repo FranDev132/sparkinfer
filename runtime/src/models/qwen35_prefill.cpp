@@ -5242,7 +5242,20 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
             }();
             if (gdn_in_gemm && gdn_z_stream)
                 supported = kernels::launch_prefill_nvfp4_quant_a(xn, fp4_a, fp4_asf, Ng, H, st);
-            const bool fork_gdn = fork_shared && q81_src == xn && q81_k == H;
+            // The decode shadow's in-projections: xn rotated and quantized ahead of the fork, then
+            // qkv here and z on the side stream through the rows kernel. The two may split k at
+            // once, so each takes its own half of the partials.
+            const bool gdn_t = tw && s.bonsai_sign_hidden && tw->wqkv_type == kPtq1GgmlType &&
+                               tw->wqkv_gate_type == kPtq1GgmlType &&
+                               kernels::launch_ptq1_rotq_bf16(
+                                   xn, static_cast<const signed char*>(s.bonsai_sign_hidden), bt_q,
+                                   bt_qd, bt_qs, N, H, s.bonsai_block, st);
+            const size_t bt_half = bt_part_cap / 2;
+            // With the shadow's z nothing on the side stream reads q81, provided alpha/beta take
+            // the bf16 pair GEMV below.
+            const bool fork_gdn = fork_shared &&
+                                  ((q81_src == xn && q81_k == H) ||
+                                   (gdn_t && w.ssm_alpha_type == 0 && w.ssm_beta_type == 0));
             cudaStream_t gst = fork_gdn ? s.stream_k : st;
             cudaStream_t zst = (gdn_z_stream && fork_gdn) ? s.stream_k : st;
             if (fork_gdn) {
@@ -5258,6 +5271,10 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
                                 fp4_a, fp4_asf, w.gdn_qkv_fp4, w.gdn_qkv_fp4_sf,
                                 rq, Ng, lqkv, H, fp4_ws, st, w.gdn_qkv_fp4_alpha);
             }
+            else if (gdn_t)
+                supported = kernels::launch_gemm_ptq1_i8_rows_bf16(
+                    bt_q, bt_qd, bt_qs, tw->wqkv, nullptr, rq, nullptr, N, lqkv, H, st, bt_part,
+                    bt_half);
             else
                 supported = proj(xn, w.wqkv, w.wqkv_type, rq, lqkv, H);
             // alpha and beta are v_heads-wide reads of the same xn — two launches whose cost is
@@ -5282,6 +5299,10 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
                          ? kernels::launch_prefill_nvfp4_gemm(
                                fp4_a, fp4_asf, w.gdn_z_fp4, w.gdn_z_fp4_sf,
                                lz, Ng, lvdim, H, fp4_ws, zst, w.gdn_z_fp4_alpha)
+                         : gdn_t
+                         ? kernels::launch_gemm_ptq1_i8_rows_bf16(
+                               bt_q, bt_qd, bt_qs, tw->wqkv_gate, nullptr, lz, nullptr, N, lvdim,
+                               H, gst, bt_part + bt_half, bt_part_cap - bt_half)
                          : proj_on(gst, xn, w.wqkv_gate, w.wqkv_gate_type, lz, lvdim, H)) &&
                         (ab_fused || (proj_on(gst, xn, w.ssm_alpha, w.ssm_alpha_type, ra, vh, H) &&
                                       proj_on(gst, xn, w.ssm_beta, w.ssm_beta_type, rb, vh, H)));
@@ -6051,6 +6072,16 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
                                                          s.w.lm_head_fp4_sf, logits,
                                                          N, c.vocab, H, fp4_ws, st,
                                                          s.w.lm_head_fp4_alpha);
+    }
+    // The decode shadow's ternary head: xn rotated and quantized per row, then the int8 rows
+    // kernel, which is bit-identical per row to single-row decode's GEMV.
+    if (!head_ok && packed && s.bonsai_dec_head && bt_q && s.bonsai_sign_hidden) {
+        head_ok = kernels::launch_ptq1_rotq_bf16(
+                      xn, static_cast<const signed char*>(s.bonsai_sign_hidden), bt_q, bt_qd,
+                      bt_qs, N, H, s.bonsai_block, st) &&
+                  kernels::launch_gemm_ptq1_i8_rows_f32(bt_q, bt_qd, bt_qs, s.bonsai_dec_head,
+                                                        logits, N, c.vocab, H, st, bt_part,
+                                                        bt_part_cap);
     }
     // Ternary head, read in its stored blocks. First in the chain because every arm below
     // consumes the Q8_1 activation against a Q4_K-shaped head, and this one wants the rotated

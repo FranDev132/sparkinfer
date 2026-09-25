@@ -122,6 +122,13 @@ bool launch_gemm_ptq1_i8_rows_bf16(const signed char* xq, const float* xd, const
                                    const void* w0, const void* w1, void* y0_bf16, void* y1_bf16,
                                    int m, int n_rows, int k, cudaStream_t stream,
                                    float* part = nullptr, size_t part_cap = 0);
+// The same two with fp32 output, for the LM head's logits: one matrix.
+bool launch_gemv_ptq1_i8_f32(const signed char* xq, const float* xd, const int* xs,
+                             const void* w, float* y, int n_rows, int k, cudaStream_t stream);
+bool launch_gemm_ptq1_i8_rows_f32(const signed char* xq, const float* xd, const int* xs,
+                                  const void* w, float* y, int m, int n_rows, int k,
+                                  cudaStream_t stream, float* part = nullptr,
+                                  size_t part_cap = 0);
 
 // Prefill's int8 GEMM operands. launch_ptq1_rows_i8: weight rows [rows, k] -> int8 in the STORED
 // (rotated) basis, t * round(s_b / scale), scale = max_b |s_b| / 127 per row -- the bytes the

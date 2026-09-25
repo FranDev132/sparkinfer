@@ -128,6 +128,9 @@ struct Qwen35PrefillCtx {
     // int8[qdim] on device, or null: the sign vector attn_output reads at, and ssm_out too when
     // the GDN value width is the same.
     const void* bonsai_sign_out = nullptr;
+    // The shadow's ternary LM head, or null: read through the int8 rows kernel, as single-row
+    // decode reads it through the int8 GEMV.
+    const void* bonsai_dec_head = nullptr;
 
     // PACKED PROMPT PREFILL. multi_n > 0 turns the pass's N rows from ONE prompt into multi_n
     // FRESH prompts laid end to end: prompt i is rows [multi_off[i], multi_off[i] + multi_len[i])

@@ -2036,7 +2036,34 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
                        w.wqkv_type == 12 && w.wqkv_gate_type == 12 &&
                        (H == 2048 || H == 4096 || H == 5120) && s.linear_qkvdim > 0 && s.linear_vdim > 0;
             }();
-            if (gdn_quad) {
+            // The decode shadow's in-projections: xn rotated and quantized once, then qkv on the
+            // main stream and z beside it (the int8 GEMV reads its activation, writes nothing
+            // shared), alpha/beta as before.
+            const bool gdn_t = dec_shadow && s.bonsai_ffn_q && s.bonsai_sign_h &&
+                               w.wqkv_type == kPtq1GgmlType && w.wqkv_gate_type == kPtq1GgmlType;
+            if (gdn_t) {
+                kernels::launch_ptq1_rotq_bf16(s.xn, s.bonsai_sign_h, s.bonsai_ffn_q,
+                                               s.bonsai_ffn_qd, s.bonsai_ffn_qs, 1, (int)H,
+                                               (int)s.bonsai_block, st);
+                cudaStream_t zs = st, abs_ = st;
+                if (gdn_pipelined) {
+                    cudaEventRecord(s.ev_pipe_fork, st);
+                    cudaStreamWaitEvent(s.stream_k, s.ev_pipe_fork, 0);
+                    cudaStreamWaitEvent(s.stream_v, s.ev_pipe_fork, 0);
+                    zs = s.stream_k;
+                    abs_ = s.stream_v;
+                }
+                kernels::launch_gemv_ptq1_i8_bf16(s.bonsai_ffn_q, s.bonsai_ffn_qd, s.bonsai_ffn_qs,
+                                                  w.wqkv_gate, nullptr, s.lin_z, nullptr,
+                                                  (int)s.linear_vdim, (int)H, zs);
+                if (gdn_pipelined) cudaEventRecord(s.ev_gdn_z, s.stream_k);
+                proj_xn(w.ssm_alpha, w.ssm_alpha_type, s.lin_alpha, c.linear_v_heads, abs_);
+                proj_xn(w.ssm_beta, w.ssm_beta_type, s.lin_beta, c.linear_v_heads, abs_);
+                if (gdn_pipelined) cudaEventRecord(s.ev_gdn_ab, s.stream_v);
+                kernels::launch_gemv_ptq1_i8_bf16(s.bonsai_ffn_q, s.bonsai_ffn_qd, s.bonsai_ffn_qs,
+                                                  w.wqkv, nullptr, s.lin_qkv, nullptr,
+                                                  (int)s.linear_qkvdim, (int)H, st);
+            } else if (gdn_quad) {
                 kernels::launch_gdn_quad_mmvq_q4k(s.aq81, w.wqkv, w.wqkv_gate, w.ssm_alpha, w.ssm_beta,
                     s.lin_qkv, s.lin_z, s.lin_alpha, s.lin_beta,
                     s.linear_qkvdim, s.linear_vdim, c.linear_v_heads, c.linear_v_heads, H, st);
@@ -2914,9 +2941,16 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
     // silently fed the LM head a stale aq81 left over from the last layer's fresh
     // prepare_xn_quant(xn) quantize (a *different*, pre-final-norm activation vector) --
     // wrong logits on every single decode step. Force a fresh quantize for muse_glimmer.
-    if (s.bonsai_dec_head) {
-        // The decode shadow's ternary head: rotate xn into the weights' basis, as the native
-        // branch below does, and read 0.21875 bytes/weight instead of the folded head's Q4_K.
+    if (s.bonsai_dec_head && s.bonsai_ffn_q &&
+        kernels::launch_ptq1_rotq_bf16(s.xn, s.bonsai_sign_h, s.bonsai_ffn_q, s.bonsai_ffn_qd,
+                                       s.bonsai_ffn_qs, 1, (int)H, (int)s.bonsai_block, st)) {
+        // The decode shadow's ternary head through the int8-activation GEMV, the arithmetic the
+        // packed step's rows kernel repeats per row: 0.28 GB a token instead of the folded 0.71.
+        kernels::launch_gemv_ptq1_i8_f32(s.bonsai_ffn_q, s.bonsai_ffn_qd, s.bonsai_ffn_qs,
+                                         s.bonsai_dec_head, s.logits, c.vocab, (int)H, st);
+    }
+    else if (s.bonsai_dec_head) {
+        // The same through the dp4a GEMV when the int8 arm is off (SPARKINFER_PTQ1_I8=0).
         const int hq = kernels::launch_ptq1_rotate_quant(s.xn, s.bonsai_rot, s.bonsai_sign_h,
                                                          (int)H, (int)s.bonsai_block, st);
         kernels::launch_gemv_ptq1_q_f32(hq, s.bonsai_rot, s.bonsai_dec_head, s.logits, c.vocab,
@@ -4385,6 +4419,7 @@ bool Qwen35Model::decode_packed(const int* tokens, const int* positions,
         ctx.bonsai_dec_layers = s.bonsai_dec_layers.data();
         const auto so = s.bonsai_sign_dev.find(s.qdim);
         if (so != s.bonsai_sign_dev.end()) ctx.bonsai_sign_out = so->second;
+        if (s.bonsai_ffn_q) ctx.bonsai_dec_head = s.bonsai_dec_head;
     }
     const int consumed = dflash_verify_short_run(ctx, tokens, n, positions[0],
                                                  nullptr, 0, nullptr, out_sampled);
@@ -6138,23 +6173,25 @@ bool Qwen35Model::load_gguf(const std::string& path) {
     }();
     const bool bonsai_shadow = had.present && bonsai_shadow_env && !bonsai_native_ffn &&
                                !bonsai_native_proj && !bonsai_native_head && !bonsai_native_embed;
-    // Which parts get a ternary copy: "head", "proj", "ffn", "attn", "out", comma-separated.
-    // "proj" is every residual-width projection; "attn" only the full-attention layers' q/k/v;
-    // "out" the two projections back into the residual (attn_output, ssm_out), which read the
-    // 6144-wide head output. Default: the FFN, the attention q/k/v and both outputs -- 3.2B
-    // weights (0.7 GB) on top of the FFN's 17.1B, each read through the int8-activation GEMV, and
-    // in a packed step through the tensor-core rows kernel that reproduces it bit for bit. Against
-    // the FFN alone that moves the logits by KL 0.019 (top-1 0.956, PPL 3.672 -> 3.642). The head
-    // and the GDN in-projections stay folded.
+    // Which parts get a ternary copy: "head", "proj", "ffn", "attn", "out", "gdn",
+    // comma-separated. "proj" is every residual-width projection; "attn" only the full-attention
+    // layers' q/k/v; "gdn" the Gated-DeltaNet in-projections (attn_qkv, attn_gate); "out" the two
+    // projections back into the residual (attn_output, ssm_out), which read the 6144-wide head
+    // output. Default: all of them -- the FFN, every projection and the LM head, 8.5B weights
+    // (1.9 GB) on top of the FFN's 17.1B, each read through the int8-activation GEMV, and in a
+    // packed step through the tensor-core rows kernel that reproduces it bit for bit. Against the
+    // attention and output projections alone that moves the logits by KL 0.011 (top-1 0.965,
+    // PPL 3.642 -> 3.617).
     static const std::string bonsai_shadow_parts = [] {
         const char* e = getenv("SPARKINFER_BONSAI_SHADOW_PARTS");
-        return std::string(e ? e : "ffn,attn,out");
+        return std::string(e ? e : "ffn,attn,out,gdn,head");
     }();
     const bool shadow_head = bonsai_shadow && bonsai_shadow_parts.find("head") != std::string::npos;
     const bool shadow_proj = bonsai_shadow && bonsai_shadow_parts.find("proj") != std::string::npos;
     const bool shadow_ffn = bonsai_shadow && bonsai_shadow_parts.find("ffn") != std::string::npos;
     const bool shadow_attn = bonsai_shadow && bonsai_shadow_parts.find("attn") != std::string::npos;
     const bool shadow_out = bonsai_shadow && bonsai_shadow_parts.find("out") != std::string::npos;
+    const bool shadow_gdn = bonsai_shadow && bonsai_shadow_parts.find("gdn") != std::string::npos;
     std::unordered_map<const void*, void*> shadow_of;   // folded weight -> its ternary copy
     if (bonsai_native || bonsai_shadow) {
         s.bonsai_block = had.block_size;
@@ -6712,8 +6749,11 @@ bool Qwen35Model::load_gguf(const std::string& path) {
         const bool out_part = name.find(".attn_output.") != std::string::npos ||
                               (name.find(".ssm_out.") != std::string::npos &&
                                s.cfg.linear_head_dim == 128 && s.linear_vdim == s.qdim);
+        const bool gdn_part = resid && (name.find(".attn_qkv.") != std::string::npos ||
+                                        name.find(".attn_gate.") != std::string::npos);
         const bool want = (shadow_proj && resid && s.bonsai_rot_xn) ||
-                          (s.bonsai_ffn_q && ((shadow_attn && attn_part) || (shadow_out && out_part)));
+                          (s.bonsai_ffn_q && ((shadow_attn && attn_part) || (shadow_out && out_part) ||
+                                              (shadow_gdn && gdn_part)));
         if (want && t && t->ggml_type == kPtq1GgmlType && s.bonsai_sign_dev.count(t->dims[0])) {
             UnrotateJob j;
             if (unrotate_job_init(j, t, name, *had.signs_for(t->dims[0]), had.block_size, false))
