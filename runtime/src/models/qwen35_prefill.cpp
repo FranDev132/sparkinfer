@@ -741,14 +741,25 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
     bool use_i8_attn = long_bf16 && (!_pi8attn || _pi8attn[0] != '0');
     // Dense short-ctx: GDN recurrence amplifies per-row int8 activation error at the H3
     // prefill_check size (Qwythos @512: top1 0.6875 < 0.80). Keep GDN on bf16 only for the
-    // exact H3 prefix (N==512). Short score prompts (200..360) stay on int8 GDN so vs-llama
-    // top1/KL clear the 0.90/0.20 bars; N>512 keeps int8 GDN for CB mid-ctx pp.
-    // SPARKINFER_PREFILL_I8_GDN=1/0 forces on/off at every N (A/B).
+    // exact H3 prefix (N==512) on that 4096-wide shape. Ternary-Bonsai-2 (H=5120, dense GGUF)
+    // already takes fused quantized-B GDN at every other scored length; N==512 was the leftover
+    // bf16 island, and on that model the fused path is both faster and inside the prefill_check
+    // spread. Short score prompts (200..360) stay on int8 GDN so vs-llama top1/KL clear the
+    // 0.90/0.20 bars; N>512 keeps int8 GDN for CB mid-ctx pp.
+    // SPARKINFER_PREFILL_I8_GDN=1/0 forces on/off at every N.
+    // SPARKINFER_PREFILL_I8_GDN_512=0 restores the N==512 bf16 island (A/B).
     const char* _pi8gdn = getenv("SPARKINFER_PREFILL_I8_GDN");
     const bool use_i8_gdn = !moe && use_i8 && [&]{
         if (_pi8gdn && _pi8gdn[0] == '1') return true;
         if (_pi8gdn && _pi8gdn[0] == '0') return false;
-        return N != 512;
+        if (N != 512) return true;
+        static const bool gdn512 = [] {
+            const char* e = getenv("SPARKINFER_PREFILL_I8_GDN_512");
+            return !(e && e[0] == '0');
+        }();
+        // Qwythos is 4096x12288 and needs the island. Compressed-tensors Qwen3.8 has no row
+        // scales, so dense_qb is false and it keeps bf16 GDN at 512 too.
+        return gdn512 && dense_qb && H == 5120;
     }();
     // GDN projections (wqkv/wqkv_gate/ssm_out) at long ctx: run them on the fp8 (e4m3) tensor cores
     // instead of bf16. int8 is off here because the near-1-decay recurrence amplifies per-row int8
@@ -1836,12 +1847,13 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
             // disabled; it stays on wmma (not mma.sync) in that fallback.
             // Gate on full prompt length N (not chunk rows R): FFN is token-chunked to FC=32k for
             // VRAM, so R<=FC would otherwise keep the dominant gate/up/down GEMMs on wmma forever.
-            // dense_qb models take it at every length: their short-context bf16 GEMMs are the GDN
-            // projections at exactly N==512 (use_i8_gdn), where the wmma kernel is 42 ms of a
-            // 134 ms Ternary-Bonsai-2 prefill. The two kernels issue the same m16n8k16 MMAs in the
-            // same K order into fp32 and round the same way, and measure byte-identical there
-            // (0 differing outputs at M=128/300/511/512/1000 on the GDN shapes) while the mma.sync
-            // one is 12-27% faster. SPARKINFER_PREFILL_BF16_MMA_DENSE=0 restores wmma.
+            // dense_qb models take it at every length. Qwythos (H=4096) still has short-context
+            // bf16 GDN GEMMs at exactly N==512 (use_i8_gdn); Ternary-Bonsai-2 (H=5120) now keeps
+            // those on the fused quantized-B path as well. The two bf16 kernels issue the same
+            // m16n8k16 MMAs in the same K order into fp32 and round the same way, and measure
+            // byte-identical (0 differing outputs at M=128/300/511/512/1000 on the GDN shapes)
+            // while the mma.sync one is 12-27% faster. SPARKINFER_PREFILL_BF16_MMA_DENSE=0
+            // restores wmma.
             const bool prefer_mma = !moe && (N > bf16_minctx || dense_bf16_mma);
             // A Q4_K weight that fills the device goes straight into the GEMM, skipping the dequant
             // pass (launch_prefill_gemm_q4k_bf16, byte-identical); anything it declines dequantizes.
