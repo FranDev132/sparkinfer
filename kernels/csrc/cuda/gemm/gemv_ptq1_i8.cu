@@ -223,6 +223,9 @@ int row_splits(int n_rows, int nblk, int nmat) {
         return n > 0 ? n : 170;
     }();
     const int ctas = (n_rows + 127) / 128 * nmat, nsteps = nblk / kStepBlocks;
+    // Four waves and more (the LM head's 1940) already fill the device; a split there only
+    // trades a wave-rounding sliver for a partial plane of vocab floats per row.
+    if (ctas >= 4 * sms) return 1;
     int best = 1;
     long best_cost = (long)((ctas + sms - 1) / sms) * nsteps;
     for (int S = 2; S <= 8; ++S) {
@@ -876,6 +879,18 @@ bool launch_gemv_ptq1_i8_bf16(const signed char* xq, const float* xd, const int*
                               int n_rows, int k, cudaStream_t st) {
     return launch_gemv_i8<__nv_bfloat16>(xq, xd, xs, w0, w1, static_cast<__nv_bfloat16*>(y0),
                                          static_cast<__nv_bfloat16*>(y1), n_rows, k, st);
+}
+
+bool launch_gemv_ptq1_i8_f32(const signed char* xq, const float* xd, const int* xs,
+                             const void* w, float* y, int n_rows, int k, cudaStream_t st) {
+    return launch_gemv_i8<float>(xq, xd, xs, w, nullptr, y, nullptr, n_rows, k, st);
+}
+
+bool launch_gemm_ptq1_i8_rows_f32(const signed char* xq, const float* xd, const int* xs,
+                                  const void* w, float* y, int m, int n_rows, int k,
+                                  cudaStream_t st, float* part, size_t part_cap) {
+    return launch_rows_i8<float>(xq, xd, xs, w, nullptr, y, nullptr, m, n_rows, k, st, part,
+                                 part_cap);
 }
 
 bool launch_gemm_ptq1_i8_rows_bf16(const signed char* xq, const float* xd, const int* xs,
