@@ -2834,12 +2834,25 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                     signed char* qp = apk_dst(fn, H);
                     a_pk = kernels::launch_prefill_quantize_rows_i8(hn_c, A_i8, sx, fn, H, st,
                                                                     qp) && qp;
-                    kernels::launch_prefill_gemm_i8(A_i8, ffn_Wg_i8, sx, ffn_swg, ffg, fn, ffn, H, st);
-                    kernels::launch_prefill_gemm_i8(A_i8, ffn_Wu_i8, sx, ffn_swu, ffu, fn, ffn, H, st);
+                    // Gate, up and SwiGLU in one GEMM whose epilogue writes h = bf16(silu(g) * u):
+                    // one bf16 plane goes to DRAM and comes back instead of two. Bit-identical to
+                    // the two GEMMs + launch_prefill_swiglu_quant_i8 (see the kernel). The launcher
+                    // declines a partial final chunk (fn % 128) and that chunk keeps the old form.
+                    // SPARKINFER_PREFILL_GEMM_I8_SWIGLU=0 keeps it everywhere.
+                    const bool h_ready = ffn >= 2048 && ffn <= 20480 &&
+                        kernels::launch_prefill_gemm_i8_swiglu(A_i8, ffn_Wg_i8, ffn_Wu_i8, sx,
+                                                               ffn_swg, ffn_swu, ffg, ffn, fn, ffn,
+                                                               H, st);
+                    if (!h_ready) {
+                        kernels::launch_prefill_gemm_i8(A_i8, ffn_Wg_i8, sx, ffn_swg, ffg, fn, ffn, H, st);
+                        kernels::launch_prefill_gemm_i8(A_i8, ffn_Wu_i8, sx, ffn_swu, ffu, fn, ffn, H, st);
+                    }
                     // fused SwiGLU + int8 quantize for the down input (skips the ffg DRAM round-trip)
                     qp = apk_dst(fn, ffn);
-                    a_pk = kernels::launch_prefill_swiglu_quant_i8(ffg, ffu, A_i8, sx, fn, ffn, st,
-                                                                   qp) && qp;
+                    a_pk = (h_ready
+                            ? kernels::launch_prefill_quant_h_i8(ffg, A_i8, sx, fn, ffn, st, qp)
+                            : kernels::launch_prefill_swiglu_quant_i8(ffg, ffu, A_i8, sx, fn, ffn,
+                                                                      st, qp)) && qp;
                     if (ffn_fused)
                         kernels::launch_prefill_gemm_i8_resid(A_i8, ffn_Wd_i8, sx, ffn_swd,
                                                               x + (size_t)fo * H, fn, H, ffn, st);
@@ -2873,7 +2886,44 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                             qb_partials, QB_SPLITS, qb_partials_cap,
                             A_i8, sx, &ffn_fused_swiglu, apk(), A_i8p);
                     }
-                    if (!ffn_grouped) {
+                    // Past the fused quantized-B GEMM's rows (and with no weight cache: one chunk)
+                    // gate and up each materialize into W_i8 and run the int8 GEMM, and the SwiGLU
+                    // kernel reads both bf16 planes back. launch_prefill_gemm_i8_swiglu forms h in
+                    // the GEMM epilogue instead. W_i8 holds one full weight, so it takes a gate half
+                    // and the matching up half per pass: two passes, no extra VRAM, the same rows
+                    // materialized. Bit-identical; SPARKINFER_PREFILL_GEMM_I8_SWIGLU=0 disables.
+                    static const bool gu_swiglu_on = [] {
+                        const char* e = getenv("SPARKINFER_PREFILL_GEMM_I8_SWIGLU");
+                        return !(e && e[0] == '0');
+                    }();
+                    bool h_ready = false;
+                    if (!ffn_grouped && gu_swiglu_on && use_i8 && ffn_i8_stage &&
+                        fn > kernels::pf_dense_gemm_qi8_max_m() && fn % 128 == 0 &&
+                        gate_pf_type == up_pf_type &&
+                        (gate_pf_type == 12 || gate_pf_type == 13 || gate_pf_type == 14) &&
+                        muse_gguf_row_bytes(gate_pf_type, H) > 0 && a_i8_fits(fn, H) &&
+                        ffn % 128 == 0 && ffn >= 2048 && ffn <= 20480 && H % 64 == 0 &&
+                        (size_t)ffn * H <= maxw && ffn <= maxNO) {
+                        const int nh = ffn / 2;
+                        const size_t rb = muse_gguf_row_bytes(gate_pf_type, H);
+                        signed char* Wg8 = W_i8;
+                        signed char* Wu8 = W_i8 + (size_t)nh * H;
+                        quant_a_i8(hn_c, fn, H);
+                        for (int h0 = 0; h0 < ffn; h0 += nh) {
+                            const char* gsrc = static_cast<const char*>(gate_pf) + (size_t)h0 * rb;
+                            const char* usrc = static_cast<const char*>(up_pf) + (size_t)h0 * rb;
+                            if (!kernels::launch_gguf_dequant_rows_i8(gate_pf_type, gsrc, Wg8, sw,
+                                                                      nh, H, st) ||
+                                !kernels::launch_gguf_dequant_rows_i8(up_pf_type, usrc, Wu8,
+                                                                      sw + nh, nh, H, st) ||
+                                !kernels::launch_prefill_gemm_i8_swiglu(A_i8, Wg8, Wu8, sx, sw,
+                                                                        sw + nh, ffg + h0, ffn,
+                                                                        fn, nh, H, st))
+                                break;
+                            h_ready = h0 + nh >= ffn;
+                        }
+                    }
+                    if (!ffn_grouped && !h_ready) {
                         proj_fused(hn_c, gate_pf, gate_pf_type, w.gate_rs, ffg, ffn, H, fn);
                         proj_fused(hn_c, up_pf,   up_pf_type,   w.up_rs,   ffu, ffn, H, fn);
                     }
@@ -2885,8 +2935,12 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                         // The fused epilogue already emitted the k-tiled copy (fuse_qp below).
                         if (!ffn_fused_swiglu) {
                             signed char* const qp = apk_dst(fn, ffn);
-                            a_pk = kernels::launch_prefill_swiglu_quant_i8(ffg, ffu, A_i8, sx, fn,
-                                                                          ffn, st, qp) && qp;
+                            a_pk = (h_ready
+                                    ? kernels::launch_prefill_quant_h_i8(ffg, A_i8, sx, fn, ffn,
+                                                                         st, qp)
+                                    : kernels::launch_prefill_swiglu_quant_i8(ffg, ffu, A_i8, sx,
+                                                                              fn, ffn, st, qp)) &&
+                                   qp;
                         } else
                             a_pk = A_i8p != nullptr;
                         // Fused quantized-B down projection. The activation is ALREADY in A_i8/sx

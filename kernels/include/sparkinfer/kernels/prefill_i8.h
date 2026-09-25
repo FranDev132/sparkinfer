@@ -37,6 +37,15 @@ bool launch_prefill_quantize_rows_i8(const void* x_bf16, signed char* q, float* 
 // int8 GEMM:  C[M,N] = A[M,K] @ W^T,  W native GGUF [N,K] row-major (so C[m,n]=sum_k A[m,k]*W[n,k]).
 // A/W int8 with per-row scales sx[M] (per token) and sw[N] (per output channel). Output C is bf16
 // with the dequant sx[m]*sw[n] fused into the store. Drop-in for the bf16 launch_prefill_gemm.
+// FFN gate+up+SwiGLU in one int8 GEMM: H[m, c] = bf16(silu(g) * u) for c in [0, NH), where g and u
+// are the bf16 outputs launch_prefill_gemm_i8 would give for W = Wg and W = Wu (NH rows each, row
+// scales swg/swu). H has row pitch ldh (elements). Needs M % 128, NH % 64 and K % 64 == 0; returns
+// false otherwise (or when SPARKINFER_PREFILL_GEMM_I8_SWIGLU=0) and launches nothing.
+bool launch_prefill_gemm_i8_swiglu(const signed char* A, const signed char* Wg,
+                                   const signed char* Wu, const float* sx, const float* swg,
+                                   const float* swu, void* H, int ldh, int M, int NH, int K,
+                                   cudaStream_t stream = nullptr);
+
 void launch_prefill_gemm_i8(const signed char* A, const signed char* W,
                             const float* sx, const float* sw, void* C,
                             int M, int N, int K, cudaStream_t stream = nullptr);

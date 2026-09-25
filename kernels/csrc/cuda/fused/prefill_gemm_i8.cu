@@ -30,10 +30,17 @@ __device__ __forceinline__ void pf_cp16(void* dst, const void* src, bool pred) {
     else      *reinterpret_cast<uint4*>(dst) = make_uint4(0u, 0u, 0u, 0u);
 }
 
-// XOR swizzle at 16B granularity: chunk c of row r lives at chunk (c ^ (r & 3)). Rows 4 apart still
-// collide (2-way); rows 0..3 -- the stride the 4B operand loads walk -- land on disjoint banks.
+// XOR swizzle at 16B granularity. A 64B row covers 16 banks, so rows r and r+1 share one 128B bank
+// line and an 8-row ldmatrix phase needs rows {0,2,4,6} (and {1,3,5,7}) on four DIFFERENT chunks.
+// `c ^ (r & 3)` -- laid out for the 4B lds.32 walk this kernel no longer does -- puts rows 0 and 4
+// on the same chunk, so every operand ldmatrix pays a 2-way conflict. `c ^ ((r >> 1) & 3)` gives the
+// eight rows eight distinct 16B bank groups. Stores and loads both go through it, so smem holds
+// the same bytes at different addresses and C is unchanged. SWZ=0 keeps the old map
+// (SPARKINFER_PREFILL_GEMM_I8_SWZ=0).
+template <int SWZ = 1>
 __device__ __forceinline__ int pf_swz(int k, int row) {
-    return (((k >> 4) ^ (row & 3)) << 4) | (k & 15);
+    if constexpr (SWZ == 0) return (((k >> 4) ^ (row & 3)) << 4) | (k & 15);
+    return (((k >> 4) ^ ((row >> 1) & 3)) << 4) | (k & 15);
 }
 
 // ldmatrix.x4: one instruction moves all four 8x8 operand tiles of an mma fragment through the
@@ -77,7 +84,7 @@ __global__ void pf_quantize_rows_i8(const __nv_bfloat16* __restrict__ x, signed 
 // in range. The predicates are data-dependent otherwise and ptxas cannot delete them; on the
 // aligned FFN shapes they are pure issue overhead around the copies and the store. Same addresses,
 // same values. SPARKINFER_PREFILL_GEMM_I8_ALIGNED=0 keeps the checked kernel.
-template <bool RESID, bool SPLITK, bool FULL = false>
+template <bool RESID, bool SPLITK, bool FULL = false, int SWZ = 1>
 __global__ __launch_bounds__(256, 2) void pf_gemm_i8_kernel(
         const signed char* __restrict__ A, const signed char* __restrict__ W,
         const float* __restrict__ sx, const float* __restrict__ sw,
@@ -121,11 +128,11 @@ __global__ __launch_bounds__(256, 2) void pf_gemm_i8_kernel(
             const int r = s >> 2, c = s & 3, k = c << 4;
             const int gm = m0 + r, gn = n0 + r, gk = k0 + k;
             if constexpr (FULL) {
-                __pipeline_memcpy_async(&As[buf][r][pf_swz(k, r)], &A[(size_t)gm * K + gk], 16);
-                __pipeline_memcpy_async(&Bs[buf][r][pf_swz(k, r)], &W[(size_t)gn * K + gk], 16);
+                __pipeline_memcpy_async(&As[buf][r][pf_swz<SWZ>(k, r)], &A[(size_t)gm * K + gk], 16);
+                __pipeline_memcpy_async(&Bs[buf][r][pf_swz<SWZ>(k, r)], &W[(size_t)gn * K + gk], 16);
             } else {
-                pf_cp16(&As[buf][r][pf_swz(k, r)], &A[(size_t)gm * K + gk], gm < M && gk < K);
-                pf_cp16(&Bs[buf][r][pf_swz(k, r)], &W[(size_t)gn * K + gk], gn < N && gk < K);
+                pf_cp16(&As[buf][r][pf_swz<SWZ>(k, r)], &A[(size_t)gm * K + gk], gm < M && gk < K);
+                pf_cp16(&Bs[buf][r][pf_swz<SWZ>(k, r)], &W[(size_t)gn * K + gk], gn < N && gk < K);
             }
         }
         __pipeline_commit();
@@ -146,14 +153,14 @@ __global__ __launch_bounds__(256, 2) void pf_gemm_i8_kernel(
             for (int i = 0; i < PF_MFRAG; i++) {
                 const int row = wm * 32 + i * 16 + (sub & 1) * 8 + lrow;
                 pf_ldm_x4(af[i][0], af[i][1], af[i][2], af[i][3],
-                          &As[buf][row][pf_swz(kk + (sub >> 1) * 16, row)]);
+                          &As[buf][row][pf_swz<SWZ>(kk + (sub >> 1) * 16, row)]);
             }
             // B pair (j, j+1): tiles {cols j,k0} {cols j,k16} {cols j+1,k0} {cols j+1,k16}
             #pragma unroll
             for (int jp = 0; jp < PF_NFRAG; jp += 2) {
                 const int col = wn * 64 + (jp + (sub >> 1)) * 8 + lrow;
                 pf_ldm_x4(bf[jp][0], bf[jp][1], bf[jp + 1][0], bf[jp + 1][1],
-                          &Bs[buf][col][pf_swz(kk + (sub & 1) * 16, col)]);
+                          &Bs[buf][col][pf_swz<SWZ>(kk + (sub & 1) * 16, col)]);
             }
             #pragma unroll
             for (int i = 0; i < PF_MFRAG; i++)
@@ -233,6 +240,273 @@ __global__ __launch_bounds__(256, 2) void pf_gemm_i8_kernel(
         }
     }
 }
+// FULL-tile kernel with a 64x64 warp tile: the same 128x128 block, four warps instead of eight.
+// Each warp's k32 step issues 8 ldmatrix.x4 for 32 mma (the 32x64 warp tile above: 6 for 16), a
+// third less shared-memory traffic per MAC, and the half-size block buys a third cp.async stage in
+// the same 48 KB of smem while two blocks still fit an SM. The accumulator is int32 and the
+// epilogue is the per-element arithmetic of pf_gemm_i8_kernel, so C is bit-identical.
+// SPARKINFER_PREFILL_GEMM_I8_W4=0 keeps pf_gemm_i8_kernel.
+//
+// GRP > 0 walks the output on a 1-D grid, GRP M-tiles at a time across every N-tile, instead of
+// N-fastest over the whole M range, so the ~340 live tiles share fewer weight columns. Measured in
+// the model on Ternary-Bonsai-2 at ctx 4096: 314.8 -> 310.0 ms of this GEMM per prefill. Only the
+// block->tile map changes; each tile's arithmetic is untouched. SPARKINFER_PREFILL_GEMM_I8_RASTER=0
+// keeps the 2-D grid.
+constexpr int PF_W4_ST = 3;
+constexpr int PF_W4_GRP = 8;
+constexpr int PF_W4_MF = 4;        // 64 rows per warp / 16
+constexpr int PF_W4_NF = 8;        // 64 cols per warp / 8
+constexpr size_t PF_W4_SMEM = (size_t)PF_W4_ST * (PF_BM + PF_BN) * PF_BK;
+
+template <bool RESID, int GRP>
+__global__ __launch_bounds__(128, 2) void pf_gemm_i8_w4_kernel(
+        const signed char* __restrict__ A, const signed char* __restrict__ W,
+        const float* __restrict__ sx, const float* __restrict__ sw,
+        __nv_bfloat16* C, int M, int N, int K) {
+    extern __shared__ __align__(16) signed char pf_w4_smem[];
+    auto As = reinterpret_cast<signed char (*)[PF_BM][PF_BK]>(pf_w4_smem);
+    auto Bs = reinterpret_cast<signed char (*)[PF_BN][PF_BK]>(pf_w4_smem + PF_W4_ST * PF_BM * PF_BK);
+
+    const int tid  = threadIdx.x;
+    const int warp = tid >> 5;
+    const int lane = tid & 31;
+    const int grp  = lane >> 2;
+    const int tig  = lane & 3;
+    const int sub  = lane >> 3;
+    const int lrow = lane & 7;
+    const int wm   = warp & 1;                        // rows [wm*64, +64)
+    const int wn   = warp >> 1;                       // cols [wn*64, +64)
+    int mt = blockIdx.y, nt = blockIdx.x;
+    if constexpr (GRP > 0) {
+        const int tiles_m = M / PF_BM, tiles_n = N / PF_BN;
+        const int per = GRP * tiles_n, g = blockIdx.x / per, r = blockIdx.x - g * per;
+        const int fm = g * GRP, gs = min(tiles_m - fm, GRP);
+        mt = fm + r % gs;
+        nt = r / gs;
+    }
+    const int m0   = mt * PF_BM;
+    const int n0   = nt * PF_BN;
+    const int nk   = K / PF_BK;
+
+    int acc[PF_W4_MF][PF_W4_NF][4];
+    #pragma unroll
+    for (int i = 0; i < PF_W4_MF; i++)
+        #pragma unroll
+        for (int j = 0; j < PF_W4_NF; j++)
+            #pragma unroll
+            for (int e = 0; e < 4; e++) acc[i][j][e] = 0;
+
+    // 512 16B chunks per operand tile; 128 threads stage 4 A-chunks + 4 B-chunks each.
+    auto stage = [&](int buf, int k0) {
+        #pragma unroll
+        for (int s = tid; s < 512; s += 128) {
+            const int r = s >> 2, k = (s & 3) << 4;
+            __pipeline_memcpy_async(&As[buf][r][pf_swz(k, r)], &A[(size_t)(m0 + r) * K + k0 + k], 16);
+            __pipeline_memcpy_async(&Bs[buf][r][pf_swz(k, r)], &W[(size_t)(n0 + r) * K + k0 + k], 16);
+        }
+    };
+
+    // Stage t waits for its own group, then (after the barrier that retires every read of the
+    // buffer it is about to refill) issues stage t+ST-1. One commit per iteration, empty at the tail,
+    // so wait_prior(ST-2) always means "tile t has landed".
+    #pragma unroll
+    for (int s = 0; s < PF_W4_ST - 1; s++) {
+        if (s < nk) stage(s, s * PF_BK);
+        __pipeline_commit();
+    }
+    for (int t = 0; t < nk; t++) {
+        __pipeline_wait_prior(PF_W4_ST - 2);
+        __syncthreads();
+        const int buf = t % PF_W4_ST;
+        {
+            const int tn = t + PF_W4_ST - 1;
+            if (tn < nk) stage(tn % PF_W4_ST, tn * PF_BK);
+            __pipeline_commit();
+        }
+        #pragma unroll
+        for (int kk = 0; kk < PF_BK; kk += 32) {
+            unsigned af[PF_W4_MF][4], bf[PF_W4_NF][2];
+            #pragma unroll
+            for (int i = 0; i < PF_W4_MF; i++) {
+                const int row = wm * 64 + i * 16 + (sub & 1) * 8 + lrow;
+                pf_ldm_x4(af[i][0], af[i][1], af[i][2], af[i][3],
+                          &As[buf][row][pf_swz(kk + (sub >> 1) * 16, row)]);
+            }
+            #pragma unroll
+            for (int jp = 0; jp < PF_W4_NF; jp += 2) {
+                const int col = wn * 64 + (jp + (sub >> 1)) * 8 + lrow;
+                pf_ldm_x4(bf[jp][0], bf[jp][1], bf[jp + 1][0], bf[jp + 1][1],
+                          &Bs[buf][col][pf_swz(kk + (sub & 1) * 16, col)]);
+            }
+            #pragma unroll
+            for (int i = 0; i < PF_W4_MF; i++)
+                #pragma unroll
+                for (int j = 0; j < PF_W4_NF; j++)
+                    asm volatile(
+                        "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
+                        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+                        : "+r"(acc[i][j][0]), "+r"(acc[i][j][1]), "+r"(acc[i][j][2]), "+r"(acc[i][j][3])
+                        : "r"(af[i][0]), "r"(af[i][1]), "r"(af[i][2]), "r"(af[i][3]),
+                          "r"(bf[j][0]), "r"(bf[j][1]));
+        }
+    }
+
+    // pf_gemm_i8_kernel's FULL store, same expression order.
+    #pragma unroll
+    for (int i = 0; i < PF_W4_MF; i++) {
+        #pragma unroll
+        for (int j = 0; j < PF_W4_NF; j++) {
+            const int gn = n0 + wn * 64 + j * 8 + tig * 2;
+            const float w0 = sw[gn], w1 = sw[gn + 1];
+            #pragma unroll
+            for (int h = 0; h < 2; h++) {
+                const int gm = m0 + wm * 64 + i * 16 + grp + h * 8;
+                const float s = sx[gm];
+                __nv_bfloat162 v = __floats2bfloat162_rn((float)acc[i][j][h * 2] * s * w0,
+                                                         (float)acc[i][j][h * 2 + 1] * s * w1);
+                __nv_bfloat162* cp = reinterpret_cast<__nv_bfloat162*>(&C[(size_t)gm * N + gn]);
+                if (RESID) {
+                    const __nv_bfloat162 r = *cp;
+                    v = __floats2bfloat162_rn(__bfloat162float(r.x) + __bfloat162float(v.x),
+                                              __bfloat162float(r.y) + __bfloat162float(v.y));
+                }
+                *cp = v;
+            }
+        }
+    }
+}
+
+// FFN gate+up+SwiGLU in one GEMM. A block owns 64 FFN channels of BOTH projections: B rows 0..63
+// are gate channels [c0, c0+64), rows 64..127 the same up channels. Warp (wm, wn) takes gate
+// channels [wn*32, +32) and the same up channels, so acc[i][j] (gate) and acc[i][j+4] (up) are the
+// same (row, channel) in the same thread and the epilogue forms h with no exchange.
+//
+// Bit-identical to gate GEMM + up GEMM + launch_prefill_swiglu_quant_i8: g and u are rounded to
+// bf16 by the same expression pf_gemm_i8_kernel's store uses, and h by the one the SwiGLU kernel
+// uses (pf_gu_silu is its sq_silu; both TUs are si_fused with the same flags). h is then quantized
+// by launch_prefill_quant_h_i8, which reads back exactly the value the SwiGLU kernel held.
+// What it removes is the bf16 gate and up planes: 4 B written and 4 B read per FFN activation
+// become 2 + 2. SPARKINFER_PREFILL_GEMM_I8_SWIGLU=0 keeps the three-kernel form.
+__device__ __forceinline__ float pf_gu_silu(float x) { return x / (1.f + __expf(-x)); }
+
+template <int GRP>
+__global__ __launch_bounds__(128, 2) void pf_gemm_i8_gu_kernel(
+        const signed char* __restrict__ A, const signed char* __restrict__ Wg,
+        const signed char* __restrict__ Wu, const float* __restrict__ sx,
+        const float* __restrict__ swg, const float* __restrict__ swu,
+        __nv_bfloat16* __restrict__ Hout, int ldh, int M, int NH, int K) {
+    extern __shared__ __align__(16) signed char pf_w4_smem[];
+    auto As = reinterpret_cast<signed char (*)[PF_BM][PF_BK]>(pf_w4_smem);
+    auto Bs = reinterpret_cast<signed char (*)[PF_BN][PF_BK]>(pf_w4_smem + PF_W4_ST * PF_BM * PF_BK);
+
+    const int tid  = threadIdx.x;
+    const int warp = tid >> 5;
+    const int lane = tid & 31;
+    const int grp  = lane >> 2;
+    const int tig  = lane & 3;
+    const int sub  = lane >> 3;
+    const int lrow = lane & 7;
+    const int wm   = warp & 1;                        // rows [wm*64, +64)
+    const int wn   = warp >> 1;                       // channels [wn*32, +32) of gate and of up
+    constexpr int CH = PF_BN / 2;                     // 64 channels per block
+    int mt = blockIdx.y, nt = blockIdx.x;
+    if constexpr (GRP > 0) {
+        const int tiles_m = M / PF_BM, tiles_n = NH / CH;
+        const int per = GRP * tiles_n, g = blockIdx.x / per, r = blockIdx.x - g * per;
+        const int fm = g * GRP, gs = min(tiles_m - fm, GRP);
+        mt = fm + r % gs;
+        nt = r / gs;
+    }
+    const int m0 = mt * PF_BM;
+    const int c0 = nt * CH;
+    const int nk = K / PF_BK;
+
+    int acc[PF_W4_MF][PF_W4_NF][4];
+    #pragma unroll
+    for (int i = 0; i < PF_W4_MF; i++)
+        #pragma unroll
+        for (int j = 0; j < PF_W4_NF; j++)
+            #pragma unroll
+            for (int e = 0; e < 4; e++) acc[i][j][e] = 0;
+
+    auto stage = [&](int buf, int k0) {
+        #pragma unroll
+        for (int s = tid; s < 512; s += 128) {
+            const int r = s >> 2, k = (s & 3) << 4;
+            const signed char* b = r < CH ? &Wg[(size_t)(c0 + r) * K] : &Wu[(size_t)(c0 + r - CH) * K];
+            __pipeline_memcpy_async(&As[buf][r][pf_swz(k, r)], &A[(size_t)(m0 + r) * K + k0 + k], 16);
+            __pipeline_memcpy_async(&Bs[buf][r][pf_swz(k, r)], b + k0 + k, 16);
+        }
+    };
+
+    #pragma unroll
+    for (int s = 0; s < PF_W4_ST - 1; s++) {
+        if (s < nk) stage(s, s * PF_BK);
+        __pipeline_commit();
+    }
+    for (int t = 0; t < nk; t++) {
+        __pipeline_wait_prior(PF_W4_ST - 2);
+        __syncthreads();
+        const int buf = t % PF_W4_ST;
+        {
+            const int tn = t + PF_W4_ST - 1;
+            if (tn < nk) stage(tn % PF_W4_ST, tn * PF_BK);
+            __pipeline_commit();
+        }
+        #pragma unroll
+        for (int kk = 0; kk < PF_BK; kk += 32) {
+            unsigned af[PF_W4_MF][4], bf[PF_W4_NF][2];
+            #pragma unroll
+            for (int i = 0; i < PF_W4_MF; i++) {
+                const int row = wm * 64 + i * 16 + (sub & 1) * 8 + lrow;
+                pf_ldm_x4(af[i][0], af[i][1], af[i][2], af[i][3],
+                          &As[buf][row][pf_swz(kk + (sub >> 1) * 16, row)]);
+            }
+            // jp 0,2: gate channels; jp 4,6: the same up channels (Bs rows +64)
+            #pragma unroll
+            for (int jp = 0; jp < PF_W4_NF; jp += 2) {
+                const int col = (jp >= 4 ? CH : 0) + wn * 32 + ((jp & 3) + (sub >> 1)) * 8 + lrow;
+                pf_ldm_x4(bf[jp][0], bf[jp][1], bf[jp + 1][0], bf[jp + 1][1],
+                          &Bs[buf][col][pf_swz(kk + (sub & 1) * 16, col)]);
+            }
+            #pragma unroll
+            for (int i = 0; i < PF_W4_MF; i++)
+                #pragma unroll
+                for (int j = 0; j < PF_W4_NF; j++)
+                    asm volatile(
+                        "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
+                        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+                        : "+r"(acc[i][j][0]), "+r"(acc[i][j][1]), "+r"(acc[i][j][2]), "+r"(acc[i][j][3])
+                        : "r"(af[i][0]), "r"(af[i][1]), "r"(af[i][2]), "r"(af[i][3]),
+                          "r"(bf[j][0]), "r"(bf[j][1]));
+        }
+    }
+
+    #pragma unroll
+    for (int i = 0; i < PF_W4_MF; i++) {
+        #pragma unroll
+        for (int j = 0; j < PF_W4_NF / 2; j++) {
+            const int ch = c0 + wn * 32 + j * 8 + tig * 2;
+            const float g0 = swg[ch], g1 = swg[ch + 1], u0 = swu[ch], u1 = swu[ch + 1];
+            #pragma unroll
+            for (int h = 0; h < 2; h++) {
+                const int gm = m0 + wm * 64 + i * 16 + grp + h * 8;
+                const float s = sx[gm];
+                // the gate and up GEMMs' stores ...
+                const __nv_bfloat162 gv = __floats2bfloat162_rn((float)acc[i][j][h * 2] * s * g0,
+                                                                (float)acc[i][j][h * 2 + 1] * s * g1);
+                const __nv_bfloat162 uv = __floats2bfloat162_rn((float)acc[i][j + 4][h * 2] * s * u0,
+                                                                (float)acc[i][j + 4][h * 2 + 1] * s * u1);
+                // ... then the SwiGLU kernel's h
+                __nv_bfloat162 hv;
+                hv.x = __float2bfloat16(pf_gu_silu(__bfloat162float(gv.x)) * __bfloat162float(uv.x));
+                hv.y = __float2bfloat16(pf_gu_silu(__bfloat162float(gv.y)) * __bfloat162float(uv.y));
+                *reinterpret_cast<__nv_bfloat162*>(&Hout[(size_t)gm * ldh + ch]) = hv;
+            }
+        }
+    }
+}
+
 // Split-K epilogue: apply the per-token / per-channel scales to the int32 partial sum. The
 // arithmetic is copied from the in-GEMM epilogue above -- ((float)acc * sx[m]) * sw[n] rounded
 // round-to-nearest, and for RESID the same round-then-add-then-round the fused store does -- so
@@ -340,17 +614,58 @@ static bool pf_gemm_i8_full_tile(int M, int N, int K) {
            (M % PF_BM) == 0 && (N % PF_BN) == 0 && (K % PF_BK) == 0;
 }
 
+static bool pf_gemm_i8_env_on(const char* name) {
+    const char* v = getenv(name);
+    return !(v && v[0] == '0');
+}
+static bool pf_gemm_i8_swz_on() {
+    static const bool on = pf_gemm_i8_env_on("SPARKINFER_PREFILL_GEMM_I8_SWZ");
+    return on;
+}
+
+template <bool RESID>
+static void pf_gemm_i8_run(const signed char* A, const signed char* W, const float* sx,
+                           const float* sw, __nv_bfloat16* c, int M, int N, int K,
+                           cudaStream_t stream) {
+    dim3 grid((N + PF_BN - 1) / PF_BN, (M + PF_BM - 1) / PF_BM);
+    const bool full = pf_gemm_i8_full_tile(M, N, K);
+    static const bool w4 = pf_gemm_i8_env_on("SPARKINFER_PREFILL_GEMM_I8_W4");
+    if (full && w4 && pf_gemm_i8_swz_on()) {
+        static const bool raster = pf_gemm_i8_env_on("SPARKINFER_PREFILL_GEMM_I8_RASTER");
+        static const bool attr = [] {
+            // Ask for the full carveout so two 48 KB blocks share an SM.
+            cudaFuncSetAttribute(pf_gemm_i8_w4_kernel<RESID, PF_W4_GRP>,
+                                 cudaFuncAttributePreferredSharedMemoryCarveout, 100);
+            cudaFuncSetAttribute(pf_gemm_i8_w4_kernel<RESID, 0>,
+                                 cudaFuncAttributePreferredSharedMemoryCarveout, 100);
+            return true;
+        }();
+        (void)attr;
+        if (raster)
+            pf_gemm_i8_w4_kernel<RESID, PF_W4_GRP><<<dim3(grid.x * grid.y), 128, PF_W4_SMEM, stream>>>(
+                A, W, sx, sw, c, M, N, K);
+        else
+            pf_gemm_i8_w4_kernel<RESID, 0><<<grid, 128, PF_W4_SMEM, stream>>>(A, W, sx, sw, c, M, N, K);
+    } else if (!pf_gemm_i8_swz_on()) {
+        if (full)
+            pf_gemm_i8_kernel<RESID, false, true, 0><<<grid, 256, 0, stream>>>(
+                A, W, sx, sw, c, nullptr, M, N, K, 0);
+        else
+            pf_gemm_i8_kernel<RESID, false, false, 0><<<grid, 256, 0, stream>>>(
+                A, W, sx, sw, c, nullptr, M, N, K, 0);
+    } else if (full) {
+        pf_gemm_i8_kernel<RESID, false, true><<<grid, 256, 0, stream>>>(
+            A, W, sx, sw, c, nullptr, M, N, K, 0);
+    } else {
+        pf_gemm_i8_kernel<RESID, false, false><<<grid, 256, 0, stream>>>(
+            A, W, sx, sw, c, nullptr, M, N, K, 0);
+    }
+}
+
 void launch_prefill_gemm_i8(const signed char* A, const signed char* W,
                             const float* sx, const float* sw, void* C,
                             int M, int N, int K, cudaStream_t stream) {
-    dim3 grid((N + PF_BN - 1) / PF_BN, (M + PF_BM - 1) / PF_BM);
-    auto* c = reinterpret_cast<__nv_bfloat16*>(C);
-    if (pf_gemm_i8_full_tile(M, N, K))
-        pf_gemm_i8_kernel<false, false, true><<<grid, 256, 0, stream>>>(
-            A, W, sx, sw, c, nullptr, M, N, K, 0);
-    else
-        pf_gemm_i8_kernel<false, false, false><<<grid, 256, 0, stream>>>(
-            A, W, sx, sw, c, nullptr, M, N, K, 0);
+    pf_gemm_i8_run<false>(A, W, sx, sw, reinterpret_cast<__nv_bfloat16*>(C), M, N, K, stream);
 }
 
 // Residual-fused variant: C[m,n] += bf16(acc*sx*sw) with pf_add's rounding. Passing the residual
@@ -358,14 +673,29 @@ void launch_prefill_gemm_i8(const signed char* A, const signed char* W,
 void launch_prefill_gemm_i8_resid(const signed char* A, const signed char* W,
                                   const float* sx, const float* sw, void* C,
                                   int M, int N, int K, cudaStream_t stream) {
-    dim3 grid((N + PF_BN - 1) / PF_BN, (M + PF_BM - 1) / PF_BM);
-    auto* c = reinterpret_cast<__nv_bfloat16*>(C);
-    if (pf_gemm_i8_full_tile(M, N, K))
-        pf_gemm_i8_kernel<true, false, true><<<grid, 256, 0, stream>>>(
-            A, W, sx, sw, c, nullptr, M, N, K, 0);
-    else
-        pf_gemm_i8_kernel<true, false, false><<<grid, 256, 0, stream>>>(
-            A, W, sx, sw, c, nullptr, M, N, K, 0);
+    pf_gemm_i8_run<true>(A, W, sx, sw, reinterpret_cast<__nv_bfloat16*>(C), M, N, K, stream);
+}
+
+
+bool launch_prefill_gemm_i8_swiglu(const signed char* A, const signed char* Wg,
+                                   const signed char* Wu, const float* sx, const float* swg,
+                                   const float* swu, void* H, int ldh, int M, int NH, int K,
+                                   cudaStream_t stream) {
+    // SPARKINFER_PREFILL_GEMM_I8_SWZ=0 is the full rollback to main's GEMM, so it declines here too.
+    static const bool on = pf_gemm_i8_env_on("SPARKINFER_PREFILL_GEMM_I8_SWIGLU");
+    if (!on || !pf_gemm_i8_swz_on() || M <= 0 || NH <= 0 || K <= 0 || (M % PF_BM) || (NH % (PF_BN / 2)) || (K % PF_BK) ||
+        (ldh % 2))
+        return false;
+    static const bool attr = [] {
+        cudaFuncSetAttribute(pf_gemm_i8_gu_kernel<PF_W4_GRP>,
+                             cudaFuncAttributePreferredSharedMemoryCarveout, 100);
+        return true;
+    }();
+    (void)attr;
+    const int tiles = (M / PF_BM) * (NH / (PF_BN / 2));
+    pf_gemm_i8_gu_kernel<PF_W4_GRP><<<tiles, 128, PF_W4_SMEM, stream>>>(
+        A, Wg, Wu, sx, swg, swu, reinterpret_cast<__nv_bfloat16*>(H), ldh, M, NH, K);
+    return true;
 }
 
 }} // namespace sparkinfer::kernels

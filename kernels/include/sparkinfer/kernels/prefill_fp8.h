@@ -58,5 +58,11 @@ bool launch_prefill_swiglu_quant_i8_acc(const int* acc_g, const int* acc_u, cons
 bool launch_prefill_swiglu_quant_i8(const void* gate, const void* up, signed char* q, float* scale,
                                     int rows, int cols, cudaStream_t stream = nullptr,
                                     signed char* qp = nullptr);
+// launch_prefill_swiglu_quant_i8's quantize on a precomputed h = bf16(silu(g) * u) (the output of
+// launch_prefill_gemm_i8_swiglu). Same q, scale and packed copy as the gate/up form. Returns false
+// when the shape is outside the register-resident kernel (cols < 2048 or > 20480); the caller then
+// must not have taken the fused GEMM.
+bool launch_prefill_quant_h_i8(const void* h, signed char* q, float* scale, int rows, int cols,
+                               cudaStream_t stream, signed char* qp = nullptr);
 
 }} // namespace sparkinfer::kernels

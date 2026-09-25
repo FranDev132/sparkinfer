@@ -36,6 +36,7 @@
 #include "sparkinfer/kernels/qtype.h"
 
 #include <cstdlib>
+#include <cstdint>
 
 namespace sparkinfer {
 namespace kernels {
@@ -118,6 +119,40 @@ __device__ __forceinline__ float dqr_q6k_val(const unsigned char* blk, int t) {
 }
 
 
+// A thread's four consecutive Q4_K values share one super-block, one 64-value half-group (so one
+// scale/min pair) and four consecutive qs bytes. dqr_q4k_val re-reads d, dmin, the scale bytes and
+// its qs byte with one single-byte (or halfword) load each, per value -- about five LSU ops per
+// weight in a kernel whose job is streaming. This takes the same bytes in five word loads per FOUR
+// values. The per-value arithmetic is dqr_q4k_val's expression on the same operands, so the output
+// is byte-identical. Needs `blk` 4-byte aligned: the launcher checks src, and 144 % 4 == 0.
+__device__ __forceinline__ void dqr_q4k_val4(const unsigned char* blk, int off, float (&out)[4]) {
+    const unsigned dm = *reinterpret_cast<const unsigned*>(blk);
+    const float d = __half2float(__ushort_as_half((unsigned short)(dm & 0xFFFFu)));
+    const float dmin = __half2float(__ushort_as_half((unsigned short)(dm >> 16)));
+    const unsigned sw0 = *reinterpret_cast<const unsigned*>(blk + 4);
+    const unsigned sw1 = *reinterpret_cast<const unsigned*>(blk + 8);
+    const unsigned sw2 = *reinterpret_cast<const unsigned*>(blk + 12);
+    auto scb = [&](int k) -> int {
+        const unsigned w = k < 4 ? sw0 : (k < 8 ? sw1 : sw2);
+        return (int)((w >> (8 * (k & 3))) & 0xFFu);
+    };
+    const int j64 = off >> 6, r = off & 63, l = r & 31, hi = r >> 5;
+    const unsigned qw = *reinterpret_cast<const unsigned*>(blk + 16 + j64 * 32 + l);
+    const int j = 2 * j64 + hi;
+    int s, m;
+    if (j < 4) { s = scb(j) & 63; m = scb(j + 4) & 63; }
+    else {
+        s = (scb(j + 4) & 0xF) | ((scb(j - 4) >> 6) << 4);
+        m = (scb(j + 4) >> 4)  | ((scb(j)     >> 6) << 4);
+    }
+    #pragma unroll
+    for (int i = 0; i < 4; i++) {
+        const int byte = (int)((qw >> (8 * i)) & 0xFFu);
+        const int nib = hi ? (byte >> 4) : (byte & 0xF);
+        out[i] = d * s * nib - dmin * m;
+    }
+}
+
 template <int QT>
 __device__ __forceinline__ constexpr int dqr_bs() {
     if constexpr (QT == DQR_Q4_K) return 144;
@@ -141,7 +176,7 @@ constexpr int DQR_BLOCK = 256, DQR_VEC = 4;   // 4 consecutive values/thread => 
 // costs more occupancy than the extra threads cost. Widening the block instead keeps NG small
 // (BLK=1024 => NG=5 for the same row). Value->thread mapping is unchanged, so the decode, the
 // amax and the stores are all bit-identical whatever BLK is.
-template <int QT, int NG, int BLK = DQR_BLOCK>
+template <int QT, int NG, int BLK = DQR_BLOCK, bool WORDS = false>
 __global__ __launch_bounds__(BLK) void deq_rows_i8_vec_kernel(
         const unsigned char* __restrict__ src, signed char* __restrict__ q,
         float* __restrict__ scale, int cols) {
@@ -159,10 +194,16 @@ __global__ __launch_bounds__(BLK) void deq_rows_i8_vec_kernel(
         if (base < cols) {
             const unsigned char* blk = rbase + (size_t)(base >> 8) * BS;
             const int off = base & 255;
-            #pragma unroll
-            for (int i = 0; i < DQR_VEC; i++) {
-                v[g][i] = dqr_val<QT>(blk, off + i);
-                amax = fmaxf(amax, fabsf(v[g][i]));
+            if constexpr (WORDS && QT == DQR_Q4_K) {
+                dqr_q4k_val4(blk, off, v[g]);
+                #pragma unroll
+                for (int i = 0; i < DQR_VEC; i++) amax = fmaxf(amax, fabsf(v[g][i]));
+            } else {
+                #pragma unroll
+                for (int i = 0; i < DQR_VEC; i++) {
+                    v[g][i] = dqr_val<QT>(blk, off + i);
+                    amax = fmaxf(amax, fabsf(v[g][i]));
+                }
             }
         }
     }
@@ -196,22 +237,22 @@ __global__ __launch_bounds__(BLK) void deq_rows_i8_vec_kernel(
     }
 }
 
-template <int QT>
+template <int QT, bool WORDS = false>
 bool dispatch(const unsigned char* s, signed char* q, float* scale, int rows, int cols,
               cudaStream_t stream) {
     const int ng = (cols + DQR_BLOCK * DQR_VEC - 1) / (DQR_BLOCK * DQR_VEC);
-    if (ng <= 1)       deq_rows_i8_vec_kernel<QT, 1><<<rows, DQR_BLOCK, 0, stream>>>(s, q, scale, cols);
-    else if (ng <= 4)  deq_rows_i8_vec_kernel<QT, 4><<<rows, DQR_BLOCK, 0, stream>>>(s, q, scale, cols);
-    else if (ng <= 8)  deq_rows_i8_vec_kernel<QT, 8><<<rows, DQR_BLOCK, 0, stream>>>(s, q, scale, cols);
-    else if (ng <= 12) deq_rows_i8_vec_kernel<QT, 12><<<rows, DQR_BLOCK, 0, stream>>>(s, q, scale, cols);
+    if (ng <= 1)       deq_rows_i8_vec_kernel<QT, 1, DQR_BLOCK, WORDS><<<rows, DQR_BLOCK, 0, stream>>>(s, q, scale, cols);
+    else if (ng <= 4)  deq_rows_i8_vec_kernel<QT, 4, DQR_BLOCK, WORDS><<<rows, DQR_BLOCK, 0, stream>>>(s, q, scale, cols);
+    else if (ng <= 8)  deq_rows_i8_vec_kernel<QT, 8, DQR_BLOCK, WORDS><<<rows, DQR_BLOCK, 0, stream>>>(s, q, scale, cols);
+    else if (ng <= 12) deq_rows_i8_vec_kernel<QT, 12, DQR_BLOCK, WORDS><<<rows, DQR_BLOCK, 0, stream>>>(s, q, scale, cols);
     else {
         // Beyond 12 groups the register array is the binding constraint, not the thread count:
         // Muse Glimmer's ffn_down (cols=19968) would need NG=20 at 256 threads = 80 floats/thread.
         // A 1024-wide block covers the same row in NG=5, so widen the block instead of growing NG.
         constexpr int WBLK = 1024, WSPAN = WBLK * DQR_VEC;
         const int ngw = (cols + WSPAN - 1) / WSPAN;
-        if (ngw <= 5)      deq_rows_i8_vec_kernel<QT, 5, WBLK><<<rows, WBLK, 0, stream>>>(s, q, scale, cols);
-        else if (ngw <= 8) deq_rows_i8_vec_kernel<QT, 8, WBLK><<<rows, WBLK, 0, stream>>>(s, q, scale, cols);
+        if (ngw <= 5)      deq_rows_i8_vec_kernel<QT, 5, WBLK, WORDS><<<rows, WBLK, 0, stream>>>(s, q, scale, cols);
+        else if (ngw <= 8) deq_rows_i8_vec_kernel<QT, 8, WBLK, WORDS><<<rows, WBLK, 0, stream>>>(s, q, scale, cols);
         else return false;                               // wider than the register budget
     }
     return true;
@@ -687,6 +728,14 @@ bool launch_gguf_dequant_rows_i8_fast(int ggml_type, const void* src, signed cha
         ((cols % (DQR_BLOCK * DQR_VEC)) != 0 && !wide_ok)) return false;
 
     auto s = reinterpret_cast<const unsigned char*>(src);
+    // Q4_K word loads (dqr_q4k_val4): byte-identical. SPARKINFER_DEQUANT_ROWS_I8_WORDS=0 keeps the
+    // per-value byte loads.
+    static const int words = [] {
+        const char* e = getenv("SPARKINFER_DEQUANT_ROWS_I8_WORDS");
+        return (e && e[0] == '0') ? 0 : 1;
+    }();
+    if (ggml_type == DQR_Q4_K && words && (reinterpret_cast<uintptr_t>(src) & 3u) == 0)
+        return dispatch<DQR_Q4_K, true>(s, q, scale, rows, cols, stream);
     if (ggml_type == DQR_Q4_K) return dispatch<DQR_Q4_K>(s, q, scale, rows, cols, stream);
     if (ggml_type == DQR_Q5_K) return dispatch<DQR_Q5_K>(s, q, scale, rows, cols, stream);
     if (ggml_type == DQR_Q6_K) return dispatch<DQR_Q6_K>(s, q, scale, rows, cols, stream);

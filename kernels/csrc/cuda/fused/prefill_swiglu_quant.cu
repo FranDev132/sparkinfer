@@ -72,7 +72,10 @@ __device__ __forceinline__ size_t sq_pack_off(int r, int c, int rows) {
     return (size_t)(c >> 5) * (size_t)rows * 32 + (size_t)r * 32 + (size_t)(c & 31);
 }
 
-template <int MAXV>
+// PRE: `gate` already holds h = bf16(silu(g) * u) -- written by launch_prefill_gemm_i8_swiglu's
+// epilogue with this kernel's own expression -- and `up` is unused. h was rounded to bf16 before it
+// was stored, so reading it back gives exactly the hv[] below and the quantize is unchanged.
+template <int MAXV, bool PRE = false>
 __global__ __launch_bounds__(1024) void pf_swiglu_quant_i8_reg_kernel(
         const __nv_bfloat16* __restrict__ gate, const __nv_bfloat16* __restrict__ up,
         signed char* __restrict__ q, float* __restrict__ scale, int rows, int cols,
@@ -87,8 +90,11 @@ __global__ __launch_bounds__(1024) void pf_swiglu_quant_i8_reg_kernel(
     for (int i = 0; i < MAXV; i++) {
         const int c = threadIdx.x + i * 1024;
         if (c < cols) {
-            hv[i] = __bfloat162float(__float2bfloat16(sq_silu(__bfloat162float(gate[base + c]))
-                                                       * __bfloat162float(up[base + c])));
+            if constexpr (PRE)
+                hv[i] = __bfloat162float(gate[base + c]);
+            else
+                hv[i] = __bfloat162float(__float2bfloat16(sq_silu(__bfloat162float(gate[base + c]))
+                                                           * __bfloat162float(up[base + c])));
             amax = fmaxf(amax, fabsf(hv[i]));
         }
     }
@@ -219,6 +225,19 @@ bool launch_prefill_swiglu_quant_i8(const void* gate, const void* up, signed cha
         q, scale, rows, cols);
     // The strided fallback has no k-tiled output: report the caller's packed copy as stale.
     return qp == nullptr;
+}
+
+bool launch_prefill_quant_h_i8(const void* h, signed char* q, float* scale, int rows, int cols,
+                               cudaStream_t stream, signed char* qp) {
+    if (qp && (cols % 32) != 0) qp = nullptr;
+    const int nv = (cols + 1023) / 1024;
+    if (cols < 2048 || nv > 20) return false;
+    auto* g = reinterpret_cast<const __nv_bfloat16*>(h);
+    if (nv <= 8)       pf_swiglu_quant_i8_reg_kernel<8, true><<<rows, 1024, 0, stream>>>(g, nullptr, q, scale, rows, cols, qp);
+    else if (nv <= 12) pf_swiglu_quant_i8_reg_kernel<12, true><<<rows, 1024, 0, stream>>>(g, nullptr, q, scale, rows, cols, qp);
+    else if (nv <= 16) pf_swiglu_quant_i8_reg_kernel<16, true><<<rows, 1024, 0, stream>>>(g, nullptr, q, scale, rows, cols, qp);
+    else               pf_swiglu_quant_i8_reg_kernel<20, true><<<rows, 1024, 0, stream>>>(g, nullptr, q, scale, rows, cols, qp);
+    return true;
 }
 
 }} // namespace sparkinfer::kernels
