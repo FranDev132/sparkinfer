@@ -744,13 +744,15 @@ bool launch_rows_i8(const signed char* xq, const float* xd, const int* xs, const
     if (m <= 0 || n_rows <= 0 || k <= 0 || k % (kBlk * kStepBlocks) != 0) return false;
     const int nblk = k / kBlk;
     // The tensor-core kernel tiles 128 weight rows; its k split must be the GEMV's (row_splits),
-    // so a launch that cannot hold the partials declines rather than summing differently.
+    // so a launch that cannot hold the partials declines rather than summing differently. One
+    // row takes it too: per row it is the GEMV's arithmetic, and at one row it is 3-10% faster
+    // (fewer, fuller CTAs than the GEMV's lane-per-block walk).
     const int nmat = w1 ? 2 : 1;
     const int S = row_splits(n_rows, nblk, nmat);
     const bool mma_ok = n_rows % 128 == 0;
-    if (mma_ok && m > 1 && S > 1 &&
-        (!part || (size_t)S * nmat * (m < 32 ? m : 32) * n_rows > part_cap || n_rows % 4 != 0))
-        return false;
+    const bool split_fits =
+        S == 1 || (part && (size_t)S * nmat * (m < 32 ? m : 32) * n_rows <= part_cap && n_rows % 4 == 0);
+    if (mma_ok && m > 1 && !split_fits) return false;
     // One wave, rows spread evenly. Where 128-row tiles need between one and two waves -- gate
     // and up's 2 x 17408 rows are 272 tiles on 170 SMs, and the second wave ran 102 of them with
     // 68 SMs idle -- 13-warp CTAs hold the same rows in one (168 of them). A step's time follows
@@ -767,7 +769,7 @@ bool launch_rows_i8(const signed char* xq, const float* xd, const int* xs, const
         const int* s = xs + (size_t)m0 * nblk;
         OutT* a = y0 + (size_t)m0 * n_rows;
         OutT* b = y1 ? y1 + (size_t)m0 * n_rows : nullptr;
-        if (mc == 1 || !mma_ok) {
+        if (!mma_ok || (mc == 1 && !split_fits)) {
             for (int r = 0; r < mc; ++r)
                 if (!launch_gemv_i8<OutT>(q + (size_t)r * k, d + (size_t)r * nblk, s + (size_t)r * nblk,
                                           w0, w1, a + (size_t)r * n_rows,
