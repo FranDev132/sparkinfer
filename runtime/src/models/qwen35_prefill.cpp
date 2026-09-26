@@ -239,6 +239,54 @@ bool muse_stream_nvfp4_b(int qtype, const void* src, int n, int k,
     return ok;
 }
 
+// Muse's streamed NVFP4 operands (ffn_down, o), kept. A batched prefill of 512+ tokens runs both
+// as NVFP4 GEMMs, and with no resident copy (the loader cannot hold one at a 64k max_seq: that
+// pass's arena needs the room) every pass converted all 52 layers' Q4_K down and o into one
+// streamed buffer each first -- 52 x (124 + 26) us, a fifth of a 512-token pass. The room a 64k
+// pass needs is free while the passes are short, so between them the converted layers are simply
+// kept: filled once at the end of a pass, read by every later pass of the same or a smaller size,
+// and released (see the top of prefill_batched_run) before a larger pass can grow its arena into
+// them. The kept bytes are what the conversion writes, so a pass that reads them runs exactly the
+// arithmetic it would have run.
+struct MuseStreamCache {
+    unsigned char* base = nullptr;
+    size_t dn_slot = 0, dn_data = 0;   // bytes per down layer, and the data part (scales follow)
+    size_t wo_slot = 0, wo_data = 0;   // same for o; o slots follow the down slots
+    int dn_layers = 0, wo_layers = 0;  // layers [0, n) of each are held
+    int n_at = 0;                      // the largest pass size this cache was sized beside
+    const void* key = nullptr;         // model identity
+    unsigned char* dn(int L) const { return base + (size_t)L * dn_slot; }
+    unsigned char* dn_sf(int L) const { return dn(L) + dn_data; }
+    unsigned char* wo(int L) const {
+        return base + (size_t)dn_layers * dn_slot + (size_t)L * wo_slot;
+    }
+    unsigned char* wo_sf(int L) const { return wo(L) + wo_data; }
+    void release() {
+        if (!base) return;
+        cudaFree(base);
+        base = nullptr; dn_layers = wo_layers = 0; n_at = 0; key = nullptr;
+        // A captured prefill graph may read these slots; it must not replay.
+        kernels::note_prefill_scratch_moved();
+    }
+};
+MuseStreamCache& muse_stream_cache() {
+    static MuseStreamCache c;
+    return c;
+}
+bool muse_stream_cache_on() {
+    static const bool on = [] {
+        const char* e = getenv("SPARKINFER_MUSE_STREAM_CACHE");
+        return !(e && e[0] == '0');
+    }();
+    return on;
+}
+// Continuous batching allocates as it goes -- the packed step's arena and graph pools grow with the
+// batch width -- so once a packed step has run, nothing is kept (see dflash_verify_short_run).
+bool& muse_stream_cache_packed_seen() {
+    static bool seen = false;
+    return seen;
+}
+
 struct VerifyGraphCache {
     Arena arena;
     cudaGraph_t graph[kVerifyMaxRows + 1] = {};
@@ -622,6 +670,12 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
               "pfb graph seed");
         pf_cu(cudaStreamSynchronize(st), "pfb graph sync");
         return *s.h_out_id;
+    }
+    // A pass larger than the one the kept operands (MuseStreamCache) were sized beside may grow
+    // its arena into their room, and a packed pass is shaped by its pack: release them first.
+    {
+        MuseStreamCache& sc = muse_stream_cache();
+        if (sc.base && (multi || N > sc.n_at || sc.key != (const void*)s.w.lm_head)) sc.release();
     }
     pf_vram("entry");
     bf16* x    = a.alloc<bf16>((size_t)N * H);
@@ -2671,7 +2725,12 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
             // output through the staging, ordered on `st` ahead of the GEMM that reads it.
             const void* wo4 = w.wo_fp4;
             const void* wo4_sf = w.wo_fp4_sf;
-            if (!wo4 && wo_st_data && wo_st_sf && w.wo && c.muse_glimmer) {
+            const MuseStreamCache& wsc = muse_stream_cache();
+            if (!wo4 && wo_st_data && wo_st_sf && w.wo && c.muse_glimmer && wsc.base &&
+                L < wsc.wo_layers) {
+                wo4 = wsc.wo(L);
+                wo4_sf = wsc.wo_sf(L);
+            } else if (!wo4 && wo_st_data && wo_st_sf && w.wo && c.muse_glimmer) {
                 if (muse_stream_nvfp4_b(w.wo_type, w.wo, H, qdim, wo_st_data, wo_st_sf,
                                         wo_st_tmp, wo_st_rows, st, N)) {
                     wo4 = wo_st_data;
@@ -2993,8 +3052,12 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
             const void* dn_fp4    = w.down_fp4;
             const void* dn_fp4_sf = w.down_fp4_sf;
             if (!dn_fp4 && nvfp4_down && ffn_fp4_possible && dn_st_sf && dn_st_data && w.down_q) {
-                if (muse_stream_nvfp4_b(w.down_qtype, w.down_q, H, ffn, dn_st_data, dn_st_sf,
-                                        dn_st_tmp, dn_st_rows, st, N)) {
+                const MuseStreamCache& sc = muse_stream_cache();
+                if (sc.base && L < sc.dn_layers) {
+                    dn_fp4 = sc.dn(L);
+                    dn_fp4_sf = sc.dn_sf(L);
+                } else if (muse_stream_nvfp4_b(w.down_qtype, w.down_q, H, ffn, dn_st_data,
+                                               dn_st_sf, dn_st_tmp, dn_st_rows, st, N)) {
                     dn_fp4 = dn_st_data;
                     dn_fp4_sf = dn_st_sf;
                 }
@@ -3999,6 +4062,80 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
     g_pfb_warm_n = multi ? -1 : N;
     pf_cu(cudaMemcpyAsync(s.h_out_id, s.d_out_id, sizeof(int), cudaMemcpyDeviceToHost, st), "prefill seed");
     pf_cu(cudaStreamSynchronize(st), "prefill sync");
+    // Keep the streamed operands (MuseStreamCache) once this pass has taken its arena at full
+    // size -- measured here, before a pass whose scratch passed kArenaKeepBytes hands it back
+    // below, so the next pass of this size always finds its arena again: as many down layers,
+    // then o layers, as the free VRAM holds beside SPARKINFER_MUSE_STREAM_CACHE_KEEP_MB (512) of
+    // headroom, converted now so the next pass -- the one that captures this N's graph -- reads
+    // them. Up to SPARKINFER_MUSE_STREAM_CACHE_MAXN (4096) tokens: past that the conversions are
+    // ~1% of the pass and the arena wants the room. Only Q4_K layers, whose conversion does not
+    // depend on the pass size. SPARKINFER_MUSE_STREAM_CACHE=0 converts every pass.
+    static const int sc_maxn = [] {
+        const char* e = getenv("SPARKINFER_MUSE_STREAM_CACHE_MAXN");
+        return e ? atoi(e) : 4096;
+    }();
+    static const long long sc_keep_mb = [] {
+        const char* e = getenv("SPARKINFER_MUSE_STREAM_CACHE_KEEP_MB");
+        const long long v = e ? atoll(e) : 512;
+        return v < 0 ? 0 : v;
+    }();
+    MuseStreamCache& sc = muse_stream_cache();
+    const bool sc_dn = dn_st_want && dn_st_data && dn_st_sf && muse_nvfp4_q4k_direct();
+    const bool sc_wo = wo_st_want && wo_st_data && wo_st_sf && muse_nvfp4_q4k_direct();
+    if (muse_stream_cache_on() && (sc_dn || sc_wo) && !multi && N <= sc_maxn && !sc.base &&
+        !muse_stream_cache_packed_seen() && !s.w.layers.empty()) {
+        auto al = [](size_t b) { return (b + 255) & ~(size_t)255; };
+        const size_t dn_data = al(kernels::prefill_nvfp4_data_bytes(H, ffn));
+        const size_t dn_slot = dn_data + al(kernels::prefill_nvfp4_scale_bytes_b(H, ffn));
+        const size_t wo_data = al(kernels::prefill_nvfp4_data_bytes(H, qdim));
+        const size_t wo_slot = wo_data + al(kernels::prefill_nvfp4_scale_bytes_b(H, qdim));
+        // The prefix of layers each leg could hold: Q4_K and not already resident.
+        int dn_max = 0, wo_max = 0;
+        while (sc_dn && dn_max < c.n_layers && !s.w.layers[dn_max].down_fp4 &&
+               s.w.layers[dn_max].down_q && s.w.layers[dn_max].down_qtype == 12) ++dn_max;
+        while (sc_wo && wo_max < c.n_layers && !s.w.layers[wo_max].wo_fp4 &&
+               s.w.layers[wo_max].wo && s.w.layers[wo_max].wo_type == 12) ++wo_max;
+        size_t freeb = 0, totalb = 0;
+        const size_t keep = (size_t)sc_keep_mb << 20;
+        size_t budget = 0;
+        if (cudaMemGetInfo(&freeb, &totalb) == cudaSuccess && freeb > keep) budget = freeb - keep;
+        int dl = (int)std::min<size_t>(budget / dn_slot, (size_t)dn_max);
+        int wl = (int)std::min<size_t>((budget - (size_t)dl * dn_slot) / wo_slot, (size_t)wo_max);
+        while ((dl > 0 || wl > 0) &&
+               cudaMalloc(reinterpret_cast<void**>(&sc.base),
+                          (size_t)dl * dn_slot + (size_t)wl * wo_slot) != cudaSuccess) {
+            sc.base = nullptr;
+            if (wl > 0) wl = wl * 3 / 4; else dl = dl * 3 / 4;
+        }
+        if (sc.base) {
+            sc.dn_slot = dn_slot; sc.dn_data = dn_data; sc.wo_slot = wo_slot; sc.wo_data = wo_data;
+            sc.dn_layers = dl;   // wo() is laid out after dl down slots
+            int dh = 0, wh = 0;
+            for (; dh < dl; ++dh)
+                if (!muse_stream_nvfp4_b(12, s.w.layers[dh].down_q, H, ffn, sc.dn(dh),
+                                         sc.dn_sf(dh), nullptr, 0, st, N)) break;
+            for (; wh < wl; ++wh)
+                if (!muse_stream_nvfp4_b(12, s.w.layers[wh].wo, H, qdim, sc.wo(wh), sc.wo_sf(wh),
+                                         nullptr, 0, st, N)) break;
+            pf_cu(cudaStreamSynchronize(st), "stream cache fill");
+            if (dh == 0 && wh == 0) {
+                cudaFree(sc.base);
+                sc.base = nullptr;
+            } else {
+                // A down layer that failed to convert must not be read; o stays laid out after dl.
+                sc.dn_layers = dh; sc.wo_layers = wh;
+                if (dh < dl) sc.wo_layers = 0;
+                sc.n_at = N; sc.key = s.w.lm_head;
+                fprintf(stderr, "[prefill-muse] kept NVFP4 down %d/%d, o %d/%d layers (%.0f MB) "
+                        "beside a %d-token pass\n", sc.dn_layers, c.n_layers, sc.wo_layers,
+                        c.n_layers, ((size_t)dl * dn_slot + (size_t)wl * wo_slot) / 1048576.0, N);
+                // This N's graph (if one was captured) converts into the streamed buffers; the
+                // next pass re-captures it reading the kept layers instead.
+                kernels::note_prefill_scratch_moved();
+            }
+        }
+    }
+
     int seed = *s.h_out_id;
 
     // Release rather than hold when this call's scratch is too big to keep resident.
@@ -4160,6 +4297,10 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
     // compact scan, the KV-append uses the per-row-table kernel instead of the single-sequence
     // one, and there is no accepted-prefix commit because every row is already a real step.
     const bool packed = s.packed_rows != nullptr;
+    if (packed) {
+        muse_stream_cache_packed_seen() = true;
+        muse_stream_cache().release();
+    }
     const int H = c.hidden, N = n, qdim = s.qdim, kvdim = s.kvdim;
     // Every block-scaled GEMM arm below used to require `(N & 7) == 0`, because
     // launch_prefill_nvfp4_quant_a builds the A-side scale layout in groups of eight rows. The
