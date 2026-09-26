@@ -66,13 +66,22 @@ __device__ __forceinline__ void ld4_bf16(const __nv_bfloat16* p, float v[4]) {
 //               bf16(x * rsqrt(mean(x^2) + eps) * nw * silu(z)), the square sum formed in
 //               gated_norm_warp_kernel's lane order so the norm is that kernel's to the bit.
 //   kRotGate    x the attention output, u its gate: launch_qwen36_mul_sigmoid's bf16(x*sigmoid(u)).
-enum : int { kRotPlain = 0, kRotSwiglu = 1, kRotGnorm = 2, kRotGate = 3 };
+//   kRotAddNorm x + u through add_rmsnorm2_q8 with weight nw: that kernel's sum, norm and Q8_1
+//               written for this CTA's span (out_sum, out_norm, out_q8), and its norm rotated. The
+//               row's square sum is formed in the 640-thread kernel's own order: virtual thread v
+//               owns elements 8v..8v+7, virtual warps fold with the same xor tree, and so do their
+//               partials.
+enum : int { kRotPlain = 0, kRotSwiglu = 1, kRotGnorm = 2, kRotGate = 3, kRotAddNorm = 4 };
+struct i8_blk_q8_1 { __half2 ds; signed char qs[32]; };
 template <int MODE>
 __global__ void __launch_bounds__(256)
 ptq1_rotq_kernel(const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* __restrict__ u,
                  const __nv_bfloat16* __restrict__ nw, float eps,
                  const signed char* __restrict__ sign, signed char* __restrict__ q,
-                 float* __restrict__ qd, int* __restrict__ qs, int k) {
+                 float* __restrict__ qd, int* __restrict__ qs, int k,
+                 __nv_bfloat16* __restrict__ out_sum = nullptr,
+                 __nv_bfloat16* __restrict__ out_norm = nullptr,
+                 i8_blk_q8_1* __restrict__ out_q8 = nullptr) {
     __shared__ float sh[kSpan];
     pdl_trigger();   // the rows kernel after this may start fetching its weights
     const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
@@ -111,6 +120,80 @@ ptq1_rotq_kernel(const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* __res
         for (int i = 0; i < 4; ++i)
             v[i] = __bfloat162float(
                 __float2bfloat16(v[i] * inv * w[i] * (z[i] / (1.f + __expf(-z[i])))));
+    } else if (MODE == kRotAddNorm) {
+        __shared__ float s_warp[32];
+        const int nvw = k / 256;                  // add_rmsnorm2_q8's warps: k/8 threads
+        constexpr int kVw = 8192 / 256 / 8;       // virtual warps per real warp, at most
+        const uint4* x8 = reinterpret_cast<const uint4*>(x + (size_t)row * k);
+        const uint4* r8 = reinterpret_cast<const uint4*>(u + (size_t)row * k);
+        uint4 xp[kVw], rp[kVw];
+#pragma unroll
+        for (int i = 0; i < kVw; ++i) {
+            const int vw = warp + 8 * i;
+            if (vw < nvw) { xp[i] = __ldg(x8 + vw * 32 + lane); rp[i] = __ldg(r8 + vw * 32 + lane); }
+        }
+        float rv[4], wv[4];
+        ld4_bf16(u + off, rv);
+        ld4_bf16(nw + e0, wv);
+#pragma unroll
+        for (int i = 0; i < kVw; ++i) {
+            const int vw = warp + 8 * i;
+            if (vw < nvw) {
+                const __nv_bfloat16* xh = reinterpret_cast<const __nv_bfloat16*>(&xp[i]);
+                const __nv_bfloat16* rh = reinterpret_cast<const __nv_bfloat16*>(&rp[i]);
+                float ss = 0.f;
+#pragma unroll
+                for (int j = 0; j < 8; j++) {
+                    const float sv = __bfloat162float(xh[j]) + __bfloat162float(rh[j]);
+                    ss = __fmaf_rn(sv, sv, ss);
+                }
+#pragma unroll
+                for (int m = 16; m > 0; m >>= 1) ss += __shfl_xor_sync(0xffffffffu, ss, m);
+                if (lane == 0) s_warp[vw] = ss;
+            }
+        }
+        __syncthreads();
+        float red = lane < nvw ? s_warp[lane] : 0.f;
+#pragma unroll
+        for (int m = 16; m > 0; m >>= 1) red += __shfl_xor_sync(0xffffffffu, red, m);
+        const float inv_rms = rsqrtf(red / k + eps);
+        float sv[4];
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            sv[i] = v[i] + rv[i];
+            const float svb = __bfloat162float(__float2bfloat16(sv[i]));
+            v[i] = __bfloat162float(__float2bfloat16(svb * inv_rms * wv[i]));
+        }
+        const __nv_bfloat162 s01 = __floats2bfloat162_rn(sv[0], sv[1]);
+        const __nv_bfloat162 s23 = __floats2bfloat162_rn(sv[2], sv[3]);
+        const __nv_bfloat162 n01 = __floats2bfloat162_rn(v[0], v[1]);
+        const __nv_bfloat162 n23 = __floats2bfloat162_rn(v[2], v[3]);
+        *reinterpret_cast<uint2*>(out_sum + off) =
+            make_uint2(*reinterpret_cast<const unsigned*>(&s01), *reinterpret_cast<const unsigned*>(&s23));
+        *reinterpret_cast<uint2*>(out_norm + off) =
+            make_uint2(*reinterpret_cast<const unsigned*>(&n01), *reinterpret_cast<const unsigned*>(&n23));
+        if (out_q8) {
+            // Q8_1 of the bf16-rounded norm: a 32-block is 8 consecutive threads here.
+            float amax = fmaxf(fmaxf(fabsf(v[0]), fabsf(v[1])), fmaxf(fabsf(v[2]), fabsf(v[3])));
+            amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 1));
+            amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 2));
+            amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 4));
+            const float d = amax / 127.0f;
+            int s8 = 0;
+            unsigned word = 0;
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                const int qi = (amax == 0.0f) ? 0 : (int)roundf(v[i] / d);
+                s8 += qi;
+                word |= ((unsigned)(unsigned char)(signed char)qi) << (8 * i);
+            }
+            i8_blk_q8_1* blk = out_q8 + (off >> 5);
+            reinterpret_cast<unsigned*>(blk->qs)[t & 7] = word;
+            s8 += __shfl_xor_sync(0xffffffffu, s8, 1);
+            s8 += __shfl_xor_sync(0xffffffffu, s8, 2);
+            s8 += __shfl_xor_sync(0xffffffffu, s8, 4);
+            if ((t & 7) == 0) blk->ds = __floats2half2_rn(d, d * (float)s8);
+        }
     }
     const char4 sg = *reinterpret_cast<const char4*>(sign + e0);
     v[0] *= (float)sg.x; v[1] *= (float)sg.y; v[2] *= (float)sg.z; v[3] *= (float)sg.w;
@@ -990,6 +1073,26 @@ bool launch_ptq1_rotq_bf16(const void* x_bf16, const signed char* sign, signed c
     if (rows <= 0 || block != kSpan || k % kSpan != 0) return false;
     ptq1_rotq_kernel<kRotPlain><<<dim3((unsigned)(k / kSpan), (unsigned)rows), 256, 0, st>>>(
         static_cast<const __nv_bfloat16*>(x_bf16), nullptr, nullptr, 0.f, sign, q, qd, qs, k);
+    return true;
+}
+
+bool launch_ptq1_add_norm_rotq_bf16(const void* x_bf16, const void* residual_bf16,
+                                    const void* weight_bf16, void* out_sum, void* out_norm,
+                                    void* out_q8, float eps, const signed char* sign,
+                                    signed char* q, float* qd, int* qs, int rows, int k,
+                                    int block, cudaStream_t st) {
+    if (rows <= 0 || block != kSpan || k % kSpan != 0 || k > 8192 || !out_sum || !out_norm)
+        return false;
+    static const bool on = [] {
+        const char* e = getenv("SPARKINFER_PTQ1_NORM_ROTQ");
+        return !(e && e[0] == '0');
+    }();
+    if (!on) return false;
+    ptq1_rotq_kernel<kRotAddNorm><<<dim3((unsigned)(k / kSpan), (unsigned)rows), 256, 0, st>>>(
+        static_cast<const __nv_bfloat16*>(x_bf16), static_cast<const __nv_bfloat16*>(residual_bf16),
+        static_cast<const __nv_bfloat16*>(weight_bf16), eps, sign, q, qd, qs, k,
+        static_cast<__nv_bfloat16*>(out_sum), static_cast<__nv_bfloat16*>(out_norm),
+        static_cast<i8_blk_q8_1*>(out_q8));
     return true;
 }
 
