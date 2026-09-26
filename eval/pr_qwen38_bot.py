@@ -95,6 +95,7 @@ Never rents a GPU. Shares the pinned box with any other bot via flock in the cro
 from __future__ import annotations
 
 import argparse
+import calendar
 import json
 import os
 import re
@@ -490,7 +491,7 @@ def qwen38_evaluated_commits(repo, num):
     for c in json.loads(r.stdout or "{}").get("comments", []):
         body = c.get("body") or ""
         m = MARKER_RE.search(body)
-        if not m or "sparkinfer qwen38 auto-eval" not in body:
+        if not m or "sparkinfer qwen38 auto-eval" not in body or not arb.trusted_marker_comment(c):
             continue
         meta_raw = m.group(2)
         try:
@@ -520,27 +521,28 @@ def _pr_last_activity_ts(repo, num):
         info = json.loads(r.stdout or "{}")
     except json.JSONDecodeError:
         return None
+    # The PR's own opening counts as activity too: a PR opened from commits made days earlier used
+    # to be closed as stale before it was ever evaluated. calendar.timegm, not time.mktime: these
+    # are UTC, and mktime read them as local time (2 h early on a CEST controller).
     dates = [c.get("committedDate") for c in (info.get("commits") or []) if c.get("committedDate")]
-    ts_str = max(dates) if dates else info.get("createdAt")
-    if not ts_str:
+    dates += [info["createdAt"]] if info.get("createdAt") else []
+    if not dates:
         return None
     try:
-        return time.mktime(time.strptime(ts_str, "%Y-%m-%dT%H:%M:%SZ"))
+        return calendar.timegm(time.strptime(max(dates), "%Y-%m-%dT%H:%M:%SZ"))
     except ValueError:
         return None
 
 
 def close_stale_qwen38_prs(repo, prs, dry_run=False):
-    """Close open PRs with no author commit activity in STALE_DAYS+ days. HOLD_LABEL and the
-    current qwen38-merge-first winner are exempt."""
+    """Close open PRs routed to Qwen3.8-27B with no author commit activity in STALE_DAYS+ days.
+    Drafts, `hold`, other models' PRs and any bot's merge-first are exempt
+    (arb.stale_close_skip_reason) -- this used to close every idle PR in the repo, #1157 included."""
     closed = set()
     now = time.time()
     for pr in prs:
         num = pr["number"]
-        if pr.get("isDraft"):
-            continue
-        labs = {l["name"] for l in pr.get("labels", [])}
-        if arb.HOLD_LABEL in labs or QWEN38_MERGE_FIRST in labs:
+        if arb.stale_close_skip_reason(pr, "qwen38"):
             continue
         ts = _pr_last_activity_ts(repo, num)
         if ts is None:
@@ -556,9 +558,9 @@ def close_stale_qwen38_prs(repo, prs, dry_run=False):
             "<!-- sparkinfer-qwen38-auto-close-stale -->\n"
             f"## Closed: stale — no commits in {age_days:.1f} days\n\n"
             f"This PR has had no new commits in over {STALE_DAYS:g} days — closing automatically "
-            "to keep the Qwen3.8-27B eval queue clean. Reopen (or push a new commit / open a "
-            "fresh PR) whenever you're ready to continue; it'll be picked back up on the next "
-            "eval cycle."
+            "to keep the Qwen3.8-27B eval queue clean. Nothing is wrong with it for that reason "
+            "alone: push your latest work and reopen it (or open a fresh PR) whenever you're "
+            "ready, and it is picked back up on the next eval cycle."
         )
         arb.gh(["pr", "comment", str(num), "-R", repo, "--body", body])
         arb.gh(["pr", "close", str(num), "-R", repo])
@@ -614,8 +616,11 @@ def ssh_run(host, port, cmd, timeout=7200, stdin_data=None, via_stdin=False):
     )
 
 
+# SCORE_FAILED is the PR's own qwen3_gguf_score crashing: an explicit `exit 1`, so without it here
+# _crash_reason found nothing and _is_box_fault read the run as a silent kill -- retried every round
+# for ever with nothing posted, instead of the REJECT a crashing forward pass earns.
 _EXPLICIT_FAIL_MARKERS = ("BUILD_FAILED", "LLAMACPP_CONFIGURE_FAILED", "LLAMACPP_BUILD_FAILED",
-                          "MERGE_CONFLICT")
+                          "MERGE_CONFLICT", "SCORE_FAILED")
 
 
 def _crash_reason(*outputs: str) -> str | None:
@@ -641,14 +646,34 @@ def _crash_reason(*outputs: str) -> str | None:
         marker = next((m for m in _EXPLICIT_FAIL_MARKERS if line.startswith(m)), None)
         if not marker:
             continue
-        # The single most actionable line is usually the compiler/linker's own "error:" —
-        # prefer that over the marker's generic "tail of build.log:" header.
-        for follow in lines[i + 1:i + 60]:
-            if "error:" in follow or "Error " in follow:
-                return f"{marker}: {follow.strip()}"
+        # The single most actionable line is usually the compiler/linker's own error -- prefer
+        # that over the marker's header and over make's `*** Error N` (arb.first_build_error).
+        err = arb.first_build_error(lines[i + 1:i + 80])
+        if err:
+            return f"{marker}: {err}"
         tail = " | ".join(l.strip() for l in lines[i + 1:i + 3] if l.strip())
         return marker + (f": {tail}" if tail else "")
     return None
+
+
+# RETRYABLE_INFRA_FAILURE lines that name the box, not the ref. The concurrent-decode ladder's own
+# RETRYABLE line is deliberately not here: a width the PR build cannot complete is reported on the
+# PR as before, not retried silently for ever.
+_BOX_FAULT_MARKERS = ("RETRYABLE_INFRA_FAILURE git ", "RETRYABLE_INFRA_FAILURE build:",
+                      "RETRYABLE_INFRA_FAILURE GPU")
+
+
+def _is_box_fault(stdout: str, stderr: str) -> bool:
+    """A failed run that is the box's rather than the PR's: nothing is posted and no label changes;
+    the next round measures again (as pr_bonsai_bot.py does). Before, it posted an error comment and
+    `eval-qwen38:REJECT` -- which also set the generic `eval:REJECT` that SN74 scoring reads -- every
+    round until the box recovered."""
+    combined = (stdout or "") + "\n" + (stderr or "")
+    if any(m in combined for m in _BOX_FAULT_MARKERS):
+        return True
+    if "RETRYABLE_INFRA_FAILURE " in combined:
+        return False
+    return _crash_reason(stdout, stderr) is None and "GUARD_END" not in combined
 
 
 def _looks_like_hard_kill(stdout: str, stderr: str) -> bool:
@@ -821,12 +846,33 @@ if [ -f build/CMakeCache.txt ] && ! grep -q '^CMAKE_CUDA_COMPILER:FILEPATH=/usr/
   rm -rf build && mkdir -p build
 fi
 export CUDACXX="${{CUDACXX:-/usr/local/cuda/bin/nvcc}}"
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release >/tmp/q38_cmake.log 2>&1
-cmake --build build --target qwen3_gguf_bench qwen3_gguf_score qwen3_gguf_generate qwen3_gguf_cb_bench -j"$(nproc)" >/tmp/q38_build.log 2>&1 || {{
-  echo "BUILD_FAILED -- tail of /tmp/q38_build.log:" >&2
-  tail -80 /tmp/q38_build.log >&2
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release >/tmp/q38_cmake.log 2>&1 || {{
+  echo "BUILD_FAILED -- cmake configure; tail:" >&2
+  tail -40 /tmp/q38_cmake.log >&2
   exit 1
 }}
+{arb.BUILD_FAILURE_SH}
+build_targets() {{
+  cmake --build build --target qwen3_gguf_bench qwen3_gguf_score qwen3_gguf_generate qwen3_gguf_cb_bench -j"$1" >/tmp/q38_build.log 2>&1
+}}
+# A compiler killed for memory, a full disk or the overlayfs EFAULT is the box: rebuild once at -j4,
+# then call it infra. Anything else is the PR's build error, errors first (arb.BUILD_FAILURE_SH).
+if ! build_targets "$(nproc)"; then
+  if FAULT=$(build_box_fault /tmp/q38_build.log); then
+    echo "build hit a box-side fault ($FAULT) -- rebuilding with -j4" >&2
+    if ! build_targets 4; then
+      if FAULT=$(build_box_fault /tmp/q38_build.log); then
+        echo "RETRYABLE_INFRA_FAILURE build: $FAULT" >&2
+        exit 1
+      fi
+      report_build_failure /tmp/q38_build.log
+      exit 1
+    fi
+  else
+    report_build_failure /tmp/q38_build.log
+    exit 1
+  fi
+fi
 test -x build/runtime/qwen3_gguf_bench
 test -x build/runtime/qwen3_gguf_score
 test -x build/runtime/qwen3_gguf_cb_bench
@@ -1317,9 +1363,12 @@ def collect_polaris_attestation(host, port, res: dict, pr_ref: str):
     verdict itself, only omit its receipt."""
     if not POLARIS_ENABLED:
         return None
+    # The tip that was measured, not whatever pull/<n>/head points at by now.
+    tip = res.get("pr_tip") or ""
+    target = shlex.quote(tip) if arb._FULL_SHA_RE.match(tip) else "FETCH_HEAD"
     checkout_cmd = (
         f"cd {shlex.quote(REMOTE_REPO)} && "
-        f"git fetch -q origin {shlex.quote(pr_ref)} && git checkout -qf FETCH_HEAD"
+        f"git fetch -q origin {shlex.quote(pr_ref)} && git checkout -qf {target}"
     )
     r0 = ssh_run(host, port, checkout_cmd, timeout=60)
     if r0.returncode != 0:
@@ -1395,7 +1444,7 @@ def measure_main_baseline(host, port):
     redundant GPU/build time. Returns {"ok": True, **parsed} or {"ok": False, "reason", "log"}."""
     r = _ssh_run_resilient(host, port, _remote_script("main", role="main"), "main run")
     if r.returncode != 0:
-        tail = ((r.stdout or "") + "\n" + (r.stderr or ""))[-2000:]
+        tail = arb.failure_excerpt(r.stdout, r.stderr, _EXPLICIT_FAIL_MARKERS)
         crash = _crash_reason(r.stdout, r.stderr)
         reason = "main run failed" + (f" — {crash}" if crash else " (no crash diagnostic captured, possible hard kill — retried once)")
         return {"ok": False, "reason": reason, "log": tail}
@@ -1413,6 +1462,15 @@ def measure_main_baseline(host, port):
     if missing_cb:
         return {"ok": False, "reason": "main bench missing/zero concurrent decode at "
                                        + "/".join(f"c{c}" for c in missing_cb),
+                "log": (r.stdout or "")[-1500:]}
+    # Every guard must have measured something unless its checkpoint is absent. Otherwise every PR
+    # in the round is measured in full only to be deferred for the missing guard.
+    unguarded = [key for key, flag in (("guard36", None), ("guardmo", "guardmo"), ("guardcbmo", "guardmo"),
+                                       ("guardmg", "guardmg"), ("guardcbmg", "guardmg"),
+                                       ("guardbn", "guardbn"))
+                 if not (flag and main.get(f"{flag}_unavailable")) and not main.get(key)]
+    if unguarded:
+        return {"ok": False, "reason": "main measured nothing for guard(s) " + ", ".join(unguarded),
                 "log": (r.stdout or "")[-1500:]}
     main["ok"] = True
     return main
@@ -1439,11 +1497,16 @@ def eval_qwen38_on_box(host, port, pr_ref: str, main: dict):
             line = next((l for l in combined.splitlines() if l.startswith("MERGE_CONFLICT")), "")
             return {"ok": False, "conflict": True,
                     "reason": line or "PR does not merge cleanly onto the measured main"}
-        tail = ((r.stdout or "") + "\n" + (r.stderr or ""))[-2000:]
+        tail = arb.failure_excerpt(r.stdout, r.stderr, _EXPLICIT_FAIL_MARKERS)
         crash = _crash_reason(r.stdout, r.stderr)
         reason = "PR speed/accuracy run failed" + (f" — {crash}" if crash else " (no crash diagnostic captured, possible hard kill — retried once)")
-        return {"ok": False, "reason": reason, "log": tail}
+        return {"ok": False, "retry": _is_box_fault(r.stdout, r.stderr), "reason": reason,
+                "log": tail, "pr_tip": _parse_remote(r.stdout or "").get("pr_tip")}
     pr = _parse_remote(r.stdout or "")
+    if "ACCURACY_NO_BASELINE" in (r.stderr or ""):
+        # main's score dump was gone when this run compared against it: the box, not the PR.
+        return {"ok": False, "retry": True, "reason": "main's score dump was gone when the PR run "
+                                                      "compared against it", "log": ""}
     if "decode128_tps" not in pr:
         return {"ok": False, "reason": "PR bench missing decode@128 tok/s", "log": (r.stdout or "")[-1500:]}
     if "prefill128_pp" not in pr:
@@ -1539,6 +1602,11 @@ def eval_qwen38_on_box(host, port, pr_ref: str, main: dict):
     # and the Qwen3.6 guard below still apply.
 
     q36_ok, q36_problems = check_q36_guard(pr, main)
+    if not q36_ok and all(p.endswith("measurement unavailable") for p in q36_problems):
+        # Measured nothing: infra, like the cross-model guards below -- not a regression to close on.
+        return {"ok": False, "retry": True, "log": "",
+                "reason": "; ".join(q36_problems) + " — infra, not a regression; the PR is "
+                          "re-evaluated next round rather than rejected"}
     if not q36_ok:
         # Same hard-REJECT discipline as the accuracy gate: a Qwen3.8-27B PR that silently
         # regresses Qwen3.6 via shared code (qwen35.cpp/inference_engine.cpp) is unmergeable
@@ -1571,7 +1639,8 @@ def eval_qwen38_on_box(host, port, pr_ref: str, main: dict):
             # measured +10% on the 256k axis; the guard itself ran fine by hand minutes later.
             unavailable = [p for p in problems if p.endswith("measurement unavailable")]
             if unavailable and len(unavailable) == len(problems):
-                return {"ok": False,
+                # retry: nothing is posted. Without it apply_result still wrote eval-qwen38:REJECT.
+                return {"ok": False, "retry": True,
                         "reason": "; ".join(unavailable) + " — infra, not a regression; the PR is "
                                   "re-evaluated next round rather than rejected",
                         "log": ""}
@@ -1770,19 +1839,40 @@ def format_comment(commit: str, res: dict) -> str:
     )
 
 
-def auto_merge_ok_qwen38(repo, num):
-    info = json.loads(arb.gh([
-        "pr", "view", str(num), "-R", repo, "--json",
-        "state,isDraft,labels,author,mergeable,files",
-    ]).stdout or "{}")
+def auto_merge_ok_qwen38(repo, num, require_merge_first=True):
+    """Can this PR be merged now? With require_merge_first=False: may it be MADE merge-first -- the
+    same test minus that label, so a winner whose merge would be refused cannot hold merge-first
+    while every other speedup PR is pushed to needs-rebase (pr_bonsai_bot.py, 2026-09-26)."""
+    try:
+        info = json.loads(arb.gh([
+            "pr", "view", str(num), "-R", repo, "--json",
+            "state,isDraft,labels,author,mergeable,files,headRefOid",
+        ]).stdout or "{}")
+    except json.JSONDecodeError:
+        info = None
+    if not isinstance(info, dict) or not info:
+        return False, arb.PR_UNREADABLE
     if info.get("state") != "OPEN" or info.get("isDraft"):
         return False, "not an open, non-draft PR"
     labs = {l["name"] for l in info.get("labels", [])}
     tiers = {l.split(":", 1)[1] for l in labs if l.startswith(EVAL_PREFIX)}
     if not (tiers & SPEEDUP_LABELS):
         return False, "no verified eval-qwen38:speedup label"
-    if QWEN38_MERGE_FIRST not in labs:
+    if require_merge_first and QWEN38_MERGE_FIRST not in labs:
         return False, "not qwen38-merge-first"
+    # Only the exact commit this bot scored. The labels survive a push made after the verdict, and a
+    # re-measurement that fails on the box side posts nothing -- so the label alone could merge
+    # unmeasured code (pr_bonsai_bot.py has checked this since it was written).
+    head = info.get("headRefOid") or ""
+    scored = _load_scores().get(str(num)) or {}
+    if not head or scored.get("commit") != head:
+        return False, (f"head {head[:9] or '?'} is not the commit last scored "
+                       f"({(scored.get('commit') or 'none')[:9]})")
+    if scored.get("label") not in SPEEDUP_LABELS or not scored.get("pass"):
+        return False, f"recorded verdict for {head[:9]} is {scored.get('label')} (pass={scored.get('pass')})"
+    # A REJECT from any other bot is a measured harm on another model.
+    if any(l.endswith(":REJECT") for l in labs if l.startswith("eval")):
+        return False, "carries a REJECT from another eval bot"
     blocked = labs & AUTOMERGE_BLOCK
     if blocked:
         return False, f"blocking label(s): {', '.join(sorted(blocked))}"
@@ -1797,7 +1887,8 @@ def auto_merge_ok_qwen38(repo, num):
         return False, f"touches protected paths: {', '.join(sens[:3])}"
     if arb.pr_merge_conflict(info.get("mergeable")):
         return False, "merge conflict with base"
-    if info.get("mergeable") != "MERGEABLE":
+    # GitHub reports UNKNOWN for a while after main moves; that must not cost a PR the ranking.
+    if info.get("mergeable") != "MERGEABLE" and require_merge_first:
         return False, f"not cleanly mergeable ({info.get('mergeable')})"
     return True, "ok"
 
@@ -1807,12 +1898,19 @@ def try_auto_merge_qwen38(repo, num):
     if not ok:
         print(f">> qwen38 auto-merge SKIP #{num}: {reason}")
         return False
-    r = arb.gh(["pr", "merge", str(num), "-R", repo, "--squash"])
+    # Pinned to the SCORED commit, which auto_merge_ok_qwen38 just found equal to the head, --admin
+    # included. A second head lookup here would pin whatever a push had made the head in between.
+    head = (_load_scores().get(str(num)) or {}).get("commit") or ""
+    if not arb._FULL_SHA_RE.match(head):
+        print(f">> qwen38 auto-merge SKIP #{num}: no scored commit to pin the merge to")
+        return False
+    args = ["pr", "merge", str(num), "-R", repo, "--squash", "--match-head-commit", head]
+    r = arb.gh(args)
     if r.returncode != 0 and os.environ.get("SPARKINFER_AUTOMERGE_ADMIN", "1") == "1":
         err = ((r.stderr or "") + (r.stdout or "")).lower()
         if "not mergeable" in err or "branch policy" in err or "required" in err or "prohibited" in err:
             print(">> qwen38 auto-merge: branch policy blocked — retrying with --admin")
-            r = arb.gh(["pr", "merge", str(num), "-R", repo, "--squash", "--admin"])
+            r = arb.gh(args + ["--admin"])
     if r.returncode == 0:
         print(f">> QWEN38 AUTO-MERGED #{num} (qwen38-merge-first)")
         arb.gh(["pr", "comment", str(num), "-R", repo, "--body",
@@ -1829,7 +1927,7 @@ def reconcile_qwen38_merge_labels(repo, dry_run=False):
     scores = _load_scores()
     open_prs = json.loads(arb.gh([
         "pr", "list", "-R", repo, "--state", "open",
-        "--json", "number,labels", "--limit", "80",
+        "--json", "number,labels", "--limit", str(arb.PR_LIST_LIMIT),
     ]).stdout or "[]")
     open_labels = {p["number"]: {l["name"] for l in p["labels"]} for p in open_prs}
 
@@ -1842,12 +1940,28 @@ def reconcile_qwen38_merge_labels(repo, dry_run=False):
             arb.remove_label(repo, m["number"], QWEN38_MERGE_FIRST)
 
     scored = []
+    stale_first = []   # carries merge-first but can no longer win it
     for num, labs in open_labels.items():
-        if QWEN38_NEEDS_REBASE in labs:
+        # A PR that cannot be merged -- hold, needs-rebase, penalty, any other AUTOMERGE_BLOCK
+        # label, or anything else auto-merge would refuse -- must not take merge-first and push the
+        # others to needs-rebase for a merge that never happens (pr_bonsai_bot.py, #1154).
+        if labs & AUTOMERGE_BLOCK:
+            if QWEN38_MERGE_FIRST in labs:
+                stale_first.append(num)
             continue
         tiers = {l.split(":", 1)[1] for l in labs if l.startswith(EVAL_PREFIX)}
         tier = next((t for t in tiers if t in SPEEDUP_LABELS), None)
         if not tier:
+            continue
+        ok, why = auto_merge_ok_qwen38(repo, num, require_merge_first=False)
+        if not ok and why == arb.PR_UNREADABLE:
+            # Not an answer: demoting on it would take merge-first from the real holder.
+            print(f">> qwen38 round: GitHub did not return #{num} — labels left as they are")
+            return
+        if not ok:
+            print(f">> qwen38 round: #{num} cannot be merge-first ({why})")
+            if QWEN38_MERGE_FIRST in labs:
+                stale_first.append(num)
             continue
         entry = scores.get(str(num)) or {}
         if entry.get("label") not in SPEEDUP_LABELS:
@@ -1857,6 +1971,9 @@ def reconcile_qwen38_merge_labels(repo, dry_run=False):
         scored.append((num, float(entry.get("delta_pct") or 0), entry.get("label") or tier))
 
     scored.sort(key=lambda x: x[1], reverse=True)
+    if not dry_run:
+        for num in stale_first:
+            arb.remove_label(repo, num, QWEN38_MERGE_FIRST)
     if not scored:
         print(">> qwen38 round: no verified speedup PRs")
         return
@@ -1958,6 +2075,11 @@ def apply_result(repo, num, commit, res, title="", dry_run=False):
         print(f"PR #{num}: {res.get('reason')} — qwen38-needs-rebase, no verdict")
         if not dry_run:
             arb.add_label(repo, num, QWEN38_NEEDS_REBASE)
+        return
+    if not res.get("ok") and res.get("retry"):
+        # The box's fault (_is_box_fault, an unmeasured guard, an exception): nothing is posted and
+        # no label changes; the next round measures again.
+        print(f"PR #{num}: qwen38 eval deferred — {res.get('reason')} (infra; re-evaluated next round)")
         return
     body = format_comment(commit, res)
     label = res.get("label") if res.get("ok") else "REJECT"
@@ -2107,7 +2229,7 @@ def main():
     prs = json.loads(arb.gh([
         "pr", "list", "-R", args.repo, "--state", "open",
         "--json", "number,title,labels,isDraft,headRefOid,headRefName,mergeable,author,body,files",
-        "--limit", "80",
+        "--limit", str(arb.PR_LIST_LIMIT),
     ]).stdout or "[]")
     prs.sort(key=lambda p: p["number"])
 
@@ -2209,7 +2331,10 @@ def main():
     print(f">> SSH {_ssh_user}@{host}:{port}")
 
     print(">> measuring main baseline (once for this round, shared across all pending PRs) …")
-    main_result = measure_main_baseline(host, port)
+    try:
+        main_result = measure_main_baseline(host, port)
+    except Exception as e:   # ssh timeout or transport failure: the round, not a PR
+        main_result = {"ok": False, "reason": f"exception: {type(e).__name__}: {e}"}
     if not main_result.get("ok"):
         # No usable baseline -> nothing in this round can be scored. Bail out here rather than
         # burning GPU time building N different PR branches against a baseline we already know
@@ -2231,8 +2356,15 @@ def main():
         try:
             res = eval_qwen38_on_box(host, port, ref, main_result)
         except Exception as e:
-            res = {"ok": False, "reason": f"exception: {e}"}
-        apply_result(args.repo, num, head or short, res, title=title, dry_run=False)
+            # A transport failure is retried with nothing posted (it used to be a REJECT); a run killed
+            # at the 2 h ssh limit is a hang, posted once (arb.exception_result).
+            res = arb.exception_result(e)
+        # Recorded against the tip the box built (arb.measured_commit): a mid-round push must not
+        # leave a verdict naming a commit that was never measured (#1167).
+        commit, moved = arb.measured_commit(head, res)
+        if moved:
+            print(f">> PR #{num} moved during the round: listed {short}, measured {commit[:9]}")
+        apply_result(args.repo, num, commit or short, res, title=title, dry_run=False)
 
     reconcile_qwen38_merge_labels(args.repo, dry_run=False)
     print("done — qwen38 eval pass complete.")
