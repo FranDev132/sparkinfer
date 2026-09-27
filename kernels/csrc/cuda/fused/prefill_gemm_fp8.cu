@@ -90,7 +90,7 @@ __global__ __launch_bounds__(256, 2) void pf_gemm_fp8_kernel(
         const __nv_fp8_e4m3* __restrict__ A, const __nv_fp8_e4m3* __restrict__ W,
         const float* __restrict__ sx, const float* __restrict__ sw,
         __nv_bfloat16* __restrict__ C, float* __restrict__ P,
-        int M, int N, int K, int ktiles) {
+        int M, int N, int K, int ktiles, const __nv_bfloat16* __restrict__ swb = nullptr) {
     // The block's eight warps split WM ways down the tile's rows and WN ways across its columns.
     // At BM=128 that is the 4x2 map this kernel has always used, 32 rows and 64 columns each. A
     // SHORTER tile spends the freed warps on columns instead: every warp still owns 32 rows, the
@@ -276,11 +276,13 @@ __global__ __launch_bounds__(256, 2) void pf_gemm_fp8_kernel(
                     const int gm = m0 + wm * 32 + i * 16 + grp + (e >> 1) * 8;
                     const int cn = gn + (e & 1);
                     if (gm < M && cn < N)
-                        C[(size_t)gm * N + cn] = __float2bfloat16(acc[i][j][e] * sx[gm] * sw[cn]);
+                        C[(size_t)gm * N + cn] = __float2bfloat16(
+                            acc[i][j][e] * sx[gm] * (swb ? __bfloat162float(swb[cn]) : sw[cn]));
                 }
                 continue;
             }
-            const float w0 = sw[gn], w1 = sw[gn + 1];
+            const float w0 = swb ? __bfloat162float(swb[gn]) : sw[gn];
+            const float w1 = swb ? __bfloat162float(swb[gn + 1]) : sw[gn + 1];
             #pragma unroll
             for (int h2 = 0; h2 < 2; h2++) {
                 const int gm = m0 + wm * 32 + i * 16 + grp + h2 * 8;
@@ -468,19 +470,20 @@ static inline int fp8_tile_bk(bool narrow) { return narrow ? fp8_narrow_bk() : F
 
 void launch_prefill_gemm_fp8(const void* A, const void* W,
                              const float* sx, const float* sw, void* C,
-                             int M, int N, int K, cudaStream_t stream) {
+                             int M, int N, int K, cudaStream_t stream, const void* sw_bf16) {
+    const __nv_bfloat16* swb = reinterpret_cast<const __nv_bfloat16*>(sw_bf16);
     const bool narrow = M >= FP8_NARROW_MIN_M && M <= FP8_NARROW_BM && fp8_narrow_m();
     const int bm = narrow ? FP8_NARROW_BM : FP8_BM;
     dim3 grid((N + FP8_BN - 1) / FP8_BN, (M + bm - 1) / bm);
     if (narrow) {
         SI_FP8_NARROW(false, grid,
             reinterpret_cast<const __nv_fp8_e4m3*>(A), reinterpret_cast<const __nv_fp8_e4m3*>(W),
-            sx, sw, reinterpret_cast<__nv_bfloat16*>(C), nullptr, M, N, K, 0);
+            sx, sw, reinterpret_cast<__nv_bfloat16*>(C), nullptr, M, N, K, 0, swb);
         return;
     }
     pf_gemm_fp8_kernel<false><<<grid, 256, 0, stream>>>(
         reinterpret_cast<const __nv_fp8_e4m3*>(A), reinterpret_cast<const __nv_fp8_e4m3*>(W),
-        sx, sw, reinterpret_cast<__nv_bfloat16*>(C), nullptr, M, N, K, 0);
+        sx, sw, reinterpret_cast<__nv_bfloat16*>(C), nullptr, M, N, K, 0, swb);
 }
 
 // Same occupancy knee as the int8 split-K launcher: one 128x128 tile per block, so GDN
@@ -500,9 +503,12 @@ static int fp8_sk_splits(int M, int N, int K) {
     return s > 1 ? s : 1;
 }
 
-__global__ void pf_gemm_fp8_sk_epi_kernel(const float* __restrict__ P, const float* __restrict__ sx,
-                                          const float* __restrict__ sw, __nv_bfloat16* __restrict__ C,
-                                          int M, int N) {
+// With `rezero` the partials are left at zero for the next launch that accumulates into them, so a
+// caller that keeps them that way (see keep_zero below) needs no memset before each one.
+__global__ void pf_gemm_fp8_sk_epi_kernel(float* __restrict__ P, const float* __restrict__ sx,
+                                          const float* __restrict__ sw,
+                                          const __nv_bfloat16* __restrict__ swb,
+                                          __nv_bfloat16* __restrict__ C, int M, int N, int rezero) {
     const int m = blockIdx.y;
     if (m >= M) return;
     const float s = sx[m];
@@ -510,17 +516,21 @@ __global__ void pf_gemm_fp8_sk_epi_kernel(const float* __restrict__ P, const flo
     int n = (blockIdx.x * blockDim.x + threadIdx.x) * 2;
     if (n + 1 < N) {
         const float2 p = *reinterpret_cast<const float2*>(&P[row + n]);
-        *reinterpret_cast<__nv_bfloat162*>(&C[row + n]) =
-            __floats2bfloat162_rn(p.x * s * sw[n], p.y * s * sw[n + 1]);
+        const float w0 = swb ? __bfloat162float(swb[n]) : sw[n];
+        const float w1 = swb ? __bfloat162float(swb[n + 1]) : sw[n + 1];
+        *reinterpret_cast<__nv_bfloat162*>(&C[row + n]) = __floats2bfloat162_rn(p.x * s * w0, p.y * s * w1);
+        if (rezero) *reinterpret_cast<float2*>(&P[row + n]) = make_float2(0.f, 0.f);
     } else if (n < N) {
-        C[row + n] = __float2bfloat16(P[row + n] * s * sw[n]);
+        C[row + n] = __float2bfloat16(P[row + n] * s * (swb ? __bfloat162float(swb[n]) : sw[n]));
+        if (rezero) P[row + n] = 0.f;
     }
 }
 
 bool launch_prefill_gemm_fp8_splitk(const void* A, const void* W,
                                     const float* sx, const float* sw, void* C,
                                     int M, int N, int K, float* partials,
-                                    cudaStream_t stream) {
+                                    cudaStream_t stream, const void* sw_bf16, bool keep_zero) {
+    const __nv_bfloat16* swb = reinterpret_cast<const __nv_bfloat16*>(sw_bf16);
     static const bool on = [] {
         const char* e = getenv("SPARKINFER_PREFILL_GEMM_SPLITK");
         return !(e && e[0] == '0');
@@ -543,21 +553,22 @@ bool launch_prefill_gemm_fp8_splitk(const void* A, const void* W,
     if (sp <= 1) return false;
     const int ktiles = (nk + sp - 1) / sp;
     const int nz = (nk + ktiles - 1) / ktiles;
-    if (cudaMemsetAsync(partials, 0, (size_t)M * N * sizeof(float), stream) != cudaSuccess)
+    if (!keep_zero &&
+        cudaMemsetAsync(partials, 0, (size_t)M * N * sizeof(float), stream) != cudaSuccess)
         return false;
     dim3 grid((N + FP8_BN - 1) / FP8_BN, (M + bm - 1) / bm, nz);
     if (narrow) {
         SI_FP8_NARROW(true, grid,
             reinterpret_cast<const __nv_fp8_e4m3*>(A), reinterpret_cast<const __nv_fp8_e4m3*>(W),
-            sx, sw, nullptr, partials, M, N, K, ktiles);
+            sx, sw, nullptr, partials, M, N, K, ktiles, swb);
     } else {
         pf_gemm_fp8_kernel<true><<<grid, 256, 0, stream>>>(
             reinterpret_cast<const __nv_fp8_e4m3*>(A), reinterpret_cast<const __nv_fp8_e4m3*>(W),
-            sx, sw, nullptr, partials, M, N, K, ktiles);
+            sx, sw, nullptr, partials, M, N, K, ktiles, swb);
     }
     dim3 eg(((N + 1) / 2 + 255) / 256, M);
     pf_gemm_fp8_sk_epi_kernel<<<eg, 256, 0, stream>>>(
-        partials, sx, sw, reinterpret_cast<__nv_bfloat16*>(C), M, N);
+        partials, sx, sw, swb, reinterpret_cast<__nv_bfloat16*>(C), M, N, keep_zero ? 1 : 0);
     return true;
 }
 

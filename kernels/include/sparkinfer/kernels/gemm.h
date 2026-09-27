@@ -202,6 +202,11 @@ bool launch_mmvq_q80_rows(const void* q81, const void* W, void* y,
 // bit-identical to two launch_gemv_rows calls.
 bool launch_gemv_rows2(const void* x, const void* W0, const void* W1, void* y0, void* y1,
                        int M, int N0, int N1, int K, cudaStream_t stream = nullptr);
+// The same pair on the bf16 tensor cores, K split over CTAs and summed in order by a second launch:
+// for packed batches, where the per-row GEMV above is latency-bound. The summation order differs,
+// so outputs can move by an ulp. False (nothing launched) when the shape does not fit.
+bool launch_gemv_rows2_mma(const void* x, const void* W0, const void* W1, void* y0, void* y1,
+                           int M, int N0, int N1, int K, cudaStream_t stream = nullptr);
 
 // mma_min_rows: the row count from which a Q4_K matrix takes the int8 tensor-core arm instead of
 // the chunked MMVQ. 0 keeps the default (8, or SPARKINFER_MMVQ_MMA_MINM when that is set).
@@ -238,17 +243,24 @@ void launch_gemv_q6k_dp4a_f32(const void* q81, const void* W, float* y, int N, i
 // not cover, so the caller keeps its dp4a loop as the fallback.
 bool launch_mmvq_q4k_mma_head_f32(const void* q81, const void* W, float* y,
                                   int M, int N, int K, cudaStream_t stream);
-// Packed Q4_K rows on the fp16 tensor cores (see the kernel in gemv.cu), for a dense FFN's down
-// projection straight from its gate/up planes: y[M, N] = SwiGLU(gate, up)[M, K] . W^T, gate and up
-// [M, K] bf16, the activation staged as fp16 and the weights dequantized to fp16 in registers,
-// fp32 accumulate, bf16 output. M <= 32, K a multiple of 256 up to 19968, N a multiple of 128.
-// Returns false (having issued nothing) for any shape it does not cover, or with
-// SPARKINFER_CB_Q4K_F16=0.
+// Packed Q4_K rows on the fp16 tensor cores (see the kernel in gemv.cu): y[M, N] = x[M, K] . W^T
+// with the bf16 activation staged as fp16 and the weights dequantized to fp16 in registers, fp32
+// accumulate. M <= 32, K a multiple of 256 up to 19968, N a multiple of 128; y is bf16, or f32
+// with y_f32. Returns false (having issued nothing) for any shape it does not cover, on a stream
+// q4k_f16_rows_reserve() never reserved, or with SPARKINFER_CB_Q4K_F16=0.
+bool launch_mmvq_q4k_f16_rows(const void* x, const void* W, void* y, bool y_f32, int M, int N,
+                              int K, cudaStream_t stream);
+// The same over two matrices of one shape read against the same activation (gate and up), in one
+// grid: y1 = x . W1^T and y2 = x . W2^T, bf16.
+bool launch_mmvq_q4k_f16_rows2(const void* x, const void* W1, const void* W2, void* y1, void* y2,
+                               int M, int N, int K, cudaStream_t stream);
+// The same with SwiGLU(gate, up) as the activation, both [M, K] bf16: a dense FFN's down
+// projection straight from its gate/up planes. bf16 output.
 bool launch_q4k_f16_rows_swiglu(const void* gate, const void* up, const void* W, void* y, int M,
                                 int N, int K, cudaStream_t stream);
 bool q4k_f16_rows_enabled();
-// Allocates `stream`'s fp16 staging for the arm above (a no-op once done). Must run outside any
-// graph capture; the arm declines on a stream that was never reserved.
+// Allocates `stream`'s fp16 staging for the arms above (a no-op once done). Must run outside any
+// graph capture; the arms decline on a stream that was never reserved.
 bool q4k_f16_rows_reserve(cudaStream_t stream);
 
 bool launch_gemv_q4k_dp4a_multirow_f32(const void* q81, const void* W, float* y,

@@ -4314,6 +4314,7 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
                       c.sliding_window > 0 && muse_packed_on();
     bool muse_f16 = false;   // set before the capture (see below); declared here for the goto
     const bool hd_ok = (c.head_dim == 256) || muse;
+    bool q4k_f16 = false;   // set before the capture (see below); declared here for the goto
     if (!hd_ok || c.linear_head_dim != 128 || c.top_k <= 0 ||
         (!dense && c.n_experts != 256)) {
         verify_decline("[dflash-verify] shape unsupported hd=%d lhd=%d experts=%d topk=%d dense=%d\n",
@@ -4420,6 +4421,7 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
     float* f8_sx[2] = {nullptr, nullptr};
     float* f8_sw[2] = {nullptr, nullptr};
     float* f8_p[2] = {nullptr, nullptr};
+    size_t f8_p_bytes = 0;
     if (packed && fp8_ckpt && kFp8GemmMinRows > 0) {
         const int f8_kwide = std::max(H, lvdim);
         const int f8_nwide = std::max(std::max(lqkv, lvdim), H);
@@ -4429,6 +4431,7 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
             f8_sw[i] = a.alloc<float>(f8_nwide);
             f8_p[i] = a.alloc<float>((size_t)NA * f8_nwide);
         }
+        f8_p_bytes = (size_t)NA * f8_nwide * sizeof(float);
     }
     const bool fp8_gemm = f8_p[1] && N >= kFp8GemmMinRows;
     // WIDE-BATCH FFN OPERANDS. Above a handful of rows the row-GEMV stops being the right kernel:
@@ -4904,11 +4907,21 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
         if (ps != st && (ai < 0 || !f8_prefork[ai])) return false;
         if (ai < 0) ai = fp8_stage(in, k, false);
         const int slot = (ps == st) ? 0 : 1;
-        kernels::launch_prefill_fp8_wscales_bf16(w, f8_sw[slot], no, ps);
+        // The epilogues read the checkpoint's bf16 channel scales in place (w's first `no` bf16s),
+        // and the split-K partials stay zeroed between launches (zeroed once before the capture
+        // below), so a projection is its GEMM and its epilogue: no scale-copy kernel and no memset
+        // node ahead of each one. SPARKINFER_FP8_GEMM_LEAN=0 restores both.
+        static const bool lean = [] {
+            const char* e = getenv("SPARKINFER_FP8_GEMM_LEAN");
+            return !(e && e[0] == '0');
+        }();
+        if (!lean) kernels::launch_prefill_fp8_wscales_bf16(w, f8_sw[slot], no, ps);
+        const void* swb = lean ? w : nullptr;
         const void* we4 = static_cast<const char*>(w) + (size_t)no * 2;
         if (!kernels::launch_prefill_gemm_fp8_splitk(f8_a[ai], we4, f8_sx[ai], f8_sw[slot], out,
-                                                     N, no, k, f8_p[slot], ps))
-            kernels::launch_prefill_gemm_fp8(f8_a[ai], we4, f8_sx[ai], f8_sw[slot], out, N, no, k, ps);
+                                                     N, no, k, f8_p[slot], ps, swb, lean))
+            kernels::launch_prefill_gemm_fp8(f8_a[ai], we4, f8_sx[ai], f8_sw[slot], out, N, no, k, ps,
+                                             swb);
         return true;
     };
     auto proj = [&](const bf16* in, const void* w, int type, bf16* out, int no, int k) -> bool {
@@ -5223,6 +5236,21 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
     }();
     muse_f16 = muse && packed && muse_f16_min > 0 && N >= muse_f16_min &&
                kernels::q4k_f16_rows_enabled() && kernels::q4k_f16_rows_reserve(st);
+    // The hd256 checkpoints' Q4_K matmuls on the fp16 tensor cores at packed widths
+    // (launch_mmvq_q4k_f16_rows and friends): the attention q|gate, k/v and o projections, the
+    // Q4_K FFN of the layers the checkpoint stores in FP8, and the LM head. The weights are
+    // dequantized in registers and the activation staged at fp16, so the fp32 accumulator carries
+    // the whole sum -- no per-32 scale fold, which is what bounds the int8 arms at these widths.
+    // The Bonsai shadow has its own ternary arms and keeps them. The staging (one per stream the
+    // arms run on) has to exist before the capture below begins. Below 8 rows the int8 arms keep
+    // it (SPARKINFER_CB_Q4K_F16_MINROWS moves the floor; SPARKINFER_CB_Q4K_F16=0 turns it off).
+    static const int q4k_f16_min = [] {
+        const char* e = getenv("SPARKINFER_CB_Q4K_F16_MINROWS");
+        return e ? atoi(e) : 8;
+    }();
+    q4k_f16 = !muse && packed && c.head_dim == 256 && dense && !s.bonsai_sign_hidden &&
+              q4k_f16_min > 0 && N >= q4k_f16_min && kernels::q4k_f16_rows_enabled() &&
+              kernels::q4k_f16_rows_reserve(st) && kernels::q4k_f16_rows_reserve(s.stream_k);
     // Packed decode always records. `recording` gates the EndCapture/instantiate/launch trio at
     // the bottom, while BeginCapture below is unconditional on this path (we only get here when
     // this tier's graph is NOT ready), so a false `recording` begins a capture that is never
@@ -5244,6 +5272,9 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
     //
     // Hoisting also makes it correct by construction rather than by care: these values are
     // constant across layers and across replays, so there is nothing for the graph to capture.
+    // The FP8 split-K partials start at zero; every epilogue leaves them there (keep_zero above).
+    for (int i = 0; i < 2 && f8_p_bytes; ++i)
+        if (f8_p[i]) pf_cu(cudaMemset(f8_p[i], 0, f8_p_bytes), "fp8 partials zero");
     if (dense && expert_ids && expert_w) {
         std::vector<float> ones((size_t)N * topk, 1.0f);
         pf_cu(cudaMemset(expert_ids, 0, (size_t)N * topk * sizeof(int)), "dense expert ids seed");
@@ -5735,8 +5766,17 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
                 supported = proj(xn, w.wqkv, w.wqkv_type, rq, lqkv, H);
             // alpha and beta are v_heads-wide reads of the same xn — two launches whose cost is
             // almost entirely launch/graph-node latency. One fused launch, same per-row math.
+            // A packed batch of 16+ rows takes the pair on the tensor cores (see
+            // launch_gemv_rows2_mma); SPARKINFER_CB_AB_MMA_MINROWS moves the floor.
+            static const int ab_mma_min = [] {
+                const char* e = getenv("SPARKINFER_CB_AB_MMA_MINROWS");
+                return e ? atoi(e) : 16;
+            }();
             const bool ab_fused = w.ssm_alpha_type == 0 && w.ssm_beta_type == 0 &&
-                kernels::launch_gemv_rows2(xn, w.ssm_alpha, w.ssm_beta, ra, rb, N, vh, vh, H, gst);
+                ((packed && ab_mma_min > 0 && N >= ab_mma_min && !s.bonsai_sign_hidden &&
+                  kernels::launch_gemv_rows2_mma(xn, w.ssm_alpha, w.ssm_beta, ra, rb, N, vh, vh, H,
+                                                 gst)) ||
+                 kernels::launch_gemv_rows2(xn, w.ssm_alpha, w.ssm_beta, ra, rb, N, vh, vh, H, gst));
             // Split join. One join here made the side branch's 11.8 MB wqkv_gate GEMV complete
             // before conv_compact -- which reads only rq, off the MAIN stream -- and before the
             // scan, which reads only alpha/beta. Nothing needs lz until gated_norm, three launches
@@ -5899,7 +5939,10 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
                                 fp4_a, fp4_asf, w.wq_fp4, w.wq_fp4_sf,
                                 b8, Ng, 2 * qdim, H, fp4_ws, st, w.wq_fp4_alpha);
             else
-                supported = proj(xn, w.wq, w.wq_type, b8, 2 * qdim, H);
+                supported = (q4k_f16 && w.wq_type == 12 &&
+                             kernels::launch_mmvq_q4k_f16_rows(xn, w.wq, b8, false, N, 2 * qdim,
+                                                               H, st)) ||
+                            proj(xn, w.wq, w.wq_type, b8, 2 * qdim, H);
             if (attn_kv_gemm)
                 supported = supported &&
                             kernels::launch_prefill_nvfp4_gemm(
@@ -5910,7 +5953,10 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
                                 vf, Ng, kvdim, H, fp4_ws, st, w.wv_fp4_alpha);
             else if (!attn_t)
                 supported = supported &&
-                            (proj_pair_nv_on(ast, xn, w.wk, w.wk_type, w.wv, w.wv_type,
+                            ((q4k_f16 && w.wk_type == 12 && w.wv_type == 12 &&
+                              kernels::launch_mmvq_q4k_f16_rows2(xn, w.wk, w.wv, kf, vf, N, kvdim,
+                                                                 H, ast)) ||
+                             proj_pair_nv_on(ast, xn, w.wk, w.wk_type, w.wv, w.wv_type,
                                              kf, vf, kvdim, H) ||
                              (proj_on(ast, xn, w.wk, w.wk_type, kf, kvdim, H) &&
                               proj_on(ast, xn, w.wv, w.wv_type, vf, kvdim, H)));
@@ -5956,10 +6002,22 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
             // in a separate kernel. Using the fused accumulation here changed verifier logits
             // after the first speculative token even though both paths consumed the same KV.
             const bool int8_gate_fused = kv8 && (H == 2048 || H == 4096);
+            // The session's split count is sized for ONE row walking its context; a packed step
+            // already has N rows x kv-heads CTAs per split, so at 32 rows the 32 splits leave
+            // each CTA a dozen keys and write as many partial bytes as they read KV. From 24
+            // rows it takes 16 (SPARKINFER_CB_ATTN_SPLITS, 0 keeps the session's). The buffers
+            // are sized for the session's count, which is never smaller.
+            static const int cb_attn_splits = [] {
+                const char* e = getenv("SPARKINFER_CB_ATTN_SPLITS");
+                return e ? atoi(e) : 16;
+            }();
+            const int ns_attn = (packed && N >= 24 && !s.bonsai_sign_hidden && cb_attn_splits > 0 &&
+                                 cb_attn_splits < ns)
+                              ? cb_attn_splits : ns;
             kernels::launch_flash_decode_split(
                 qb, kp, vp, btab_rows ? btab_rows : btable, seq, att,
                 fa_m, fa_l, fa_acc,
-                N, c.n_q_heads, c.n_kv_heads, c.head_dim, bs, mbs, ns,
+                N, c.n_q_heads, c.n_kv_heads, c.head_dim, bs, mbs, ns_attn,
                 // Pass the real sequence length, not -1. This argument is the HOST-side hint
                 // launch_flash_decode_split uses to pick its implementation:
                 //   mma_chunk = (seqlen + n_splits - 1) / n_splits
@@ -5995,7 +6053,10 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
                                 fp4_a, fp4_asf, w.wo_fp4, w.wo_fp4_sf,
                                 ao, Ng, H, qdim, fp4_ws, st, w.wo_fp4_alpha);
             else
-                supported = proj(att, w.wo, w.wo_type, ao, H, qdim);
+                supported = (q4k_f16 && w.wo_type == 12 &&
+                             kernels::launch_mmvq_q4k_f16_rows(att, w.wo, ao, false, N, H, qdim,
+                                                               st)) ||
+                            proj(att, w.wo, w.wo_type, ao, H, qdim);
         }
         if (!supported) break;
         // DEBUG ONLY: layer-0-only sub-stage capture (ao = GDN/attn output pre-residual, h =
@@ -6309,6 +6370,14 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
                             N, H, ffn);
                     supported = false; break;
                 }
+            } else if (q4k_f16 && topk == 1 && w.gate_qtype == 12 && w.up_qtype == 12 &&
+                       w.down_qtype == 12 &&
+                       kernels::launch_mmvq_q4k_f16_rows2(hn, w.gate_q, w.up_q, sg, su, N, ffn, H,
+                                                          st) &&
+                       kernels::launch_q4k_f16_rows_swiglu(sg, su, w.down_q, routed, N, H, ffn,
+                                                           st)) {
+                // Gate and up in one grid over the same fp16 activation, then down straight from
+                // SwiGLU of the two planes.
             } else {
                 kernels::launch_moe_expert_ffn_q4k(hn, w.gate_q, w.up_q, w.down_q,
                                                    w.gate_qtype, w.up_qtype, w.down_qtype,
@@ -6652,7 +6721,10 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
         // a K split and writes the logits directly. Gated on its own switch rather than
         // cb_head_mr, which belongs to the arm below: SPARKINFER_HEAD_MMA=0 restores the previous
         // dispatch, so both arms come out of ONE binary.
-        if (packed && N > 1 &&
+        if (q4k_f16 &&
+            kernels::launch_mmvq_q4k_f16_rows(xn, s.w.lm_head, logits, true, N, c.vocab, H, st))
+            mr_done = true;
+        if (!mr_done && packed && N > 1 &&
             kernels::launch_mmvq_q4k_mma_head_f32(q81, s.w.lm_head, logits, N, c.vocab, H, st))
             mr_done = true;
         if (!mr_done && cb_head_mr && packed && N > 1) {

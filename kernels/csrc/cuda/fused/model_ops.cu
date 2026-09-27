@@ -97,8 +97,9 @@ __global__ void argmax_p2_kernel(int* __restrict__ out_id) {
 // draft's handful of proposal rows that pins a 248k-entry scan to a few of the 5090's 170 SMs.
 // Same split as the single-row decode path, with the row on grid.y and per-row partials.
 // argmax_merge is associative and picks max-value/min-index, so the verdict is identical to
-// argmax_kernel's regardless of how the scan is partitioned.
-static constexpr int ARGMAX_ROWS_MAX = 16;
+// argmax_kernel's regardless of how the scan is partitioned. 64 rows covers every packed decode
+// width: at 32 the one-block-per-row fallback took 80 us of a continuous-batch step.
+static constexpr int ARGMAX_ROWS_MAX = 64;
 __device__ float g_argmax_rpv[ARGMAX_ROWS_MAX * ARGMAX_BLOCKS];
 __device__ int   g_argmax_rpi[ARGMAX_ROWS_MAX * ARGMAX_BLOCKS];
 
