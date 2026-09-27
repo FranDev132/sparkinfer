@@ -309,6 +309,8 @@ private:
     // retries admission, so a large request is not starved by smaller ones arriving after it.
     std::set<uint64_t> waiting_;
     uint64_t next_wait_ticket_ = 1;
+    // Callers inside complete_streaming whose submission has not resolved yet (see worker_loop).
+    std::atomic<int> submitting_{0};
     std::atomic<uint64_t> admission_waits_{0}, admission_timeouts_{0};
     bool queue_depth_full_locked() const;
     int active_jobs_locked() const;   // jobs not yet done; caller holds mu_

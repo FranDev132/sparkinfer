@@ -6206,7 +6206,36 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
             // a machine with a different SM count without a rebuild.
             const bool attn_kv_gemm = attn_q_gemm && (kAttnGemm & 4) &&
                                       w.wk_fp4 && w.wk_fp4_sf && w.wv_fp4 && w.wv_fp4_sf;
-            if (attn_t)
+            // With the shadow, k and v (one pair launch) read the same int8 xn as q and write
+            // nothing q reads, so they run beside it on the side stream, each launch splitting k
+            // into its own half of the partials -- the q launch alone is under a wave at a few
+            // rows. Same kernels, same splits, so every value is what the serial order computed.
+            static const bool attn_kv_side = [] {
+                const char* e = getenv("SPARKINFER_CB_ATTN_KV_SIDE");
+                return !(e && e[0] == '0');
+            }();
+            const size_t part_half = bt_part_cap / 2;
+            const bool kv_side = attn_t && attn_kv_side && fork_shared && ev_fork && ev_join &&
+                                 N <= 8 && (size_t)8 * N * (2 * qdim) <= part_half &&
+                                 (size_t)8 * 2 * N * kvdim <= bt_part_cap - part_half;
+            if (attn_t && kv_side) {
+                supported = xn_pre ||
+                            kernels::launch_ptq1_rotq_bf16(
+                                xn, static_cast<const signed char*>(s.bonsai_sign_hidden), bt_q,
+                                bt_qd, bt_qs, N, H, s.bonsai_block, st);
+                if (supported) {
+                    pf_cu(cudaEventRecord(ev_fork, st), "verify attn kv fork");
+                    pf_cu(cudaStreamWaitEvent(s.stream_k, ev_fork, 0), "verify attn kv fork wait");
+                    supported = kernels::launch_gemm_ptq1_i8_rows_bf16(
+                                    bt_q, bt_qd, bt_qs, tw->wk, tw->wv, kf, vf, N, kvdim, H,
+                                    s.stream_k, bt_part + part_half, bt_part_cap - part_half) &&
+                                kernels::launch_gemm_ptq1_i8_rows_bf16(
+                                    bt_q, bt_qd, bt_qs, tw->wq, nullptr, b8, nullptr, N, 2 * qdim,
+                                    H, st, bt_part, part_half);
+                    pf_cu(cudaEventRecord(ev_join, s.stream_k), "verify attn kv join");
+                    pf_cu(cudaStreamWaitEvent(st, ev_join, 0), "verify attn kv join wait");
+                }
+            } else if (attn_t)
                 // q, then k with v as one pair: the pairing sets the k split, which has to be the
                 // one single-row decode used for the same pair.
                 supported = proj_t(xn, s.bonsai_sign_hidden, tw->wq, nullptr, b8, nullptr,

@@ -147,7 +147,18 @@ ContinuousBatchEngine::Result ContinuousBatchEngine::complete_streaming(
     uint64_t rid = 0;
     EnqueueError err = EnqueueError::NONE;
     bool gave_up = false, deadline_ran_out = false;
+    // Counted from before mu_ is taken until the submission resolves, so the worker can tell a
+    // request that is about to appear from one that is not coming (see worker_loop).
+    submitting_.fetch_add(1, std::memory_order_acq_rel);
+    struct SubmitDone {
+        ContinuousBatchEngine* e;
+        ~SubmitDone() {
+            e->submitting_.fetch_sub(1, std::memory_order_acq_rel);
+            e->cv_.notify_all();
+        }
+    };
     {
+        SubmitDone submit_done{this};
         std::unique_lock<std::mutex> lock(mu_);
         // Every request reserves KV for its prompt plus max_tokens when it is admitted, so a few
         // agents asking for long outputs can hold the whole pool. Such a request used to be
@@ -577,6 +588,18 @@ ContinuousBatchEngine::Result ContinuousBatchEngine::wait_locked(uint64_t reques
     return out;
 }
 
+namespace {
+// scheduler.cpp's packed_decode_width(): the width a packed decode step serves at a flat cost.
+int packed_decode_width_cb() {
+    static const int v = [] {
+        const char* e = getenv("SPARKINFER_WIDE_DECODE_ROWS");
+        const int x = e ? atoi(e) : 32;
+        return x < 1 ? 1 : x;
+    }();
+    return v;
+}
+}  // namespace
+
 void ContinuousBatchEngine::worker_loop() {
     while (true) {
         // A request that is alone and eligible decodes speculatively (see enable_speculative). It
@@ -633,7 +656,37 @@ void ContinuousBatchEngine::worker_loop() {
                 active.push_back(s);
             }
 
-            ScheduleBatch batch = scheduler_.schedule(active);
+            // Nothing decodes yet and a small load is still being submitted: give the requests
+            // already inside complete_streaming a moment (bounded) to land, so the scheduler sees
+            // the whole load at once and they are prefilled together.
+            int arriving = submitting_.load(std::memory_order_acquire);
+            if (arriving > 0) {
+                int pending = 0, decoding = 0;
+                for (const auto& s : active) (s.phase == SeqPhase::PREFILL ? pending : decoding)++;
+                if (decoding == 0 && pending >= 1 && (pending + arriving) * 4 <= packed_decode_width_cb()) {
+                    cv_.wait_for(lock, std::chrono::milliseconds(2), [&] {
+                        return submitting_.load(std::memory_order_acquire) == 0;
+                    });
+                    arriving = submitting_.load(std::memory_order_acquire);
+                    active.clear();
+                    for (const auto& kv : jobs_) {
+                        if (kv.second->done) continue;
+                        ScheduledSequence s;
+                        s.request_id = kv.first;
+                        s.seq_id = kv.second->seq_id;
+                        s.phase = kv.second->phase;
+                        s.priority = kv.second->req.priority;
+                        s.tokens_in_phase = (kv.second->phase == SeqPhase::PREFILL)
+                                                ? kv.second->prefill_pos
+                                                : kv.second->decode_emitted;
+                        s.prefill_remaining = (kv.second->phase == SeqPhase::PREFILL)
+                                                  ? (int)kv.second->req.prompt.size() - kv.second->prefill_pos
+                                                  : 0;
+                        active.push_back(s);
+                    }
+                }
+            }
+            ScheduleBatch batch = scheduler_.schedule(active, arriving);
             prefill_ids = batch.prefill_request_ids;
             decode_ids = batch.decode_request_ids;
 

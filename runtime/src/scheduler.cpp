@@ -91,7 +91,7 @@ Scheduler::Scheduler(SchedulePolicy policy, int max_tokens_per_batch)
 
 Scheduler::~Scheduler() = default;
 
-ScheduleBatch Scheduler::schedule(const std::vector<ScheduledSequence>& active) const {
+ScheduleBatch Scheduler::schedule(const std::vector<ScheduledSequence>& active, int arriving) const {
     ScheduleBatch batch;
     if (active.empty()) return batch;
 
@@ -228,8 +228,19 @@ ScheduleBatch Scheduler::schedule(const std::vector<ScheduledSequence>& active) 
         // both, the first schedule() already sees (pending + have) * 2 >= wide, and in steady
         // state `have < wide` gates them out regardless.
         const int fill = pending + have;
+        // A small load whose every request is already queued and none of which decodes yet:
+        // admit them all, so they are prefilled as one pack instead of one pass each ahead of a
+        // decode step at a fraction of its width. Only when nothing more is arriving and the
+        // whole load is a quarter of `wide` or less -- c16/c32 never get here, and a wide load
+        // still forming its queue always has arrivals in flight.
+        static const bool pack_start = [] {
+            const char* e = getenv("SPARKINFER_CB_PACK_START");
+            return !(e && e[0] == '0');
+        }();
+        const bool narrow_start = pack_start && have == 0 && arriving == 0 && pending >= 2 &&
+                                  fill * 4 <= wide;
         const bool deep_ramp = fill * 2 >= wide ||
-                               (deep_rows < wide && have > 0 && fill * 2 < wide);
+                               (deep_rows < wide && have > 0 && fill * 2 < wide) || narrow_start;
         const int allow = (have < wide && deep_ramp) ? prefills_per_step() : 1;
         int taken = 0;
         for (const ScheduledSequence* s : ordered) {

@@ -51,7 +51,8 @@ public:
     // CONTINUOUS_BATCHING / CHUNKED_PREFILL: vLLM V1 decode-first packing (up to
     // max_tokens_per_batch), then at most one prefill in remaining budget.
     // PRIORITY: exclusive prefill-first (no mix).
-    ScheduleBatch schedule(const std::vector<ScheduledSequence>& active) const;
+    // `arriving`: requests the caller knows are mid-submission (not yet in `active`).
+    ScheduleBatch schedule(const std::vector<ScheduledSequence>& active, int arriving = 0) const;
 
     // Legacy group API (kept for compatibility).
     void add_sequence_group(SequenceGroup group);
