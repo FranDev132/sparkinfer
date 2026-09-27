@@ -80,6 +80,10 @@ __global__ __launch_bounds__(1024) void pf_swiglu_quant_i8_reg_kernel(
         const __nv_bfloat16* __restrict__ gate, const __nv_bfloat16* __restrict__ up,
         signed char* __restrict__ q, float* __restrict__ scale, int rows, int cols,
         signed char* __restrict__ qp) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+    // As pf_gate_quant_rows_kernel: the down GEMM that reads q/scale/qp may start its weights now.
+    asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+#endif
     const int row = blockIdx.x;
     if (row >= rows) return;
     const size_t base = (size_t)row * cols;

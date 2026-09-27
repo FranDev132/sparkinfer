@@ -127,6 +127,11 @@ __global__ __launch_bounds__(BLOCK) void pf_gate_quant_rows_kernel(
         const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* __restrict__ gate,
         signed char* __restrict__ q, float* __restrict__ scale, int rows, int cols,
         signed char* __restrict__ qp, int gate_ld) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+    // Lets a programmatically launched consumer (the o GEMM, see launch_prefill_gemm_qi8_dense's
+    // QM_PDL) start its weight fetch now; it waits on this grid before reading q/scale/qp.
+    asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+#endif
     const int r   = blockIdx.x;
     const int tid = threadIdx.x;
     if (r >= rows) return;

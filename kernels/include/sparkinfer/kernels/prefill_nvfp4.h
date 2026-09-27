@@ -18,6 +18,24 @@ bool launch_prefill_nvfp4_rmsnorm_quant_a(const void* src_bf16, const void* weig
                                           void* dst_fp4, void* dst_sf,
                                           int m, int k, float eps,
                                           cudaStream_t stream = nullptr);
+// The same fold, byte-identical to launch_rmsnorm (fast-math) + launch_prefill_nvfp4_quant_a,
+// and it also writes the bf16 norm to `out` (skipped when null). k must be a multiple of 16.
+bool launch_prefill_nvfp4_rmsnorm_quant_a_exact(const void* src_bf16, const void* weight_bf16,
+                                                void* out_bf16, void* dst_fp4, void* dst_sf,
+                                                int m, int k, float eps,
+                                                cudaStream_t stream = nullptr);
+// launch_norm_then_add_acc followed by the exact fold above, in one pass and byte-identical to
+// both: out_sum = residual + RMSNorm(acc * sxr * rs) * w_post, out_norm = RMSNorm(out_sum) * w_pre
+// and its FP4 operand. k must be a multiple of 16 and at most 8192.
+bool launch_prefill_nvfp4_norm_add_norm_quant_exact(const void* residual, const int* acc,
+                                                     const float* sxr, const float* rs,
+                                                     const void* w_post, float eps_post,
+                                                     void* out_sum, const void* w_pre,
+                                                     float eps_pre, void* out_norm, void* dst_fp4,
+                                                     void* dst_sf, int m, int k,
+                                                     cudaStream_t stream = nullptr,
+                                                     // write zeros back over acc[0, m*k) once read
+                                                     bool zero_acc = false);
 // Muse's attention gate fused into the A-operand quantize: x * sigmoid(g) straight to FP4, the
 // same fold launch_prefill_gate_quant_rows_i8 does for the int8 o-projection.
 // gate_ld: row pitch of `gate` in elements, when it is a COLUMN SLICE of a wider packed

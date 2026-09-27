@@ -1247,6 +1247,12 @@ __device__ __forceinline__ void ws_mb_fence_init() {
 __device__ __forceinline__ void ws_cp16(unsigned dst, const void* src) {
     asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" :: "r"(dst), "l"(src) : "memory");
 }
+// Wait on the grid this one was programmatically launched behind (QB_F_PDL); a no-op otherwise.
+__device__ __forceinline__ void ws_pdl_wait() {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+    asm volatile("griddepcontrol.wait;" ::: "memory");
+#endif
+}
 
 template <int QT, bool GROUPED, bool SPLIT, int WBN = 64>
 __global__ __launch_bounds__(WsCfg<WBN>::THREADS, WsCfg<WBN>::MINB) void pf_dense_gemm_qi8_ws_kernel(
@@ -1322,6 +1328,7 @@ __global__ __launch_bounds__(WsCfg<WBN>::THREADS, WsCfg<WBN>::MINB) void pf_dens
                           : (A_i8 + (size_t)a_row * K + c16 + (size_t)(sb_lo << 8));
             dsts[u] = (unsigned)__cvta_generic_to_shared(&As[0][r][c16 ^ (16 * ((r >> 2) & 1))]);
         }
+        ws_pdl_wait();   // A is the previous grid's output (QB_F_PDL); the weights are not
         for (int t = 0; t < nsteps; t++) {
             const int s = t % CF::NA;
             if (t >= CF::NA) ws_mb_wait(emptyA(s), ((t / CF::NA) - 1) & 1);
@@ -1418,6 +1425,7 @@ __global__ __launch_bounds__(WsCfg<WBN>::THREADS, WsCfg<WBN>::MINB) void pf_dens
 
     // Epilogue, staged through Bs[0] once every MMA warp is past its last read of either plane.
     // The decode warps are finished: their last write preceded the fullB arrival waited on above.
+    ws_pdl_wait();   // sx and the output buffers are ordered behind the previous grid (QB_F_PDL)
     asm volatile("bar.sync 1, %0;" :: "n"(CF::CONS) : "memory");
     int* Cs = reinterpret_cast<int*>(&Bs[0][0][0]);
 #pragma unroll
@@ -2035,8 +2043,9 @@ static bool qm_tall_for(int ty, int M) {
 // Ternary-Bonsai-2's shapes at M=128 (16 cycled weight copies), 64-wide -> 128-wide: PTQ1 gate+up
 // 107.6 -> 92.1 us, q/k/v 49.5 -> 43.1, down 53.9 -> 50.1, all six shapes 15.23 -> 13.47 ms per
 // forward; Q4_K GDN qkv+z 63.1 -> 60.0. With two M-tiles the 64-wide grid's extra blocks win back
-// (M=256: 27.1 -> 30.0 ms), and a Q4_K launch the wide tile would split measured 28.1 -> 28.9 at
-// K=6144, so the launchers keep the 64-wide tile for those. The launchers also require every output
+// (M=256: 27.1 -> 30.0 ms). A Q4_K launch the wide tile would split measured 28.1 -> 28.9 at
+// K=6144 on that model's 40-tile widths; the launchers take the wide tile for a split Q4_K launch
+// only when every slice is deep enough (qm_wide_split_ok). The launchers also require every output
 // width to be a whole number of wide tiles. SPARKINFER_PREFILL_QB_WIDE=0 keeps the 64-wide tile
 // (A/B; bit-identical either way: the int32 sums are exact and every output takes the same
 // epilogue expression).
@@ -2059,6 +2068,25 @@ static int qm_pick_splits_wide(int ntw, int K, int mtiles, bool have_partials, i
     return splits < 1 ? 1 : splits;
 }
 
+// Whether a single-projection Q4_K launch takes the wide tile. Unsplit it always did; a launch the
+// wide grid would split keeps it too once every slice walks at least SPARKINFER_QB_WIDE_SPLIT_MINSB
+// super-blocks (default 4; 0 sends every split launch back to the 64-wide tile). Muse Glimmer's
+// prefill@128 down (N=6656, K=19968) was 13 slices x 104 narrow tiles, four waves of two blocks an
+// SM; wide it is 3 x 52, one block per SM, and every A slice is staged once per 128 columns
+// instead of per 64. Measured per launch at M=128 (16 cycled weight copies): down 94.0 -> 80.3 us,
+// o (K=4096, 3 slices of 6 super-blocks) 23.8 -> 22.9 us. Bit-identical: the slices still add
+// exact int32 partials, and every output takes the same epilogue expression.
+static bool qm_wide_split_ok(int ntw, int K, int mtiles, bool have_partials, int partials_splits) {
+    const int s = qm_pick_splits_wide(ntw, K, mtiles, have_partials, partials_splits);
+    if (s == 1) return true;
+    static int minsb = -1;
+    if (minsb < 0) {
+        const char* e = getenv("SPARKINFER_QB_WIDE_SPLIT_MINSB");
+        minsb = e ? atoi(e) : 4;
+    }
+    return minsb > 0 && ((K >> 8) + s - 1) / s >= minsb;
+}
+
 // Unsplit grids with more than one M-tile ran N-tiles fastest, so the M-tiles that read the same
 // weight tile sat a whole grid row apart and each fetched it from DRAM again (the weight loads are
 // evict-first). Dispatching them back to back turns the repeat reads into L2 hits. Each block still
@@ -2071,6 +2099,13 @@ static int qm_m_fast() {
     return e;
 }
 
+// QB_F_PDL's switch: SPARKINFER_QB_PDL=0 launches plainly even when a caller asks (A/B).
+static bool qm_pdl_on() {
+    static int e = -1;
+    if (e < 0) { const char* v = getenv("SPARKINFER_QB_PDL"); e = (v && v[0] == '0') ? 0 : 1; }
+    return e != 0 && qm_sm90();
+}
+
 // Dense fused-decode int8 GEMM (single weight, no routing). See pf_dense_gemm_qi8_kernel_g.
 // `out_acc` (optional): when the split-K atomic path is taken, skip the reduce pass and report
 // that `partials[0 .. M*N)` holds the raw int32 accumulator instead. The caller's next kernel then
@@ -2080,7 +2115,7 @@ bool launch_prefill_gemm_qi8_dense(int ggml_type, const signed char* A_i8, const
                                    const void* W_q, const float* row_scale, void* C_bf16,
                                    int M, int N, int K, cudaStream_t stream,
                                    int* partials, int partials_splits, int* out_acc,
-                                   const signed char* A_pack) {
+                                   const signed char* A_pack, int flags) {
     if (!pf_dense_gemm_qi8_supported(ggml_type)) return false;   // Q4_K / Q5_K / Q6_K
     if (!row_scale || M <= 0 || M > qb_max_m()) return false;
     if (K <= 0 || (K & (QM_SB - 1)) != 0) return false;         // whole super-blocks only
@@ -2090,8 +2125,8 @@ bool launch_prefill_gemm_qi8_dense(int ggml_type, const signed char* A_i8, const
     const int mtiles = (M + QM_BM - 1) / QM_BM;
     const bool wide = qm_wide_for(ggml_type, M) && (N % QM_WBN) == 0 &&
                       (ggml_type == QMQ_PTQ1 ||
-                       qm_pick_splits_wide(N / QM_WBN, K, mtiles, partials != nullptr,
-                                           partials_splits) == 1);
+                       qm_wide_split_ok(N / QM_WBN, K, mtiles, partials != nullptr,
+                                        partials_splits));
     const int ntiles = wide ? N / QM_WBN : (N + QM_BND - 1) / QM_BND;
 
     // Split K only when the plain grid leaves the device idle. With more than one M-tile the grid
@@ -2113,9 +2148,24 @@ bool launch_prefill_gemm_qi8_dense(int ggml_type, const signed char* A_i8, const
             const int atomic = qm_atomic_acc();
             const size_t total = (size_t)M * (size_t)N;
             // The atomic accumulator must start at zero; one [m][n] plane, not `splits` of them.
-            if (atomic) cudaMemsetAsync(partials, 0, total * sizeof(int), stream);
+            const bool zeroed = atomic && (flags & QB_F_ZEROED);
+            if (atomic && !zeroed) cudaMemsetAsync(partials, 0, total * sizeof(int), stream);
             dim3 grid(splits, ntiles, mtiles);
-            if (wide)
+            if (wide && zeroed && (flags & QB_F_PDL) && ggml_type == QMQ_Q4_K && qm_pdl_on()) {
+                cudaLaunchConfig_t cfg = {};
+                cfg.gridDim = grid;
+                cfg.blockDim = dim3(WsCfg<QM_WBN>::THREADS);
+                cfg.dynamicSmemBytes = WsCfg<QM_WBN>::SMEM;
+                cfg.stream = stream;
+                cudaLaunchAttribute attr{};
+                attr.id = cudaLaunchAttributeProgrammaticStreamSerialization;
+                attr.val.programmaticStreamSerializationAllowed = 1;
+                cfg.attrs = &attr;
+                cfg.numAttrs = 1;
+                cudaLaunchKernelEx(&cfg, pf_dense_gemm_qi8_ws_kernel<QMQ_Q4_K, false, true, QM_WBN>,
+                                   A_i8, sx, W, row_scale, C, M, N, K, PfQGroup{}, partials,
+                                   sb_per_split, atomic, A_pack, 0);
+            } else if (wide)
                 QM_LAUNCH_WIDE(false, true,
                         A_i8, sx, W, row_scale, C, M, N, K, PfQGroup{}, partials, sb_per_split,
                         atomic, A_pack);
@@ -2166,7 +2216,7 @@ bool launch_prefill_gemm_qi8_dense_resid(int ggml_type, const signed char* A_i8,
     const int mtiles = (M + QM_BM - 1) / QM_BM;
     const bool wide = qm_wide_for(ggml_type, M) && (N % QM_WBN) == 0 &&
                       (ggml_type == QMQ_PTQ1 ||
-                       qm_pick_splits_wide(N / QM_WBN, K, mtiles, true, partials_splits) == 1);
+                       qm_wide_split_ok(N / QM_WBN, K, mtiles, true, partials_splits));
     const int ntiles = wide ? N / QM_WBN : N / QM_BND;
     int splits = wide ? qm_pick_splits_wide(ntiles, K, mtiles, true, partials_splits)
                       : qm_pick_splits(ntiles, K, M, mtiles, true, partials_splits,

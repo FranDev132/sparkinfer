@@ -62,7 +62,17 @@ bool launch_prefill_gemm_qi8_dense(int ggml_type, const signed char* A_i8, const
                                    // qr_pack_off, prefill_quant_rows.cu). Same bytes, staged with
                                    // a quarter of the memory transactions; nullptr keeps the
                                    // row-major addressing. Output is bit-identical either way.
-                                   const signed char* A_pack = nullptr);
+                                   const signed char* A_pack = nullptr,
+                                   // QB_F_* bits below; 0 = the plain launch.
+                                   int flags = 0);
+// `partials` already holds zeros for [0, M*N) (its last reader cleared it), so the split-K
+// atomic path skips its memset.
+constexpr int QB_F_ZEROED = 1;
+// Launch the 128-wide split kernel with programmatic stream serialization: its weight-decode warps
+// start while the previous kernel (which must trigger launch_dependents) still runs, and the
+// A-staging and MMA warps wait on that grid first. Only with QB_F_ZEROED -- a memset node between
+// the two kernels would break the programmatic edge.
+constexpr int QB_F_PDL = 2;
 
 // The same GEMM with the residual add folded into its split-K reduce:
 // X[m][n] = bf16(X[m][n] + bf16(acc * sx[m] * row_scale[n])), exactly what the reduce into a

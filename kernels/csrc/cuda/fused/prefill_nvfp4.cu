@@ -10,6 +10,12 @@ size_t prefill_nvfp4_scale_bytes_a(int, int) { return 0; }
 size_t prefill_nvfp4_scale_bytes_b(int, int) { return 0; }
 size_t prefill_nvfp4_workspace_bytes(int, int, int) { return 0; }
 bool launch_prefill_nvfp4_quant_a(const void*, void*, void*, int, int, cudaStream_t) { return false; }
+bool launch_prefill_nvfp4_rmsnorm_quant_a_exact(const void*, const void*, void*, void*, void*,
+                                                int, int, float, cudaStream_t) { return false; }
+bool launch_prefill_nvfp4_norm_add_norm_quant_exact(const void*, const int*, const float*,
+                                                     const float*, const void*, float, void*,
+                                                     const void*, float, void*, void*, void*, int,
+                                                     int, cudaStream_t, bool) { return false; }
 bool launch_prefill_nvfp4_gate_quant_a(const void*, const void*, void*, void*, int, int,
                                        cudaStream_t) { return false; }
 bool launch_prefill_nvfp4_swiglu_quant_a(const void*, const void*, void*, void*, int, int,
