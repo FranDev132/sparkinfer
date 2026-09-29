@@ -1910,6 +1910,17 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
                                               (int)s.bonsai_block, st);
     };
 
+    // A layer's closing norm writes the next layer's xn; where that layer reads xn through the
+    // NVFP4 dp4a projections, the norm also writes its dp4a form (nv_pq_a/nv_ps_a, the kernel's
+    // NV output -- bit-identical to launch_gemv_nvfp4_quant_x on xn) and this carries the fact
+    // over, so the next prepare_xn_nvfp4 has nothing to launch. The post-attention norm does the
+    // same for the FFN (hn -> nv_xq/nv_xs). SPARKINFER_DECODE_NORM_NV=0 keeps the quantize
+    // launches (A/B).
+    static const bool dec_norm_nv = [] {
+        const char* e = getenv("SPARKINFER_DECODE_NORM_NV");
+        return !(e && e[0] == '0');
+    }();
+    bool xn_nv_carry = false;
     for (int L = 0; L < c.n_layers; L++) {
         // The decode shadow's weights: the FFN read through the dp4a GEMV, the attention and output
         // projections through the int8 one. Native residency keeps the float kernels its packed
@@ -1977,10 +1988,11 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
         // Q8_1 quantize above, so the parallel K/V and GDN streams that read it inherit the same
         // dependency they already have on xn itself. Not gated on use_pq: that flag selects the
         // mmvq activation format, which this path does not use.
-        bool xn_nv_ready = false;
+        bool xn_nv_ready = xn_nv_carry;
+        xn_nv_carry = false;
         auto prepare_xn_nvfp4 = [&](bool any_nv) {
             if (!any_nv || xn_nv_ready || !kernels::qwen38_nvfp4_dp4a_proj()) return;
-            kernels::launch_gemv_nvfp4_quant_x(s.xn, s.nv_pq_a, s.nv_ps_a, 1, H, st);
+            kernels::launch_gemv_nvfp4_quant_x(s.xn, s.nv_pq_a, s.nv_ps_a, 1, H, st, true);
             xn_nv_ready = true;
         };
         auto proj_xn = [&](const void* W, int t, void* y, int N, cudaStream_t pst) {
@@ -1996,9 +2008,11 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
                 else if (t == kernels::SI_QTYPE_FP8)
                     kernels::launch_gemv_fp8(s.xn, W, y, N, H, pst);
                 else if (t == kernels::SI_QTYPE_NVFP4) {
+                    // Programmatic on `st` only: there its producer is the kernel before it in the
+                    // same stream (see launch_gemv_nvfp4_rows_dp4a); a side stream joins by event.
                     if (!(xn_nv_ready &&
                           kernels::launch_gemv_nvfp4_rows_dp4a(s.nv_pq_a, s.nv_ps_a, W, y,
-                                                               1, N, H, pst)))
+                                                               1, N, H, pst, pst == st)))
                         kernels::launch_gemv_nvfp4(s.xn, W, y, N, H, pst);
                 }
                 else if (t == kPtq1GgmlType && s.bonsai_rot_xn)
@@ -2072,9 +2086,9 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
                     kernels::launch_gemv_fp8(x, W, y, N, K, st);
                 } else if (t == kernels::SI_QTYPE_NVFP4) {
                     if (kernels::qwen38_nvfp4_dp4a_proj()) {
-                        kernels::launch_gemv_nvfp4_quant_x(x, s.nv_pq_b, s.nv_ps_b, 1, K, st);
+                        kernels::launch_gemv_nvfp4_quant_x(x, s.nv_pq_b, s.nv_ps_b, 1, K, st, true);
                         if (kernels::launch_gemv_nvfp4_rows_dp4a(s.nv_pq_b, s.nv_ps_b, W, y,
-                                                                 1, N, K, st)) return;
+                                                                 1, N, K, st, true)) return;
                     }
                     kernels::launch_gemv_nvfp4(x, W, y, N, K, st);
                 } else if (t) kernels::launch_gemv_q(x, W, t, y, N, K, st);
@@ -2615,9 +2629,10 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
             // attention output, which showed up as LOSSLESS=0 rather than as a wrong number.
             else if (s.gguf && w.wo_type == kernels::SI_QTYPE_NVFP4 &&
                      kernels::qwen38_nvfp4_dp4a_proj() &&
-                     (kernels::launch_gemv_nvfp4_quant_x(s.attn, s.nv_pq_b, s.nv_ps_b, 1, s.qdim, st),
+                     (kernels::launch_gemv_nvfp4_quant_x(s.attn, s.nv_pq_b, s.nv_ps_b, 1, s.qdim, st,
+                                                         true),
                       kernels::launch_gemv_nvfp4_rows_dp4a(s.nv_pq_b, s.nv_ps_b, w.wo, s.ao,
-                                                           1, H, s.qdim, st))) {}
+                                                           1, H, s.qdim, st, true))) {}
             else if (s.gguf && w.wo_type) kernels::launch_gemv_q(s.attn, w.wo, w.wo_type, s.ao, H, s.qdim, st);
             else if (s.gguf)         kernels::launch_gemv(s.attn, w.wo, s.ao, H, s.qdim, st);
             else                     kernels::launch_gemm(s.attn, w.wo, s.ao, 1, H, s.qdim, 1.f, 0.f, gc, st);
@@ -2633,6 +2648,7 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
                             s.bonsai_rot_hn && s.bonsai_sign_h && s.bonsai_sign_ffn &&
                             w.gate_qtype == kPtq1GgmlType && w.up_qtype == kPtq1GgmlType &&
                             w.down_qtype == kPtq1GgmlType;
+        bool hn_nv_ready = false;   // the post-attention norm wrote hn's dp4a form (see dec_norm_nv)
         int ffn_hq = -1;
         if (c.muse_glimmer) {
             // Sandwich norm: h = x + RMSNorm(ao) * post_attn_norm (norm the attention
@@ -2674,9 +2690,17 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
                 ffn_hq = kernels::launch_ptq1_add_norm_rotate_quant(
                     s.x, s.ao, w.post_attn_norm, s.h, s.hn, s.aq81, c.rms_eps, s.bonsai_rot_hn,
                     s.bonsai_sign_h, (int)H, (int)s.bonsai_block, st);
-            if (ffn_hq < 0)
-                kernels::launch_add_rmsnorm2_q8(s.x, s.ao, w.post_attn_norm, s.h, s.hn, s.aq81, H,
-                                                c.rms_eps, st);
+            if (ffn_hq < 0) {
+                if (dec_norm_nv && !ffn_t3 && w.gate_nv && w.up_nv && w.down_nv && c.top_k == 1 &&
+                    kernels::qwen38_nvfp4_dp4a() &&
+                    kernels::launch_add_rmsnorm2_q8_nvfp4_rows(s.x, s.ao, w.post_attn_norm, s.h,
+                                                               s.hn, s.aq81, s.nv_xq, s.nv_xs, 1,
+                                                               H, c.rms_eps, st))
+                    hn_nv_ready = true;
+                else
+                    kernels::launch_add_rmsnorm2_q8(s.x, s.ao, w.post_attn_norm, s.h, s.hn, s.aq81,
+                                                    H, c.rms_eps, st);
+            }
             dbg_bf16(s.h, H, 50, L);
             dbg_bf16(s.hn, H, 51, L);
         } else {
@@ -2872,16 +2896,18 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
                 // the speculative output matching the AR output of this build, so a decode on
                 // dp4a against a verify on the float path would disagree and report LOSSLESS=0.
                 if (kernels::qwen38_nvfp4_dp4a()) {
-                    kernels::launch_gemv_nvfp4_quant_x(s.hn, s.nv_xq, s.nv_xs, 1, H, st);
+                    // hn_nv_ready: the post-attention norm already wrote these bytes.
+                    if (!hn_nv_ready)
+                        kernels::launch_gemv_nvfp4_quant_x(s.hn, s.nv_xq, s.nv_xs, 1, H, st, true);
                     // One grid for gate and up (see launch_gemv_nvfp4_rows_dp4a2): same shape,
                     // same activation, and per-row bit-identical to the two singles below.
                     if (!kernels::launch_gemv_nvfp4_rows_dp4a2(s.nv_xq, s.nv_xs, w.gate_nv,
                                                                w.up_nv, s.nv_gate, s.nv_up,
-                                                               1, c.moe_ffn, H, st)) {
+                                                               1, c.moe_ffn, H, st, true)) {
                     kernels::launch_gemv_nvfp4_rows_dp4a(s.nv_xq, s.nv_xs, w.gate_nv, s.nv_gate,
-                                                         1, c.moe_ffn, H, st);
+                                                         1, c.moe_ffn, H, st, true);
                     kernels::launch_gemv_nvfp4_rows_dp4a(s.nv_xq, s.nv_xs, w.up_nv, s.nv_up,
-                                                         1, c.moe_ffn, H, st);
+                                                         1, c.moe_ffn, H, st, true);
                     }
                     if (!kernels::launch_prefill_swiglu_nvfp4(s.nv_gate, s.nv_up, s.nv_h,
                                                              s.nv_xq, s.nv_xs, c.moe_ffn, st)) {
@@ -2889,7 +2915,7 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
                     kernels::launch_gemv_nvfp4_quant_x(s.nv_h, s.nv_xq, s.nv_xs, 1, c.moe_ffn, st);
                     }
                     kernels::launch_gemv_nvfp4_rows_dp4a(s.nv_xq, s.nv_xs, w.down_nv, s.routed,
-                                                         1, H, c.moe_ffn, st);
+                                                         1, H, c.moe_ffn, st, true);
                 } else {
                 kernels::launch_gemv_nvfp4(s.hn, w.gate_nv, s.nv_gate, c.moe_ffn, H, st);
                 kernels::launch_gemv_nvfp4(s.hn, w.up_nv, s.nv_up, c.moe_ffn, H, st);
@@ -3069,9 +3095,26 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
                               s.h, s.routed, nextnorm, s.x, s.xn, s.aq81, c.rms_eps,
                               s.bonsai_sign_h, s.bonsai_ffn_q, s.bonsai_ffn_qd, s.bonsai_ffn_qs,
                               1, (int)H, (int)s.bonsai_block, st);
-            if (!xn_rq_ready)
-                kernels::launch_add_rmsnorm2_q8(s.h, s.routed, nextnorm, s.x, s.xn, s.aq81, H,
-                                                c.rms_eps, st);
+            if (!xn_rq_ready) {
+                // The next layer's projections read xn through the NVFP4 dp4a path (its
+                // prepare_xn_nvfp4 test): write that form here too (see xn_nv_carry).
+                const Qwen35LayerWeights* nw = L + 1 >= c.n_layers ? nullptr
+                    : (dec_shadow ? &s.bonsai_dec_layers[L + 1] : &s.w.layers[L + 1]);
+                const int NV = kernels::SI_QTYPE_NVFP4;
+                const bool next_nv = dec_norm_nv && nw && s.gguf && kernels::qwen38_nvfp4_dp4a_proj() &&
+                    (nw->linear_attn
+                         ? (nw->wqkv_type == NV || nw->wqkv_gate_type == NV ||
+                            nw->ssm_alpha_type == NV || nw->ssm_beta_type == NV)
+                         : (nw->wq_type == NV || nw->wk_type == NV || nw->wv_type == NV));
+                if (next_nv && kernels::launch_add_rmsnorm2_q8_nvfp4_rows(s.h, s.routed, nextnorm, s.x,
+                                                                          s.xn, s.aq81, s.nv_pq_a,
+                                                                          s.nv_ps_a, 1, H, c.rms_eps,
+                                                                          st))
+                    xn_nv_carry = true;
+                else
+                    kernels::launch_add_rmsnorm2_q8(s.h, s.routed, nextnorm, s.x, s.xn, s.aq81, H,
+                                                    c.rms_eps, st);
+            }
         } else
             kernels::launch_add_rmsnorm2(s.h, s.routed, nextnorm, s.x, s.xn, 1, H, c.rms_eps, st);
         dflash_maybe_capture_layer(L);

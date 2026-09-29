@@ -463,6 +463,10 @@ __global__ void pf_swiglu_nvfp4_kernel(const __nv_bfloat16* __restrict__ gate,
                                        __nv_bfloat16* __restrict__ h,
                                        signed char* __restrict__ xq, float* __restrict__ xs,
                                        long n) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+    // A programmatically launched consumer (the decode down GEMV) may start fetching its weights.
+    asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+#endif
     const long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
     const bool live = i < n;
     float f = 0.f;

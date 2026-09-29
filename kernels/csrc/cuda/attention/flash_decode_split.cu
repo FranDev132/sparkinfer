@@ -1150,9 +1150,9 @@ template <> struct fa_mma_min_blocks<128, 16> { static constexpr int v = 4; };
 // per-token/per-head fp16 scales are applied to the int32 results. This halves the KV global read (the
 // bottleneck) and uses 2x-throughput int8 tensor cores. M is padded 8->16; partials (m,l,acc) stay
 // byte-compatible with the combine kernel. sm_80+ (wmma). One block per (seq, kv_head, split); 8 warps.
-template <int HEAD_DIM, int GQA, int WIDE = 0>
+template <int HEAD_DIM, int GQA, int WIDE = 0, int MB = 0>
 __global__ void __launch_bounds__(fa_mma_block_threads<HEAD_DIM, GQA>::v,
-                                 fa_mma_min_blocks<HEAD_DIM, GQA>::v) fa_split_gqa_mma_i8_kernel(
+                                 MB ? MB : fa_mma_min_blocks<HEAD_DIM, GQA>::v) fa_split_gqa_mma_i8_kernel(
     const __nv_bfloat16* __restrict__ q, const signed char* __restrict__ k_pool,
     const signed char* __restrict__ v_pool, const int* __restrict__ block_table,
     const int* __restrict__ seq_lens,
@@ -1175,7 +1175,15 @@ __global__ void __launch_bounds__(fa_mma_block_threads<HEAD_DIM, GQA>::v,
     // products and int32 sums are exact in any order, and the P' quantization, the softmax and
     // the fold are the kMmaPV shapes' own, so the partials are the ones the wmma path writes.
     // Block ids and scales stay read from the table: staging them measured slower on this group.
-    constexpr bool kWide = WIDE == 1 && HEAD_DIM == 256 && GQA == 6;
+    constexpr bool kWide = WIDE >= 1 && HEAD_DIM == 256 && GQA == 6;
+    // WIDE=2: the group's V words are loaded into registers straight after the QK mma instead of
+    // inside the PV loop, where each block's four loads were consumed by the mma right after
+    // issue -- up to eight DRAM round trips in series per group. Issued early they land under the
+    // barrier and the softmax. The same words reach the same byte permutes and mmas, so the
+    // partials are the WIDE=1 ones bit for bit. The 32 registers this holds take the kernel to
+    // 128 and two blocks an SM (MB), which it pays for everywhere it is used.
+    constexpr bool kVpre = kWide && WIDE == 2;
+    unsigned vw[kVpre ? 8 : 1][4];
     constexpr bool kRegP = kMmaPV || kWide;    // P' quantized from registers, correction folded
     // Split-major block order on the wide path: the kv heads' CTAs for one split are adjacent, so
     // the four readers of the same [token][kv_head][dim] rows run together rather than a wave
@@ -1328,6 +1336,20 @@ __global__ void __launch_bounds__(fa_mma_block_threads<HEAD_DIM, GQA>::v,
             // divergence vs the exact tile path at >16k on Qwen3.6).
             store_matrix_sync(reinterpret_cast<int*>(s_s) + warp * 16, cf, 128, mem_row_major);
         }
+        if constexpr (kVpre) {
+            const int grp = lane >> 2, tig = lane & 3;
+            const int dcol = warp * 32 + 4 * grp;
+            #pragma unroll
+            for (int ks = 0; ks < 8; ks++)
+                if (ks < gblk) {
+                    const signed char* vb = v_pool + ((size_t)blk_id(ks) * 16 * num_kv_heads + kvh) * HEAD_DIM
+                                          + (size_t)(tig * 4) * KVLD + dcol;
+                    vw[ks][0] = __ldg(reinterpret_cast<const unsigned*>(vb));
+                    vw[ks][1] = __ldg(reinterpret_cast<const unsigned*>(vb + KVLD));
+                    vw[ks][2] = __ldg(reinterpret_cast<const unsigned*>(vb + 2 * KVLD));
+                    vw[ks][3] = __ldg(reinterpret_cast<const unsigned*>(vb + 3 * KVLD));
+                }
+        }
         __syncthreads();
         // Read the raw int32 QK scores directly and apply the per-row/per-token scales inline in the
         // softmax below — this deletes a full 16x128 shared int32->float round-trip and one
@@ -1404,13 +1426,7 @@ __global__ void __launch_bounds__(fa_mma_block_threads<HEAD_DIM, GQA>::v,
             const int grp = lane >> 2, tig = lane & 3;
             const int dcol = warp * 32 + 4 * grp;
             int c[4][4] = {{0, 0, 0, 0}, {0, 0, 0, 0}, {0, 0, 0, 0}, {0, 0, 0, 0}};
-            for (int ks = 0; ks < gblk; ks++) {
-                const signed char* vb = v_pool + ((size_t)blk_id(ks) * 16 * num_kv_heads + kvh) * HEAD_DIM
-                                      + (size_t)(tig * 4) * KVLD + dcol;
-                const unsigned w0 = __ldg(reinterpret_cast<const unsigned*>(vb));
-                const unsigned w1 = __ldg(reinterpret_cast<const unsigned*>(vb + KVLD));
-                const unsigned w2 = __ldg(reinterpret_cast<const unsigned*>(vb + 2 * KVLD));
-                const unsigned w3 = __ldg(reinterpret_cast<const unsigned*>(vb + 3 * KVLD));
+            auto pv_block = [&](int ks, unsigned w0, unsigned w1, unsigned w2, unsigned w3) {
                 // w_i = dims 0..3 of token tig*4 + i  ->  b[j] = dim j of tokens 0..3.
                 const unsigned t0 = __byte_perm(w0, w1, 0x5140), t1 = __byte_perm(w2, w3, 0x5140);
                 const unsigned t2 = __byte_perm(w0, w1, 0x7362), t3 = __byte_perm(w2, w3, 0x7362);
@@ -1424,6 +1440,21 @@ __global__ void __launch_bounds__(fa_mma_block_threads<HEAD_DIM, GQA>::v,
                                  "{%0,%1,%2,%3}, {%4,%5}, {%6}, {%0,%1,%2,%3};\n"
                                  : "+r"(c[j][0]), "+r"(c[j][1]), "+r"(c[j][2]), "+r"(c[j][3])
                                  : "r"(a0), "r"(a1), "r"(b[j]));
+            };
+            if constexpr (kVpre) {
+                #pragma unroll
+                for (int ks = 0; ks < 8; ks++)
+                    if (ks < gblk) pv_block(ks, vw[ks][0], vw[ks][1], vw[ks][2], vw[ks][3]);
+            } else {
+                for (int ks = 0; ks < gblk; ks++) {
+                    const signed char* vb = v_pool + ((size_t)blk_id(ks) * 16 * num_kv_heads + kvh) * HEAD_DIM
+                                          + (size_t)(tig * 4) * KVLD + dcol;
+                    const unsigned w0 = __ldg(reinterpret_cast<const unsigned*>(vb));
+                    const unsigned w1 = __ldg(reinterpret_cast<const unsigned*>(vb + KVLD));
+                    const unsigned w2 = __ldg(reinterpret_cast<const unsigned*>(vb + 2 * KVLD));
+                    const unsigned w3 = __ldg(reinterpret_cast<const unsigned*>(vb + 3 * KVLD));
+                    pv_block(ks, w0, w1, w2, w3);
+                }
             }
             // c[j][e]: row grp (e < 2) or grp + 8, n = 2*tig + (e & 1) -> dim 32w + 4n + j.
             #pragma unroll
@@ -1776,7 +1807,21 @@ void launch_flash_decode_split(
                 // splits 44.4 -> 31.5. SPARKINFER_FA6_WIDE=0 keeps the wmma form.
                 static int fa6_wide = -1;
                 if (fa6_wide < 0) { const char* e = getenv("SPARKINFER_FA6_WIDE"); fa6_wide = (e && e[0] == '0') ? 0 : 1; }
-                if (fa6_wide)
+                // The V-prefetch form of the same group (WIDE=2, see kVpre), two blocks an SM,
+                // bit-identical, for splits of at least SPARKINFER_FA6_VPRE_MINCHUNK tokens (default
+                // 256, first reached at the 64k band). Measured on the kernel, one row, 252 splits:
+                // 64k 87-91 -> 72 us, 128k 180 -> 175, 256k 354 -> 350; at 16k/32k (65/131-token
+                // splits) the two-block form is 10% / 2% SLOWER, so those stay on the form above.
+                // 0 disables it.
+                static int fa6_vpre_min = -1;
+                if (fa6_vpre_min < 0) { const char* e = getenv("SPARKINFER_FA6_VPRE_MINCHUNK"); fa6_vpre_min = e ? atoi(e) : 256; }
+                if (fa6_wide && fa6_vpre_min > 0 && mma_chunk256 >= fa6_vpre_min)
+                    fa_split_gqa_mma_i8_kernel<256, GQA, 2, 2><<<gq, MMA_THREADS, i8_smem, stream>>>(
+                        reinterpret_cast<const __nv_bfloat16*>(q), reinterpret_cast<const signed char*>(k_pool),
+                        reinterpret_cast<const signed char*>(v_pool), block_table, seq_lens,
+                        part_m, part_l, part_acc, scale, num_q_heads, num_kv_heads, block_size, max_blocks, n_splits,
+                        reinterpret_cast<const __half*>(k_scale), reinterpret_cast<const __half*>(v_scale));
+                else if (fa6_wide)
                     fa_split_gqa_mma_i8_kernel<256, GQA, 1><<<gq, MMA_THREADS, i8_smem, stream>>>(
                         reinterpret_cast<const __nv_bfloat16*>(q), reinterpret_cast<const signed char*>(k_pool),
                         reinterpret_cast<const signed char*>(v_pool), block_table, seq_lens,

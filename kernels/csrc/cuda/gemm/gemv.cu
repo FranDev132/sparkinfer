@@ -1173,6 +1173,27 @@ __global__ void gemv_nvfp4_rows_sk_kernel(const __nv_bfloat16* __restrict__ x,
 //
 // -0 is handled: code 8 gives mag 0 and mask 0xFF, and (0 ^ 0xFF) - 0xFF is 0 in byte arithmetic,
 // which is the correct int8 for -0.
+// Programmatic dependent launch for the single-row decode GEMVs. The weights are the GEMV's own and
+// only its activation comes from the kernel before it, so a GEMV launched programmatic starts while
+// that kernel still runs: it asks L2 for the first weight trips of every lane, then waits for the
+// producer (griddepcontrol.wait) before its first activation load. The producers trigger at their
+// start. All three are no-ops for a kernel launched the ordinary way, and below sm_90.
+__device__ __forceinline__ void gemv_pdl_trigger() {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+    asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+#endif
+}
+__device__ __forceinline__ void gemv_pdl_wait() {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+    asm volatile("griddepcontrol.wait;" ::: "memory");
+#endif
+}
+__device__ __forceinline__ void gemv_prefetch_l2(const void* p) {
+    asm volatile("prefetch.global.L2 [%0];" :: "l"(p));
+}
+// Trips of its own groups each lane prefetches before the wait.
+constexpr int GEMV_PDL_TRIPS = 4;
+
 __device__ __forceinline__ void si_nvfp4_i8x8(unsigned p, unsigned& q0, unsigned& q1) {
     // Magnitudes for codes 0..3 and 4..7, one byte each, in the two PRMT source registers.
     const unsigned MAG_LO = 0x03020100u;   // {0, 1, 2, 3}
@@ -1193,6 +1214,8 @@ __device__ __forceinline__ void si_nvfp4_i8x8(unsigned p, unsigned& q0, unsigned
 __global__ void si_nvfp4_quant_x_kernel(const __nv_bfloat16* __restrict__ x,
                                         signed char* __restrict__ xq,
                                         float* __restrict__ xs, int ngroups) {
+    gemv_pdl_trigger();   // the GEMV after it may start fetching its weights (see gemv_pdl_wait)
+    gemv_pdl_wait();      // launched programmatic itself: nothing is read or written before this
     const int gi = blockIdx.x * blockDim.x + threadIdx.x;
     if (gi >= ngroups) return;
     const __nv_bfloat16* src = x + (size_t)gi * 16;
@@ -1210,7 +1233,7 @@ __global__ void si_nvfp4_quant_x_kernel(const __nv_bfloat16* __restrict__ x,
     xs[gi] = s;
 }
 
-template <typename OutT, int S, int R, int NR>
+template <typename OutT, int S, int R, int NR, bool PDL = false>
 __global__ void gemv_nvfp4_rows_dp4a_kernel(const signed char* __restrict__ xq,
                                             const float* __restrict__ xs,
                                             const void* __restrict__ packed,
@@ -1232,6 +1255,21 @@ __global__ void gemv_nvfp4_rows_dp4a_kernel(const signed char* __restrict__ xq,
         const int ng = K >> 4;
         const int gstride = S * 32;
         int g = split * 32 + lane;
+        if constexpr (PDL) {
+            #pragma unroll
+            for (int j = 0; j < NR; j++) {
+                const int nj = n0 + j;
+                if (NR > 1 && nj >= N) break;
+                const unsigned char* srow = sf + (size_t)nj * (size_t)(K >> 4);
+                const unsigned char* prow = w + (size_t)nj * (size_t)(K >> 1);
+                #pragma unroll
+                for (int u = 0; u < GEMV_PDL_TRIPS; u++) {
+                    const int gu = g + u * gstride;
+                    if (gu < ng) { gemv_prefetch_l2(prow + (size_t)gu * 8); gemv_prefetch_l2(srow + gu); }
+                }
+            }
+            gemv_pdl_wait();
+        }
         // GPT of this lane's OWN groups per trip. The lane keeps exactly the group sequence it had
         // -- g, g+stride, g+2*stride, ... -- and accumulates them in that order, so every
         // (output row, activation row) dot is the same sum of the same terms in the same order.
@@ -3208,11 +3246,42 @@ void launch_gemv_nvfp4(const void* x, const void* W, void* y, int N, int K, cuda
     gemv_nvfp4_kernel<__nv_bfloat16><<<grid, GEMV_WPB * 32, 0, stream>>>(xp, W, yp, N, K);
 }
 
+// Launches a single-row decode GEMV programmatic (see gemv_pdl_wait). SPARKINFER_DECODE_PDL=0
+// launches it the ordinary way, for an A/B out of one binary.
+static bool gemv_decode_pdl_on() {
+    static const bool on = [] {
+        const char* e = getenv("SPARKINFER_DECODE_PDL");
+        return !(e && e[0] == '0');
+    }();
+    return on;
+}
+template <typename... KArgs, typename... Args>
+static void gemv_launch_pdl(void (*kernel)(KArgs...), dim3 grid, dim3 block, cudaStream_t st,
+                            Args... args) {
+    cudaLaunchConfig_t cfg = {};
+    cfg.gridDim = grid;
+    cfg.blockDim = block;
+    cfg.dynamicSmemBytes = 0;
+    cfg.stream = st;
+    cudaLaunchAttribute attr{};
+    attr.id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attr.val.programmaticStreamSerializationAllowed = 1;
+    cfg.attrs = &attr;
+    cfg.numAttrs = 1;
+    cudaLaunchKernelEx(&cfg, kernel, args...);
+}
+
 void launch_gemv_nvfp4_quant_x(const void* x, void* xq, void* xs, int M, int K,
-                               cudaStream_t stream) {
+                               cudaStream_t stream, bool pdl) {
     if (!x || !xq || !xs || M < 1 || K < 1 || (K & 15)) return;
     const int ngroups = M * (K >> 4);
     const int blk = 256;
+    if (pdl && M == 1 && gemv_decode_pdl_on()) {
+        gemv_launch_pdl(si_nvfp4_quant_x_kernel, dim3((ngroups + blk - 1) / blk), dim3(blk), stream,
+                        reinterpret_cast<const __nv_bfloat16*>(x), reinterpret_cast<signed char*>(xq),
+                        reinterpret_cast<float*>(xs), ngroups);
+        return;
+    }
     si_nvfp4_quant_x_kernel<<<(ngroups + blk - 1) / blk, blk, 0, stream>>>(
         reinterpret_cast<const __nv_bfloat16*>(x), reinterpret_cast<signed char*>(xq),
         reinterpret_cast<float*>(xs), ngroups);
@@ -3228,7 +3297,7 @@ void launch_gemv_nvfp4_quant_x(const void* x, void* xq, void* xs, int M, int K,
 // Bit-identical: a CTA still owns RPB*NR consecutive output rows of ONE matrix (N0 is a multiple
 // of RPB*NR for every shape this is used on, so no CTA straddles the boundary), walks the same
 // groups in the same order, and folds the same S partials. Only which launch carries it changes.
-template <typename OutT, int S, int R, int NR>
+template <typename OutT, int S, int R, int NR, bool PDL = false>
 __global__ void gemv_nvfp4_rows_dp4a2_kernel(const signed char* __restrict__ xq,
                                              const float* __restrict__ xs,
                                              const void* __restrict__ packed0,
@@ -3257,6 +3326,21 @@ __global__ void gemv_nvfp4_rows_dp4a2_kernel(const signed char* __restrict__ xq,
         const int ng = K >> 4;
         const int gstride = S * 32;
         int g = split * 32 + lane;
+        if constexpr (PDL) {
+            #pragma unroll
+            for (int j = 0; j < NR; j++) {
+                const int nj = n0 + j;
+                if (NR > 1 && nj >= N) break;
+                const unsigned char* srow = sf + (size_t)nj * (size_t)(K >> 4);
+                const unsigned char* prow = w + (size_t)nj * (size_t)(K >> 1);
+                #pragma unroll
+                for (int u = 0; u < GEMV_PDL_TRIPS; u++) {
+                    const int gu = g + u * gstride;
+                    if (gu < ng) { gemv_prefetch_l2(prow + (size_t)gu * 8); gemv_prefetch_l2(srow + gu); }
+                }
+            }
+            gemv_pdl_wait();
+        }
         // GPT of this lane's OWN groups per trip. The lane keeps exactly the group sequence it had
         // -- g, g+stride, g+2*stride, ... -- and accumulates them in that order, so every
         // (output row, activation row) dot is the same sum of the same terms in the same order.
@@ -3529,7 +3613,7 @@ __global__ void gemv_nvfp4_rows_dp4a_pairwise_kernel(
 // the matrix boundary, which is the only thing that would change a row's arithmetic.
 bool launch_gemv_nvfp4_rows_dp4a2(const void* xq, const void* xs,
                                   const void* W0, const void* W1, void* y0, void* y1,
-                                  int M, int N, int K, cudaStream_t stream) {
+                                  int M, int N, int K, cudaStream_t stream, bool pdl) {
     if (!xq || !xs || !W0 || !W1 || !y0 || !y1 || N < 1 || K < 1 || (K & 15)) return false;
     if (!gemv_bf16_splitk()) return false;
     if (M < 1) return false;
@@ -3548,7 +3632,7 @@ bool launch_gemv_nvfp4_rows_dp4a2(const void* xq, const void* xs,
                     reinterpret_cast<const float*>(xs) + (size_t)r0 * ng, W0, W1,
                     reinterpret_cast<__nv_bfloat16*>(y0) + (size_t)r0 * N,
                     reinterpret_cast<__nv_bfloat16*>(y1) + (size_t)r0 * N,
-                    m, N, K, stream)) return false;
+                    m, N, K, stream, false)) return false;
         }
         return true;
     }
@@ -3561,6 +3645,24 @@ bool launch_gemv_nvfp4_rows_dp4a2(const void* xq, const void* xs,
     const auto* sp = reinterpret_cast<const float*>(xs);
     auto* yp0 = reinterpret_cast<__nv_bfloat16*>(y0);
     auto* yp1 = reinterpret_cast<__nv_bfloat16*>(y1);
+    // Single-row decode, launched programmatic behind its activation quantize: the same kernel
+    // and tiling the M == 1 case below picks, with the weight prefetch + wait in front.
+    if (pdl && M == 1 && nr_mode == 0 && gemv_decode_pdl_on()) {
+        if (N >= 4096) {
+            constexpr int S = 2, RPB = GEMV_WPB / S;
+            if (N % RPB) return false;
+            gemv_launch_pdl(gemv_nvfp4_rows_dp4a2_kernel<__nv_bfloat16, S, 1, 1, true>,
+                            dim3(2 * (N / RPB)), dim3(GEMV_WPB * 32), stream, xp, sp, W0, W1, yp0,
+                            yp1, N, K);
+        } else {
+            constexpr int S = 8, RPB = GEMV_WPB / S;
+            if (N % RPB) return false;
+            gemv_launch_pdl(gemv_nvfp4_rows_dp4a2_kernel<__nv_bfloat16, S, 1, 1, true>,
+                            dim3(2 * (N / RPB)), dim3(GEMV_WPB * 32), stream, xp, sp, W0, W1, yp0,
+                            yp1, N, K);
+        }
+        return true;
+    }
     // Opt-OUT. This kernel differs from the dp4a2 branch below only in which warp owns an output
     // element -- same split rule (N>=4096 ? S=2 : S=8), same lane-owned group walk, so every
     // output sums the same terms in the same order and the two are bit-identical. It wins once a
@@ -3630,7 +3732,7 @@ bool launch_gemv_nvfp4_rows_dp4a2(const void* xq, const void* xs,
 }
 
 bool launch_gemv_nvfp4_rows_dp4a(const void* xq, const void* xs, const void* W, void* y,
-                                 int M, int N, int K, cudaStream_t stream) {
+                                 int M, int N, int K, cudaStream_t stream, bool pdl) {
     if (!xq || !xs || !W || !y || N < 1 || K < 1 || (K & 15)) return false;
     if (!gemv_bf16_splitk()) return false;
     if (M < 1) return false;
@@ -3648,7 +3750,7 @@ bool launch_gemv_nvfp4_rows_dp4a(const void* xq, const void* xs, const void* W, 
                     reinterpret_cast<const signed char*>(xq) + (size_t)r0 * K,
                     reinterpret_cast<const float*>(xs) + (size_t)r0 * ng, W,
                     reinterpret_cast<__nv_bfloat16*>(y) + (size_t)r0 * N,
-                    m, N, K, stream)) return false;
+                    m, N, K, stream, false)) return false;
         }
         return true;
     }
@@ -3679,6 +3781,38 @@ bool launch_gemv_nvfp4_rows_dp4a(const void* xq, const void* xs, const void* W, 
     // remain available for paired A/Bs and for checkpoints whose width distribution differs.
     static const int down_nr4_mode = []{ const char* e = getenv("SPARKINFER_NVFP4_DOWN_NR4");
         return e ? ((e[0] == '1') ? 1 : 0) : -1; }();
+    // Single-row decode, launched programmatic behind its producer: the same kernel and tiling the
+    // M == 1 case below picks (NR = 1), with the weight prefetch + wait in front.
+    if (pdl && M == 1 && nr_mode == 0 && gemv_decode_pdl_on()) {
+        // The long-K projection (the FFN down, K = 17408 over N = 5120) as two output rows per
+        // warp-group: at one row its 10240 warps are 1.25 resident waves of this kernel and the
+        // last quarter-wave streams the weights at a fraction of the rate; at two all of them are
+        // resident at once, each lane with two weight rows in flight. Per row the arithmetic is
+        // unchanged (NR only picks which warp owns a row). Measured on the isolated kernel with
+        // DRAM-resident weights: 34.82 -> 32.97 us; the K <= N shapes are flat or slower at NR=2.
+        // SPARKINFER_DECODE_DOWN_NR2=0 keeps one row.
+        static const bool down_nr2 = [] {
+            const char* e = getenv("SPARKINFER_DECODE_DOWN_NR2");
+            return !(e && e[0] == '0');
+        }();
+        if (down_nr2 && K > N && N >= 4096) {
+            constexpr int S = 2, RPB = GEMV_WPB / S;
+            gemv_launch_pdl(gemv_nvfp4_rows_dp4a_kernel<__nv_bfloat16, S, 1, 2, true>,
+                            dim3((N + RPB * 2 - 1) / (RPB * 2)), dim3(GEMV_WPB * 32), stream, xp,
+                            sp, W, yp, N, K);
+        } else if (N >= 4096) {
+            constexpr int S = 2, RPB = GEMV_WPB / S;
+            gemv_launch_pdl(gemv_nvfp4_rows_dp4a_kernel<__nv_bfloat16, S, 1, 1, true>,
+                            dim3((N + RPB - 1) / RPB), dim3(GEMV_WPB * 32), stream, xp, sp, W, yp,
+                            N, K);
+        } else {
+            constexpr int S = 8, RPB = GEMV_WPB / S;
+            gemv_launch_pdl(gemv_nvfp4_rows_dp4a_kernel<__nv_bfloat16, S, 1, 1, true>,
+                            dim3((N + RPB - 1) / RPB), dim3(GEMV_WPB * 32), stream, xp, sp, W, yp,
+                            N, K);
+        }
+        return true;
+    }
 #define SI_NVFP4_DP4A(S_, R_) do { \
         constexpr int S = (S_), R = (R_), RPB = GEMV_WPB / S; \
         const bool down_nr4 = down_nr4_mode >= 0 ? down_nr4_mode != 0 : R == 3; \

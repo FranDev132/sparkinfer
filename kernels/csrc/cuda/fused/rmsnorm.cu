@@ -196,6 +196,13 @@ __global__ void add_rmsnorm2_q8_kernel(const __nv_bfloat16* __restrict__ x,
                                        signed char* __restrict__ nv_q,
                                        float* __restrict__ nv_s,
                                        int cols, float eps) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+    // NV form only: its reader is the NVFP4 dp4a GEMV, which, launched programmatic, fetches its
+    // weights now and waits for this grid before reading nv_q/nv_s. The plain form must NOT
+    // trigger early -- the Q4_K expert gate/up kernel after it is launched programmatic too and
+    // reads out_q8 without a grid-dependency wait, relying on this kernel finishing first.
+    if constexpr (NV) asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+#endif
     const size_t base = (size_t)blockIdx.x * cols;
     __shared__ float s_warp[32];
     const int t = threadIdx.x;

@@ -53,6 +53,9 @@ __global__ void split_q_gate_kernel(const __nv_bfloat16* __restrict__ qg,
 __global__ void mul_sigmoid_kernel(__nv_bfloat16* __restrict__ x,
                                    const __nv_bfloat16* __restrict__ gate,
                                    int n) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+    asm volatile("griddepcontrol.launch_dependents;" ::: "memory");   // see gemv_pdl_wait
+#endif
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
     const float y = q36_to_f(x[i]) * q36_sigmoid(q36_to_f(gate[i]));
@@ -523,6 +526,9 @@ __global__ void gated_norm_warp_kernel(const __nv_bfloat16* __restrict__ x,
                                        const __nv_bfloat16* __restrict__ weight,
                                        __nv_bfloat16* __restrict__ out,
                                        int v_heads, float eps) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+    asm volatile("griddepcontrol.launch_dependents;" ::: "memory");   // see gemv_pdl_wait
+#endif
     constexpr int NROW = HEAD_DIM / 32;
     const int h = blockIdx.x;
     const int lane = threadIdx.x & 31;
