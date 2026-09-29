@@ -29,6 +29,7 @@
 #include "sparkinfer/kernels/gemm.h"
 #include "sparkinfer/kernels/prefill_i8.h"
 #include "sparkinfer/kernels/prefill_fp8.h"
+#include "sparkinfer/kernels/prefill_gemm_skinny.h"
 #include "sparkinfer/kernels/prefill_moe.h"
 #include "sparkinfer/kernels/deterministic.h"
 #include "sparkinfer/kernels/prefill_router_mma.h"
@@ -1577,8 +1578,18 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
         const char* e = getenv("SPARKINFER_PREFILL_FFN_WCACHE");
         return !(e && e[0] == '0');
     }();
+    // The FP4-FFN checkpoints take it too, for the layers their FP4 arm does not cover: Qwen3.8's
+    // layers 56-63 keep an 8-bit FFN, materialized to int8 per chunk like any dense one. A layer
+    // that CAN take the FP4 arm never takes the cache (ffn_fp4_possible, per layer below), so the
+    // FP4 layers are untouched and GGUF without an FP4 FFN is exactly the scope it was.
+    // SPARKINFER_PREFILL_FFN_WCACHE_FP4=0 keeps the cache off on those checkpoints (A/B).
+    static const bool ffn_wcache_fp4 = [] {
+        const char* e = getenv("SPARKINFER_PREFILL_FFN_WCACHE_FP4");
+        return !(e && e[0] == '0');
+    }();
     bool ffn_wcache = false;
-    if (ffn_wcache_env && s.gguf && !use_i8_ffn && use_i8 && !moe && !c.muse_glimmer && !gu_nvfp4 &&
+    if (ffn_wcache_env && ((s.gguf && !gu_nvfp4) || (ffn_wcache_fp4 && gu_nvfp4)) &&
+        !use_i8_ffn && use_i8 && !moe && !c.muse_glimmer &&
         N > FC &&
         W_i8 && wbuf && sw && (size_t)ffn * H <= maxw && ffn <= maxNO) {
         static float* wc_sw = nullptr;
@@ -1872,21 +1883,26 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
         const char* e = getenv("SPARKINFER_Q38_FP8_PREFILL");
         return !(e && e[0] == '0');
     }();
-    auto proj_fp8_native = [&](const bf16* A, const void* W, bf16* C, int R, int n_out, int K) -> bool {
+    // Whether proj_fp8_native below takes a checkpoint FP8 weight of this shape.
+    auto fp8_native_ok = [&](const void* W, int R, int n_out, int K) {
+        return q38_fp8_prefill && W && A_i8 && sx && sw && n_out >= 128 && a_i8_fits(R, K);
+    };
+    auto proj_fp8_native = [&](const bf16* A, const void* W, bf16* C, int R, int n_out, int K,
+                               bool resid = false, bool a_ready = false) -> bool {
         // Checkpoint SI_QTYPE_FP8 is already e4m3 + per-row bf16 scale. At the scored
         // ctx=128 the int8 arm dequants that to bf16 and requants to s8 every GDN
         // projection (48 layers × qkv/z/out). Feed the packed e4m3 to the existing
         // fp8 GEMM instead. SPARKINFER_Q38_FP8_PREFILL=0 restores the requant path.
-        if (!q38_fp8_prefill || !W || !A_i8 || !sx || !sw || n_out < 128) return false;
-        if (!a_i8_fits(R, K)) return false;
+        // a_ready: the caller already wrote A's e4m3 rows and scales into A_i8/sx (A unused).
+        if (!fp8_native_ok(W, R, n_out, K)) return false;
         a_q = nullptr; a_pk = false;
-        kernels::launch_prefill_quantize_rows_fp8(A, A_i8, sx, R, K, st);
+        if (!a_ready) kernels::launch_prefill_quantize_rows_fp8(A, A_i8, sx, R, K, st);
         kernels::launch_prefill_fp8_wscales_bf16(W, sw, n_out, st);
         const void* We4 = static_cast<const char*>(W) + (size_t)n_out * 2;
         if (!(sk_p && kernels::launch_prefill_gemm_fp8_splitk(
                 A_i8, We4, sx, sw, C, R, n_out, K,
-                reinterpret_cast<float*>(sk_p), st)))
-            kernels::launch_prefill_gemm_fp8(A_i8, We4, sx, sw, C, R, n_out, K, st);
+                reinterpret_cast<float*>(sk_p), st, nullptr, false, resid)))
+            kernels::launch_prefill_gemm_fp8(A_i8, We4, sx, sw, C, R, n_out, K, st, nullptr, resid);
         return true;
     };
     auto proj = [&](const bf16* A, const void* W, int wtype, bf16* C, int n_out, int K, int rows = 0) {
@@ -1961,8 +1977,17 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
         const char* e = getenv("SPARKINFER_PREFILL_NVFP4_RESID_FUSE");
         return !(e && e[0] == '0');
     }();
+    // A checkpoint FP8 weight (Qwen3.8's GDN out_proj) folds the residual into the fp8 GEMM's
+    // own epilogue: C = bf16(x + bf16(acc * sx * sw)), launch_prefill_add's rounding, written
+    // straight into x. SPARKINFER_Q38_FP8_RESID=0 keeps the raw projection + separate add (A/B).
+    static const bool fp8_resid = [] {
+        const char* e = getenv("SPARKINFER_Q38_FP8_RESID");
+        return !(e && e[0] == '0');
+    }();
     auto proj_resid = [&](const bf16* A, const void* W, int wtype, bf16* Cx, int n_out, int K,
                           int rows = 0) -> bool {
+        if (resid_fuse && fp8_resid && wtype == kernels::SI_QTYPE_FP8)
+            return proj_fp8_native(A, W, Cx, rows > 0 ? rows : N, n_out, K, /*resid=*/true);
         if (!resid_fuse || !use_i8 || n_out < 128 || wtype == kernels::SI_QTYPE_FP8) return false;
         const int R = rows > 0 ? rows : N;
         if (!a_i8_fits(R, K)) return false;
@@ -2201,6 +2226,10 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
     // gt/grs (optional): the layer's decode-shadow view, whose in-projections are read in their
     // ternary blocks where the fused GEMM takes the pass; *z_tern then says z must be too, since
     // A_i8 holds the rotated activation.
+    // Whether A_i8/sx hold the e4m3 rows of the current xn for the next GDN layer's fp8 qkv/z
+    // (gdn_qkv_z). Set only by norm_xn (further down) and cleared by that consumer, at the top of
+    // the next layer that is not GDN, and wherever the GDN block ends -- so it never outlives xn.
+    bool xn_fp8_ready = false;
     auto gdn_qkv_z = [&](const bf16* A, const Qwen35LayerWeights& w, bool norm_deferred,
                          bool* z_pending = nullptr, const Qwen35LayerWeights* gt = nullptr,
                          const BonsaiShadowRs* grs = nullptr, bool* z_tern = nullptr) {
@@ -2227,7 +2256,10 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
         if (q38_fp8_prefill && w.wqkv_type == kernels::SI_QTYPE_FP8 &&
             w.wqkv_gate_type == kernels::SI_QTYPE_FP8 && A_i8 && sx && sw) {
             a_q = nullptr; a_pk = false;
-            kernels::launch_prefill_quantize_rows_fp8(A, A_i8, sx, N, H, st);
+            // norm_xn may already have written xn's e4m3 rows (xn_fp8_ready, see there).
+            if (!(xn_fp8_ready && A == xn))
+                kernels::launch_prefill_quantize_rows_fp8(A, A_i8, sx, N, H, st);
+            xn_fp8_ready = false;
             kernels::launch_prefill_fp8_wscales_bf16(w.wqkv, sw, lqkv, st);
             const void* Wq = static_cast<const char*>(w.wqkv) + (size_t)lqkv * 2;
             if (!(sk_p && kernels::launch_prefill_gemm_fp8_splitk(
@@ -2396,11 +2428,32 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
             !nw->linear_attn && nw->wgate && muse_nvfp4_qkv && nw->qkvg_fp4 && nw->qkvg_fp4_sf &&
             fp4_a && fp4_as && fp4_qkv;
     };
+    // The next layer is a GDN layer whose qkv/z take proj's checkpoint-FP8 arm in gdn_qkv_z (the
+    // NVFP4 arm ahead of it is not the one that runs): that arm's first step is the e4m3
+    // quantize of xn, so the norm writes it too (launch_rmsnorm_fp8, bit-identical) and the
+    // quantize re-reading xn is skipped. SPARKINFER_Q38_XN_FP8=0 keeps the two passes (A/B).
+    static const bool q38_xn_fp8 = [] {
+        const char* e = getenv("SPARKINFER_Q38_XN_FP8");
+        return !(e && e[0] == '0');
+    }();
+    auto xn_fp8_for = [&](const Qwen35LayerWeights* nw) {
+        return q38_xn_fp8 && nw && nw->linear_attn && q38_fp8_prefill &&
+            nw->wqkv_type == kernels::SI_QTYPE_FP8 &&
+            nw->wqkv_gate_type == kernels::SI_QTYPE_FP8 && A_i8 && sx && sw &&
+            !(gdn_nvfp4 && (gdn_fp4_mask & 1) && nw->gdn_qkv_fp4 && nw->gdn_qkv_fp4_sf &&
+              nw->gdn_z_fp4 && nw->gdn_z_fp4_sf && fp4_gdn_a && fp4_gdn_as && fp4_gdn_ws);
+    };
     auto norm_xn = [&](const void* nrm, const Qwen35LayerWeights* nw) {
+        xn_fp8_ready = false;
         xn_fp4_ready = xn_exact_for(nw) &&
             kernels::launch_prefill_nvfp4_rmsnorm_quant_a_exact(x, nrm, xn, fp4_a, fp4_as, N, H,
                                                                 eps, st);
-        if (!xn_fp4_ready) kernels::launch_rmsnorm(x, nrm, xn, N, H, eps, st);
+        if (!xn_fp4_ready) {
+            xn_fp8_ready = xn_fp8_for(nw) &&
+                kernels::launch_rmsnorm_fp8(x, nrm, xn, A_i8, sx, N, H, eps, st);
+            if (xn_fp8_ready) { a_q = nullptr; a_pk = false; }   // A_i8 now holds e4m3
+            else kernels::launch_rmsnorm(x, nrm, xn, N, H, eps, st);
+        }
     };
     // Set when the post-FFN sandwich norm already produced the next layer's xn and its FP4
     // operand (launch_prefill_nvfp4_norm_add_norm_quant_exact), so the end-of-layer norm is skipped.
@@ -2514,8 +2567,14 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                     proj_fused(xn, w.wqkv_gate, w.wqkv_gate_type, w.wqkv_gate_rs, lz, lvdim, H);
             } else {
                 gdn_qkv_z(xn, w, attn_norm_deferred, nullptr, tl, trs);   // qkv + z gate (fp8: fused)
-                proj(xn, w.ssm_alpha, w.ssm_alpha_type, la, vh,    H);
-                proj(xn, w.ssm_beta,  w.ssm_beta_type,  lb, vh,    H);
+                // bf16 alpha/beta both reach launch_prefill_gemm_skinny through proj(); past its
+                // split-K rows they share one pass over xn (bit-identical to the two launches).
+                if (!(w.ssm_alpha_type == 0 && w.ssm_beta_type == 0 &&
+                      kernels::launch_prefill_gemm_skinny_pair(xn, w.ssm_alpha, w.ssm_beta, la, lb,
+                                                               N, vh, H, st))) {
+                    proj(xn, w.ssm_alpha, w.ssm_alpha_type, la, vh,    H);
+                    proj(xn, w.ssm_beta,  w.ssm_beta_type,  lb, vh,    H);
+                }
             }
             if (multi) {
                 // Each prompt's conv window and recurrence are its own: run both on its slice of the
@@ -2624,15 +2683,40 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                     c.gdn_qh_block, st, /*carry_in=*/pos0 != 0);
             }
             if (z_pending) pf_cu(cudaStreamWaitEvent(st, gdn_ev[3], 0), "gdn z join");
-            kernels::launch_prefill_gated_norm(att, lz, w.ssm_norm, lnrm, N, vh, c.linear_head_dim, eps, st);
+            // Qwen3.8's out_proj is a checkpoint FP8 weight, and proj_fp8_native reads the gated
+            // norm only as its per-row e4m3 rows. When the arms below are certain to reach that
+            // GEMM, the norm quantizes itself into A_i8/sx and the bf16 lnrm is never written:
+            // 2 B written and 2 B read back per value gone, bit-identical.
+            // SPARKINFER_Q38_GATED_NORM_FP8=0 keeps the separate passes (A/B).
+            static const bool q38_gnorm_fp8 = [] {
+                const char* e = getenv("SPARKINFER_Q38_GATED_NORM_FP8");
+                return !(e && e[0] == '0');
+            }();
+            bool out_fp8_done = false;
+            if (q38_gnorm_fp8 && w.ssm_out_type == kernels::SI_QTYPE_FP8 &&
+                !(gdn_nvfp4 && (gdn_fp4_mask & 2) && w.gdn_out_fp4 && w.gdn_out_fp4_sf &&
+                  fp4_gdn_a && fp4_gdn_as && fp4_gdn_ws) &&
+                !(tl && (tproj_mask & 4) && lvdim == qdim && tl->ssm_out_type == kPtq1GgmlType) &&
+                !(w.ssm_out_rs && qb_fires) && fp8_native_ok(w.ssm_out, N, H, lvdim) &&
+                kernels::launch_prefill_gated_norm_fp8(att, lz, w.ssm_norm, A_i8, sx, N, vh,
+                                                       c.linear_head_dim, eps, st)) {
+                // The same GEMM proj_resid / proj would run, on the rows just written.
+                const bool rf = resid_fuse && fp8_resid;
+                proj_fp8_native(nullptr, w.ssm_out, rf ? x : ao, N, H, lvdim, rf, /*a_ready=*/true);
+                attn_fused = rf;
+                out_fp8_done = true;
+            } else {
+                kernels::launch_prefill_gated_norm(att, lz, w.ssm_norm, lnrm, N, vh,
+                                                   c.linear_head_dim, eps, st);
+            }
             // out_proj off the same NVFP4 bytes, with the residual folded into the block-scaled
             // GEMM's own epilogue (D = A*B + C, C aliasing D aliasing x) instead of written raw
             // to `ao` for a separate full-tensor add. That add is three N*H bf16 streams (read x,
             // read ao, write x) for one flop per element; the epilogue already holds the
             // accumulator in registers, so folding it in costs one read and removes the pass.
             // The fused form claims the residual itself -- attn_fused suppresses the add below.
-            bool out_fp4 = false;
-            if (gdn_nvfp4 && (gdn_fp4_mask & 2) && w.gdn_out_fp4 && w.gdn_out_fp4_sf &&
+            bool out_fp4 = out_fp8_done;
+            if (!out_fp4 && gdn_nvfp4 && (gdn_fp4_mask & 2) && w.gdn_out_fp4 && w.gdn_out_fp4_sf &&
                 fp4_gdn_a && fp4_gdn_as && fp4_gdn_ws &&
                 kernels::launch_prefill_nvfp4_quant_a(lnrm, fp4_gdn_a, fp4_gdn_as, N, lvdim, st)) {
                 if (nvfp4_resid_fuse &&
@@ -2672,7 +2756,9 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                 }
             }
             use_i8 = restore_i8_gdn;
+            xn_fp8_ready = false;
         } else {
+            xn_fp8_ready = false;
             // ---- full softmax-attention layer (q_has_gate, partial RoPE, int8 KV) ----
             // Set when q|gate|k|v came out of ONE GEMM and q/k/v were left in that packed buffer
             // instead of being copied to tight arrays (see the Muse arm below).
@@ -2680,6 +2766,20 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
             // Long-ctx: optionally keep Q/K/V/O on int8 (no GDN recurrence here).
             const bool restore_i8 = use_i8;
             if (use_i8_attn) use_i8 = true;
+            // Off Muse, whether the o projection is certain to take proj_resid's int8 GEMM, whose
+            // first step is the row-quantize of the gated `att` -- then the gate folds into that
+            // quantize (see below). SPARKINFER_Q38_GATE_QUANT=0 keeps the separate gate pass (A/B).
+            static const bool q38_gate_q = [] {
+                const char* e = getenv("SPARKINFER_Q38_GATE_QUANT");
+                return !(e && e[0] == '0');
+            }();
+            const bool q38_gq = q38_gate_q && !c.muse_glimmer &&
+                !(attn_nvfp4 && (attn_fp4_mask & 2) && w.wo_fp4 && w.wo_fp4_sf && fp4_attn_a &&
+                  fp4_attn_as && fp4_attn_ws) &&
+                !(tl && (tproj_mask & 2) && tl->wo_type == kPtq1GgmlType) &&
+                !(w.wo_rs && (qb_fires || !qb_dense_pass)) &&
+                resid_fuse && use_i8 && H >= 128 && w.wo_type != kernels::SI_QTYPE_FP8 &&
+                a_i8_fits(N, qdim);
             if (c.muse_glimmer && w.wgate) {
                 // Muse Glimmer keeps attn_gate as its OWN quantized tensor (w.wgate, [qdim,H]) -- Q
                 // goes straight to qb and the gate straight to qg, with no [q|gate] interleave to build
@@ -3032,6 +3132,20 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                 a_pk = A_i8p != nullptr;
                 gate_fused = true;
             }
+            // Qwen3.8 takes the last o arm below: proj_resid's int8 GEMM, whose first step is the
+            // row-quantize of the gated `att`. Fold the gate into that quantize here, as Muse's arm
+            // above does, when every earlier arm is certain to decline and that int8 path is
+            // certain to run (q38_gq) -- proj_resid's quant_a_i8 then finds these bytes in the
+            // memo. Bit-identical to mul_sigmoid + quant_rows_fast.
+            if (!gate_fused && !wo_fp4_done && q38_gq) {
+                signed char* qp = apk_dst(N, qdim);    // what quant_a_i8 would hand it
+                if (kernels::launch_prefill_gate_quant_rows_i8(att, gate_src, A_i8, sx, N, qdim, st,
+                                                               qp, gate_ld)) {
+                    a_q = att; a_qR = N; a_qK = qdim;  // proj_resid's quant_a_i8 is now a no-op
+                    a_pk = qp != nullptr;
+                    gate_fused = true;
+                }
+            }
             // If the fused quantize ran but the GEMM declined, `att` is still raw -- gate it here.
             if (!gate_fused && !wo_fp4_done) {
                 kernels::launch_prefill_mul_sigmoid(att, gate_src, N, qdim, st, gate_ld);
@@ -3218,8 +3332,12 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                 return ((t == 12 || t == 13 || t == 14) && (cols & 255) == 0) ||
                        (t_gu && t == kPtq1GgmlType && cols == H);
             };
+            // Whether this layer's gate/up CAN take the FP4 arm below (see ffn_fused there).
+            const bool ffn_fp4_possible = gu_nvfp4 && w.gate_fp4 && w.gate_fp4_sf &&
+                                          w.up_fp4 && w.up_fp4_sf && fp4_a && fp4_as;
             const bool ffn_i8 = (use_i8_ffn ||
-                                 (ffn_wcache && rows_i8_direct(gate_pf_type, H) &&
+                                 (ffn_wcache && !ffn_fp4_possible &&
+                                  rows_i8_direct(gate_pf_type, H) &&
                                   rows_i8_direct(up_pf_type, H) &&
                                   rows_i8_direct(down_pf_type, ffn))) &&
                                 ffn_i8_stage && ffn_Wg_i8 != nullptr;
@@ -3383,8 +3501,6 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
             // otherwise mix fused and unfused within one layer and a single post-loop add could not
             // be right for both. With this false the non-FP4 chunks write `ao` too, so one add at
             // the end covers every chunk.
-            const bool ffn_fp4_possible = gu_nvfp4 && w.gate_fp4 && w.gate_fp4_sf &&
-                                          w.up_fp4 && w.up_fp4_sf && fp4_a && fp4_as;
             const bool ffn_fused = !c.muse_glimmer && !ffn_fp4_possible &&
                                    resid_fuse && (ffn_i8 || use_i8) && !ffn_qi8;
             // Set when the fused-B down GEMM (one chunk, the whole prompt) added its output into x

@@ -9,6 +9,12 @@ namespace sparkinfer { namespace kernels {
 void launch_rmsnorm(const void* x_bf16, const void* weight_bf16, void* out_bf16,
                     int rows, int cols, float eps, cudaStream_t stream = nullptr);
 
+// launch_rmsnorm that ALSO writes the per-row e4m3 form launch_prefill_quantize_rows_fp8 would
+// make of out (q [rows, cols] e4m3, scale [rows]) -- for a norm whose next reader is an fp8 GEMM.
+// Bit-identical to the two launches. False (nothing written) when cols % 8 != 0 or cols > 8192.
+bool launch_rmsnorm_fp8(const void* x_bf16, const void* weight_bf16, void* out_bf16, void* q,
+                        float* scale, int rows, int cols, float eps, cudaStream_t stream = nullptr);
+
 void launch_add_rmsnorm(const void* x_bf16, const void* residual_bf16,
                         const void* weight_bf16, void* out_bf16,
                         int rows, int cols, float eps, cudaStream_t stream = nullptr);

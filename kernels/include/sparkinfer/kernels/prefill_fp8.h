@@ -36,7 +36,10 @@ void launch_prefill_fp8_wscales_bf16(const void* scale_bf16, float* sw, int n,
 void launch_prefill_gemm_fp8(const void* A, const void* W,
                              const float* sx, const float* sw, void* C,
                              int M, int N, int K, cudaStream_t stream = nullptr,
-                             const void* sw_bf16 = nullptr);
+                             const void* sw_bf16 = nullptr,
+                             // C holds the residual: C = bf16(C + bf16(A@W^T)), launch_prefill_add's
+                             // rounding, so the projection needs no scratch output and no add pass.
+                             bool resid = false);
 
 // Split-K variant for the scored M=128 GDN projections (40-64 tiles on a 170-SM 5090).
 // `partials` is M*N fp32. Returns false when the shape already fills the device (caller
@@ -47,7 +50,8 @@ bool launch_prefill_gemm_fp8_splitk(const void* A, const void* W,
                                     const float* sx, const float* sw, void* C,
                                     int M, int N, int K, float* partials,
                                     cudaStream_t stream = nullptr,
-                                    const void* sw_bf16 = nullptr, bool keep_zero = false);
+                                    const void* sw_bf16 = nullptr, bool keep_zero = false,
+                                    bool resid = false);
 
 // Fused SwiGLU + per-row int8 quantize: q[r,:] = int8(silu(gate[r,:]) * up[r,:]) with
 // scale[r] = amax_c|.| / 127. Replaces launch_prefill_swiglu + launch_prefill_quantize_rows_i8 on

@@ -151,6 +151,14 @@ bool launch_prefill_gated_norm_nvfp4(const void* x, const void* z, const void* w
                                      int n_tokens, int v_heads, int head_dim, float eps,
                                      cudaStream_t stream = nullptr);
 
+// Same norm, but its output goes only to an fp8 GEMM: writes the per-row e4m3 quantization that
+// launch_prefill_quantize_rows_fp8 would make of `out` (q [N, v_heads*hd], scale [N]) and never
+// writes `out` itself. Bit-identical to the two launches. False (nothing written) for a shape it
+// cannot cover (head_dim != 128 or more than 64 v-heads).
+bool launch_prefill_gated_norm_fp8(const void* x, const void* z, const void* weight, void* q,
+                                   float* scale, int n_tokens, int v_heads, int head_dim,
+                                   float eps, cudaStream_t stream = nullptr);
+
 // Full-attention prefill: batched QK-norm + partial-RoPE (q,k in place, bf16) + int8 KV write
 // into the single-sequence paged pool at positions 0..N-1. Matches the decode int8 layout
 // (per-(token,kv_head) max-abs fp16 scale). block_table maps logical block -> physical block.

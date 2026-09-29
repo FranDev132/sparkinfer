@@ -12,6 +12,7 @@
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
+#include <cuda_fp8.h>
 #include <cuda_runtime.h>
 #include <cuda_pipeline.h>
 #include <mma.h>
@@ -1152,6 +1153,77 @@ __global__ void pf_gated_norm_kernel(const __nv_bfloat16* __restrict__ x,
     }
 }
 
+// pf_gated_norm_kernel whose only consumer is the fp8 GEMM of the GDN out-projection, which reads
+// the norm solely as launch_prefill_quantize_rows_fp8's per-row e4m3 form. One block per token:
+// each warp normalizes v-heads warp, warp + nw, ... exactly as pf_gated_norm_kernel does one (same
+// lane-strided reads, same pf_wsum order, same expression and bf16 rounding), keeps the rounded
+// values in registers, and the block quantizes the row the way pf_quantize_rows_fp8_fast_kernel
+// does: amax over the bf16 values (max is exact in any order), d = amax / 2 with the amax == 0
+// rule, e4m3(v / d). Same TU flags as both (si_fused, fast-math), so every byte and scale match,
+// and the bf16 row is never written or read back.
+constexpr float kPfFp8Tgt = 2.0f;   // FP8_TGT in prefill_gemm_fp8.cu
+template <int HEAD_DIM, int HPW>
+__global__ __launch_bounds__(512) void pf_gated_norm_fp8_kernel(
+        const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* __restrict__ z,
+        const __nv_bfloat16* __restrict__ weight, __nv_fp8_e4m3* __restrict__ q,
+        float* __restrict__ scale, int n_tokens, int v_heads, float eps) {
+    constexpr int NROW = HEAD_DIM / 32;
+    const int t    = blockIdx.x;
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int nw   = blockDim.x >> 5;
+    if (t >= n_tokens) return;
+    const size_t row = (size_t)t * v_heads * HEAD_DIM;
+    __nv_bfloat16 ob[HPW][NROW];
+    float amax = 0.f;
+    #pragma unroll
+    for (int i = 0; i < HPW; i++) {
+        const int h = warp + i * nw;
+        if (h < v_heads) {
+            const size_t base = row + (size_t)h * HEAD_DIM;
+            float xv[NROW], zv[NROW], wv[NROW], ss = 0.f;
+            #pragma unroll
+            for (int r = 0; r < NROW; r++) {
+                const int d = lane + r * 32;
+                xv[r] = pf_to_f(x[base + d]);
+                zv[r] = pf_to_f(z[base + d]);
+                wv[r] = pf_to_f(weight[d]);
+                ss += xv[r] * xv[r];
+            }
+            const float inv = rsqrtf(pf_wsum(ss) / HEAD_DIM + eps);
+            #pragma unroll
+            for (int r = 0; r < NROW; r++) {
+                ob[i][r] = __float2bfloat16(xv[r] * inv * wv[r] * pf_silu(zv[r]));
+                amax = fmaxf(amax, fabsf(__bfloat162float(ob[i][r])));
+            }
+        }
+    }
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
+    __shared__ float sred[16];
+    if (lane == 0) sred[warp] = amax;
+    __syncthreads();
+    if (warp == 0) {
+        float v = lane < nw ? sred[lane] : 0.f;
+        #pragma unroll
+        for (int o = 16; o > 0; o >>= 1) v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, o));
+        if (lane == 0) sred[0] = v;
+    }
+    __syncthreads();
+    const float d = (sred[0] == 0.f) ? 1.f : (sred[0] / kPfFp8Tgt);
+    if (threadIdx.x == 0) scale[t] = d;
+    #pragma unroll
+    for (int i = 0; i < HPW; i++) {
+        const int h = warp + i * nw;
+        if (h < v_heads) {
+            const size_t base = row + (size_t)h * HEAD_DIM;
+            #pragma unroll
+            for (int r = 0; r < NROW; r++)
+                q[base + lane + r * 32] = __nv_fp8_e4m3(__bfloat162float(ob[i][r]) / d);
+        }
+    }
+}
+
 // Interleaved-MRoPE axis for rotary frequency index i.
 //
 // Qwen3.5 lays the three position axes out as [T H W T H W ...] across the frequency vector
@@ -2268,6 +2340,30 @@ bool launch_prefill_gated_norm_nvfp4(const void* x, const void* z, const void* w
         reinterpret_cast<const __nv_bfloat16*>(weight), reinterpret_cast<__nv_bfloat16*>(out),
         reinterpret_cast<signed char*>(nv_q), reinterpret_cast<float*>(nv_s),
         n_tokens, v_heads, eps);
+    return true;
+}
+
+bool launch_prefill_gated_norm_fp8(const void* x, const void* z, const void* weight, void* q,
+                                   float* scale, int n_tokens, int v_heads, int head_dim,
+                                   float eps, cudaStream_t stream) {
+    static const bool on = [] {
+        const char* e = getenv("SPARKINFER_PREFILL_GATED_NORM_FP8");
+        return !(e && e[0] == '0');
+    }();
+    if (!on || !q || !scale || head_dim != 128 || n_tokens <= 0 || v_heads <= 0 || v_heads > 64)
+        return false;
+    const int nw = v_heads < 16 ? v_heads : 16;
+    const int hpw = (v_heads + nw - 1) / nw;
+    auto xb = reinterpret_cast<const __nv_bfloat16*>(x);
+    auto zb = reinterpret_cast<const __nv_bfloat16*>(z);
+    auto wb = reinterpret_cast<const __nv_bfloat16*>(weight);
+    auto qb = reinterpret_cast<__nv_fp8_e4m3*>(q);
+    switch (hpw) {
+        case 1: pf_gated_norm_fp8_kernel<128, 1><<<n_tokens, nw * 32, 0, stream>>>(xb, zb, wb, qb, scale, n_tokens, v_heads, eps); break;
+        case 2: pf_gated_norm_fp8_kernel<128, 2><<<n_tokens, nw * 32, 0, stream>>>(xb, zb, wb, qb, scale, n_tokens, v_heads, eps); break;
+        case 3: pf_gated_norm_fp8_kernel<128, 3><<<n_tokens, nw * 32, 0, stream>>>(xb, zb, wb, qb, scale, n_tokens, v_heads, eps); break;
+        default: pf_gated_norm_fp8_kernel<128, 4><<<n_tokens, nw * 32, 0, stream>>>(xb, zb, wb, qb, scale, n_tokens, v_heads, eps); break;
+    }
     return true;
 }
 

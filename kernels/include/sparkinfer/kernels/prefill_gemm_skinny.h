@@ -36,5 +36,12 @@ namespace kernels {
 bool launch_prefill_gemm_skinny(const void* A, const void* W, void* C,
                                 int M, int N, int K, cudaStream_t stream = nullptr);
 
+// C0 = A @ W0^T and C1 = A @ W1^T (both [M, N], N <= 48) in one pass over A, each bit-identical
+// to launch_prefill_gemm_skinny on its own. False -- nothing launched -- wherever that launcher
+// would split K (short prompts) or not run; the caller then makes its two launches.
+//   SPARKINFER_PREFILL_SKINNY_PAIR  (default 1)  0 keeps two launches (A/B).
+bool launch_prefill_gemm_skinny_pair(const void* A, const void* W0, const void* W1, void* C0,
+                                     void* C1, int M, int N, int K, cudaStream_t stream = nullptr);
+
 }  // namespace kernels
 }  // namespace sparkinfer

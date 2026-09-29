@@ -6,6 +6,7 @@
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
+#include <cuda_fp8.h>
 #ifndef SPARKINFER_NVRTC_DEVICE_ONLY
 #include <cuda_runtime.h>
 #endif
@@ -109,6 +110,97 @@ template __global__ void rmsnorm_kernel<0>(const __nv_bfloat16*, const __nv_bflo
 #ifndef _MSC_VER
 template __global__ void rmsnorm_kernel<1>(const __nv_bfloat16*, const __nv_bfloat16*, const __nv_bfloat16*, __nv_bfloat16*, int, int, float);
 #endif
+// rmsnorm_kernel<0> for a norm whose next reader is an fp8 GEMM (Qwen3.8's GDN qkv/z): writes the
+// bf16 row exactly as that kernel does -- same pack walk, same __fmaf_rn chain, same two-level
+// reduction, same (x * inv_rms) * w -- with the row's packs held in registers instead of loaded a
+// second time, and then the per-row e4m3 form pf_quantize_rows_fp8_fast_kernel would make of it:
+// amax over the bf16 values (max is exact in any order), d = amax / 2 with the amax == 0 rule,
+// e4m3(v / d). This TU and that one are both si_fused (--use_fast_math), so the division lowers
+// the same way and every byte and scale match. blockDim must be 256.
+constexpr float kRnFp8Tgt = 2.0f;   // FP8_TGT in prefill_gemm_fp8.cu
+template <int MAXP>
+__global__ __launch_bounds__(256) void rmsnorm_fp8_kernel(const __nv_bfloat16* __restrict__ x,
+                                                          const __nv_bfloat16* __restrict__ weight,
+                                                          __nv_bfloat16* __restrict__ out,
+                                                          __nv_fp8_e4m3* __restrict__ q,
+                                                          float* __restrict__ scale,
+                                                          int rows, int cols, float eps) {
+    const int row = blockIdx.x;
+    if (row >= rows) return;
+    const size_t base = (size_t)row * cols;
+    __shared__ float s_warp[32];
+    __shared__ float s_max[8];
+
+    const int npack = cols >> 3;
+    const uint4* x4 = reinterpret_cast<const uint4*>(x + base);
+    uint4 xp[MAXP];
+    float ss = 0.f;
+    #pragma unroll
+    for (int i = 0; i < MAXP; i++) {
+        const int p = threadIdx.x + i * 256;
+        if (p < npack) {
+            xp[i] = __ldg(x4 + p);
+            float xv[8]; rn_unpack8(xp[i], xv);
+            #pragma unroll
+            for (int j = 0; j < 8; j++) ss = __fmaf_rn(xv[j], xv[j], ss);
+        }
+    }
+    ss = rn_warp_sum(ss);
+    if ((threadIdx.x & 31) == 0) s_warp[threadIdx.x >> 5] = ss;
+    __syncthreads();
+    if (threadIdx.x < 32) {
+        float v = (threadIdx.x < (blockDim.x + 31) / 32) ? s_warp[threadIdx.x] : 0.f;
+        v = rn_warp_sum(v);
+        if (threadIdx.x == 0) s_warp[0] = rsqrtf(v / cols + eps);
+    }
+    __syncthreads();
+    const float inv_rms = s_warp[0];
+
+    const uint4* w4 = reinterpret_cast<const uint4*>(weight);
+    uint4* o4 = reinterpret_cast<uint4*>(out + base);
+    float amax = 0.f;
+    #pragma unroll
+    for (int i = 0; i < MAXP; i++) {
+        const int p = threadIdx.x + i * 256;
+        if (p < npack) {
+            float xv[8]; rn_unpack8(xp[i], xv);
+            float wv[8]; rn_unpack8(__ldg(w4 + p), wv);
+            float ov[8];
+            #pragma unroll
+            for (int j = 0; j < 8; j++) ov[j] = xv[j] * inv_rms * wv[j];
+            xp[i] = rn_pack8(ov);                    // the bf16 row, kept for the quantize
+            o4[p] = xp[i];
+            const __nv_bfloat16* hb = reinterpret_cast<const __nv_bfloat16*>(&xp[i]);
+            #pragma unroll
+            for (int j = 0; j < 8; j++) amax = fmaxf(amax, fabsf(__bfloat162float(hb[j])));
+        }
+    }
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
+    if ((threadIdx.x & 31) == 0) s_max[threadIdx.x >> 5] = amax;
+    __syncthreads();
+    if (threadIdx.x < 32) {
+        float v = (threadIdx.x < 8) ? s_max[threadIdx.x] : 0.f;
+        #pragma unroll
+        for (int o = 16; o > 0; o >>= 1) v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, o));
+        if (threadIdx.x == 0) s_max[0] = v;
+    }
+    __syncthreads();
+    const float d = (s_max[0] == 0.f) ? 1.f : (s_max[0] / kRnFp8Tgt);
+    if (threadIdx.x == 0) scale[row] = d;
+    #pragma unroll
+    for (int i = 0; i < MAXP; i++) {
+        const int p = threadIdx.x + i * 256;
+        if (p < npack) {
+            const __nv_bfloat16* hb = reinterpret_cast<const __nv_bfloat16*>(&xp[i]);
+            __nv_fp8_e4m3 o8[8];
+            #pragma unroll
+            for (int j = 0; j < 8; j++) o8[j] = __nv_fp8_e4m3(__bfloat162float(hb[j]) / d);
+            *reinterpret_cast<uint2*>(&q[base + (size_t)p * 8]) = *reinterpret_cast<const uint2*>(o8);
+        }
+    }
+}
+
 // Fused residual + RMSNorm that ALSO emits the residual sum:
 //   sum = x + residual;  norm = (sum / rms(sum)) * weight
 // One kernel replaces a residual_add + a rmsnorm (and keeps `sum` for the next
@@ -1119,6 +1211,25 @@ void launch_rmsnorm(const void* x, const void* weight, void* out,
         reinterpret_cast<const __nv_bfloat16*>(x), nullptr,
         reinterpret_cast<const __nv_bfloat16*>(weight),
         reinterpret_cast<__nv_bfloat16*>(out), rows, cols, eps);
+}
+
+bool launch_rmsnorm_fp8(const void* x, const void* weight, void* out, void* q, float* scale,
+                        int rows, int cols, float eps, cudaStream_t stream) {
+    static const bool on = [] {
+        const char* e = getenv("SPARKINFER_RMSNORM_FP8");
+        return !(e && e[0] == '0');
+    }();
+    if (!on || !q || !scale || rows <= 0 || cols <= 0 || (cols % 8) != 0) return false;
+    const int npack = cols / 8;
+    auto xb = reinterpret_cast<const __nv_bfloat16*>(x);
+    auto wb = reinterpret_cast<const __nv_bfloat16*>(weight);
+    auto ob = reinterpret_cast<__nv_bfloat16*>(out);
+    auto qb = reinterpret_cast<__nv_fp8_e4m3*>(q);
+    if (npack <= 256 * 2)      rmsnorm_fp8_kernel<2><<<rows, 256, 0, stream>>>(xb, wb, ob, qb, scale, rows, cols, eps);
+    else if (npack <= 256 * 3) rmsnorm_fp8_kernel<3><<<rows, 256, 0, stream>>>(xb, wb, ob, qb, scale, rows, cols, eps);
+    else if (npack <= 256 * 4) rmsnorm_fp8_kernel<4><<<rows, 256, 0, stream>>>(xb, wb, ob, qb, scale, rows, cols, eps);
+    else return false;
+    return true;
 }
 
 void launch_add_rmsnorm(const void* x, const void* residual, const void* weight, void* out,

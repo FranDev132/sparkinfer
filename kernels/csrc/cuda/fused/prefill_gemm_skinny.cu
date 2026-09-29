@@ -130,6 +130,87 @@ __global__ __launch_bounds__(WARPS * 32) void pf_gemm_skinny_kernel(
     }
 }
 
+// Two skinny GEMMs over the SAME A in one pass: C0 = A @ W0^T and C1 = A @ W1^T, each [M, n_out].
+// The GDN gate projections (ssm_alpha, ssm_beta) both read xn; run separately, each launch streams
+// all of it through shared memory, and at long context that staging is what the pair costs. Here
+// the W tile holds W0's NE rows then W1's, and warp column tiles 0..NE/16-1 belong to C0, the rest
+// to C1 -- NE is a multiple of 16, so no 16x16 tile straddles the two. Every output element gets
+// the same A and W fragments in the same K order through the same wmma chain as
+// pf_gemm_skinny_kernel<BT, NE, ...> gives it, so both outputs are bit-identical.
+template <int BT, int NE, int KT, int WARPS>
+__global__ __launch_bounds__(WARPS * 32) void pf_gemm_skinny_pair_kernel(
+        const __nv_bfloat16* __restrict__ A, const __nv_bfloat16* __restrict__ W0,
+        const __nv_bfloat16* __restrict__ W1, __nv_bfloat16* __restrict__ C0,
+        __nv_bfloat16* __restrict__ C1, int M, int n_out, int K) {
+    using namespace nvcuda;
+    constexpr int NMAX = 2 * NE;
+    static_assert(NE % 16 == 0, "a 16-column tile must not straddle the two outputs");
+    __shared__ __align__(16) __nv_bfloat16 sA[2][BT][KT + SK_PAD];
+    __shared__ __align__(16) __nv_bfloat16 sW[2][NMAX][KT + SK_PAD];
+    __shared__ float sC[16][16];
+
+    const int tid  = threadIdx.x;
+    const int warp = tid >> 5;
+    const int lane = tid & 31;
+    const int m0   = blockIdx.x * BT;
+    const int wm   = warp / (NMAX / 16);
+    const int wn   = warp % (NMAX / 16);
+
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> cf;
+    wmma::fill_fragment(cf, 0.f);
+
+    auto stage = [&](int buf, int k0) {
+        for (int e = tid; e < (BT * KT) / 8; e += WARPS * 32) {
+            const int i = e / (KT / 8), kv = (e % (KT / 8)) * 8;
+            const int gm = m0 + i, gk = k0 + kv;
+            sk_cp16(&sA[buf][i][kv], &A[(size_t)gm * K + gk], gm < M && gk + 7 < K);
+        }
+        for (int e = tid; e < (NMAX * KT) / 8; e += WARPS * 32) {
+            const int j = e / (KT / 8), kv = (e % (KT / 8)) * 8;
+            const int gk = k0 + kv;
+            const int jr = j < NE ? j : j - NE;
+            const __nv_bfloat16* Wm = j < NE ? W0 : W1;
+            sk_cp16(&sW[buf][j][kv], &Wm[(size_t)jr * K + gk], jr < n_out && gk + 7 < K);
+        }
+        __pipeline_commit();
+    };
+
+    const int nk = K / KT;
+    stage(0, 0);
+    int buf = 0;
+    for (int t = 0; t < nk; t++) {
+        if (t + 1 < nk) stage(buf ^ 1, (t + 1) * KT);
+        __pipeline_wait_prior(t + 1 < nk ? 1 : 0);
+        __syncthreads();
+
+        #pragma unroll
+        for (int kk = 0; kk < KT; kk += 16) {
+            wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> af;
+            wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::col_major> bf;
+            wmma::load_matrix_sync(af, &sA[buf][wm * 16][kk], KT + SK_PAD);
+            wmma::load_matrix_sync(bf, &sW[buf][wn * 16][kk], KT + SK_PAD);
+            wmma::mma_sync(cf, af, bf, cf);
+        }
+        __syncthreads();
+        buf ^= 1;
+    }
+
+    for (int w = 0; w < WARPS; w++) {
+        __syncthreads();
+        if (warp != w) continue;
+        wmma::store_matrix_sync(&sC[0][0], cf, 16, wmma::mem_row_major);
+        __syncwarp();
+        const bool second = wn * 16 >= NE;
+        __nv_bfloat16* Cm = second ? C1 : C0;
+        const int c0 = wn * 16 - (second ? NE : 0);
+        for (int e = lane; e < 256; e += 32) {
+            const int r = e >> 4, c = e & 15;
+            const int gm = m0 + wm * 16 + r, gn = c0 + c;
+            if (gm < M && gn < n_out) Cm[(size_t)gm * n_out + gn] = __float2bfloat16(sC[r][c]);
+        }
+    }
+}
+
 // Same cp.async staging, K partitioned across blockIdx.y so M=128 (4 row-tiles)
 // fills the 170-SM 5090. Partials atomicAdd into fp32 P[M,N].
 template <int BT, int NMAX, int KT, int WARPS>
@@ -303,6 +384,45 @@ bool launch_prefill_gemm_skinny(const void* A, const void* W, void* C,
     if (bt_env <= 16) SI_SKINNY_LAUNCH(16, 64);
     if (bt_env >= 64) SI_SKINNY_LAUNCH(64, 64);
     SI_SKINNY_LAUNCH(32, 64);
+}
+
+bool launch_prefill_gemm_skinny_pair(const void* A, const void* W0, const void* W1, void* C0,
+                                     void* C1, int M, int N, int K, cudaStream_t stream) {
+    constexpr int KT = 64, BT = 32;
+    static const int enabled = [] {
+        const char* e = getenv("SPARKINFER_PREFILL_GEMM_SKINNY");
+        const char* p = getenv("SPARKINFER_PREFILL_SKINNY_PAIR");
+        return ((e && e[0] == '0') || (p && p[0] == '0')) ? 0 : 1;
+    }();
+    // Same split-K rule as launch_prefill_gemm_skinny: where it would split, decline and let the
+    // caller make its two launches, so short prompts keep exactly the path they had.
+    static const bool sk_on = [] {
+        const char* e = getenv("SPARKINFER_PREFILL_SKINNY_SPLITK");
+        if (e) return e[0] != '0';
+        return !deterministic_mode();
+    }();
+    static const int bt_env = [] {
+        const char* e = getenv("SPARKINFER_PREFILL_SKINNY_BT");
+        return e ? atoi(e) : 32;
+    }();
+    if (!enabled || bt_env != BT || N <= 0 || N > 48 || M <= 0 || K <= 0 || (K % KT) != 0)
+        return false;
+    const int mtiles = (M + BT - 1) / BT;
+    const int nk = K / KT;
+    if (sk_on && mtiles < 170 && nk >= 4) return false;
+    auto a  = reinterpret_cast<const __nv_bfloat16*>(A);
+    auto w0 = reinterpret_cast<const __nv_bfloat16*>(W0);
+    auto w1 = reinterpret_cast<const __nv_bfloat16*>(W1);
+    auto c0 = reinterpret_cast<__nv_bfloat16*>(C0);
+    auto c1 = reinterpret_cast<__nv_bfloat16*>(C1);
+    if (N <= 32) {
+        constexpr int W_ = (BT / 16) * (64 / 16);
+        pf_gemm_skinny_pair_kernel<BT, 32, KT, W_><<<mtiles, W_ * 32, 0, stream>>>(a, w0, w1, c0, c1, M, N, K);
+    } else {
+        constexpr int W_ = (BT / 16) * (96 / 16);
+        pf_gemm_skinny_pair_kernel<BT, 48, KT, W_><<<mtiles, W_ * 32, 0, stream>>>(a, w0, w1, c0, c1, M, N, K);
+    }
+    return true;
 }
 
 #undef SI_SKINNY_LAUNCH
