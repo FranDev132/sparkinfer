@@ -3332,10 +3332,48 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                 return ((t == 12 || t == 13 || t == 14) && (cols & 255) == 0) ||
                        (t_gu && t == kPtq1GgmlType && cols == H);
             };
+            // The NVFP4 operands this layer's FFN reads: the checkpoint's own, or (below) Q4_K legs
+            // converted for this pass.
+            const void* f4_g = w.gate_fp4;  const void* f4_gs = w.gate_fp4_sf;
+            const void* f4_u = w.up_fp4;    const void* f4_us = w.up_fp4_sf;
+            const void* f4_d = w.down_fp4;  const void* f4_ds = w.down_fp4_sf;
+            float f4_ga = w.gate_fp4_alpha, f4_ua = w.up_fp4_alpha, f4_da = w.down_fp4_alpha;
+            bool f4_conv = false;
+            // Qwen3.8's compressed-tensors checkpoint stores eight MLP layers (56-63) in FP8. The
+            // loader requantizes them to Q4_K for decode, so the long prompt ran them on the int8
+            // GEMM (~0.55 POPS) while the other 56 take the NVFP4 GEMM (~1.35). Convert the three
+            // Q4_K legs to NVFP4 once per layer pass into the int8 weight cache's buffers (W_i8 and
+            // wbuf: 0.5625 B/weight against 1, so no VRAM) and run the layer through the FP4 arm
+            // below. The weights move grid, Q4_K to e2m1 per 16 with a ue4m3 scale, the conversion
+            // Muse Glimmer's Q4_K gate/up already take for prefill. Only past the fused GEMM's M
+            // limit, where the int8 path materializes; shorter prompts keep it.
+            // SPARKINFER_Q38_FFN8_NVFP4=0 keeps the int8 FFN.
+            static const bool q38_ffn8_env = [] {
+                const char* e = getenv("SPARKINFER_Q38_FFN8_NVFP4");
+                return !(e && e[0] == '0');
+            }();
+            if (q38_ffn8_env && q38_nvfp4 && nvfp4_down && !f4_g && !moe && !c.muse_glimmer &&
+                fp4_a && fp4_as && fp4_down_a && fp4_down_as && W_i8 && wbuf &&
+                N > kernels::pf_dense_gemm_qi8_max_m() && gate_pf && up_pf && down_pf &&
+                gate_pf_type == 12 && up_pf_type == 12 && down_pf_type == 12 &&
+                (H % 256) == 0 && (ffn % 256) == 0 && (size_t)ffn * H <= maxw) {
+                void *gd, *gr, *gl, *ud, *ur, *ul, *dd, *dr, *dl;
+                signed char* const wb = reinterpret_cast<signed char*>(wbuf);
+                if (fp4_parts(W_i8, ffn, H, &gd, &gr, &gl, true) <= (size_t)ffn * H &&
+                    fp4_parts(wb, ffn, H, &ud, &ur, &ul, true) <= (size_t)ffn * H &&
+                    fp4_parts(wb + (size_t)ffn * H, H, ffn, &dd, &dr, &dl, true) <= (size_t)H * ffn &&
+                    kernels::launch_prefill_nvfp4_quant_b_q4k(gate_pf, gd, gl, ffn, 0, ffn, H, st) &&
+                    kernels::launch_prefill_nvfp4_quant_b_q4k(up_pf, ud, ul, ffn, 0, ffn, H, st) &&
+                    kernels::launch_prefill_nvfp4_quant_b_q4k(down_pf, dd, dl, H, 0, H, ffn, st)) {
+                    f4_g = gd; f4_gs = gl; f4_u = ud; f4_us = ul; f4_d = dd; f4_ds = dl;
+                    f4_ga = f4_ua = f4_da = 1.f;
+                    f4_conv = true;
+                }
+            }
             // Whether this layer's gate/up CAN take the FP4 arm below (see ffn_fused there).
-            const bool ffn_fp4_possible = gu_nvfp4 && w.gate_fp4 && w.gate_fp4_sf &&
-                                          w.up_fp4 && w.up_fp4_sf && fp4_a && fp4_as;
-            const bool ffn_i8 = (use_i8_ffn ||
+            const bool ffn_fp4_possible = gu_nvfp4 && f4_g && f4_gs &&
+                                          f4_u && f4_us && fp4_a && fp4_as;
+            const bool ffn_i8 = !f4_conv && (use_i8_ffn ||
                                  (ffn_wcache && !ffn_fp4_possible &&
                                   rows_i8_direct(gate_pf_type, H) &&
                                   rows_i8_direct(up_pf_type, H) &&
@@ -3512,14 +3550,14 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
             // need the trailing add to skip exactly those rows. When it is on, any chunk whose
             // fused GEMM declines applies its own residual immediately instead.
             const bool ffn_fp4_resid = nvfp4_resid_fuse && ffn_fp4_possible && !c.muse_glimmer &&
-                                       nvfp4_down && w.down_fp4 && w.down_fp4_sf &&
+                                       nvfp4_down && f4_d && f4_ds &&
                                        fp4_down_a && fp4_down_as;
             // The streamed operand is built ONCE per layer here and read by every chunk below,
             // then overwritten by the next layer. It is ordered on `st` with the GEMMs that
             // consume it, so a single buffer is correct -- a second would only overlap the
             // conversion. A layer whose conversion declines simply keeps today's int8 path.
-            const void* dn_fp4    = w.down_fp4;
-            const void* dn_fp4_sf = w.down_fp4_sf;
+            const void* dn_fp4    = f4_d;
+            const void* dn_fp4_sf = f4_ds;
             if (!dn_fp4 && nvfp4_down && ffn_fp4_possible && dn_st_sf && dn_st_data && w.down_q) {
                 const MuseStreamCache& sc = muse_stream_cache();
                 if (sc.base && L < sc.dn_layers) {
@@ -3538,8 +3576,8 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                     kernels::launch_norm_then_add(x + (size_t)fo * H, ao + (size_t)fo * H,
                                                   w.post_attn_norm, h + (size_t)fo * H, fn, H,
                                                   1e-8f, st);
-                const bool layer_fp4 = gu_nvfp4 && w.gate_fp4 && w.gate_fp4_sf &&
-                    w.up_fp4 && w.up_fp4_sf && fp4_a && fp4_as &&
+                const bool layer_fp4 = gu_nvfp4 && f4_g && f4_gs &&
+                    f4_u && f4_us && fp4_a && fp4_as &&
                     kernels::prefill_nvfp4_supported(fn, ffn, H) &&
                     (muse_ffn_norm_fp4
                      ? kernels::launch_prefill_nvfp4_rmsnorm_quant_a(
@@ -3551,12 +3589,12 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                      : (hn_fp4_ready && fo == 0 && fn == N) ||
                        kernels::launch_prefill_nvfp4_quant_a(
                            hn_c, fp4_a, fp4_as, fn, H, st)) &&
-                    kernels::launch_prefill_nvfp4_gemm(fp4_a, fp4_as, w.gate_fp4, w.gate_fp4_sf,
+                    kernels::launch_prefill_nvfp4_gemm(fp4_a, fp4_as, f4_g, f4_gs,
                                                        ffg, fn, ffn, H, fp4_ws, st,
-                                                       w.gate_fp4_alpha) &&
-                    kernels::launch_prefill_nvfp4_gemm(fp4_a, fp4_as, w.up_fp4, w.up_fp4_sf,
+                                                       f4_ga) &&
+                    kernels::launch_prefill_nvfp4_gemm(fp4_a, fp4_as, f4_u, f4_us,
                                                        ffu, fn, ffn, H, fp4_ws, st,
-                                                       w.up_fp4_alpha);
+                                                       f4_ua);
                 if (layer_fp4) {
                     bf16* xc = x + (size_t)fo * H;
                     const bool down_swiglu_q = nvfp4_down && dn_fp4 && dn_fp4_sf &&
@@ -3565,14 +3603,14 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                             ffg, ffu, fp4_down_a, fp4_down_as, fn, ffn, st);
                     const bool down_fp4_resid = down_swiglu_q && ffn_fp4_resid &&
                         kernels::launch_prefill_nvfp4_gemm(
-                            fp4_down_a, fp4_down_as, w.down_fp4, w.down_fp4_sf,
-                            xc, fn, H, ffn, fp4_ws, st, w.down_fp4_alpha, xc);
+                            fp4_down_a, fp4_down_as, f4_d, f4_ds,
+                            xc, fn, H, ffn, fp4_ws, st, f4_da, xc);
                     const bool down_fp4_done = down_fp4_resid ||
                         (down_swiglu_q &&
                          kernels::launch_prefill_nvfp4_gemm(
                             fp4_down_a, fp4_down_as, dn_fp4, dn_fp4_sf,
                             ao + (size_t)fo * H, fn, H, ffn, fp4_ws, st,
-                            w.down_fp4_alpha));
+                            f4_da));
                     if (!down_fp4_done) {
                         // The fused down GEMM reads SwiGLU's output only as its int8 operand, so
                         // form it in one pass over gate/up (launch_prefill_swiglu_quant_i8) instead
