@@ -5281,6 +5281,11 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
     float* f8_sx[2] = {nullptr, nullptr};
     float* f8_sw[2] = {nullptr, nullptr};
     float* f8_p[2] = {nullptr, nullptr};
+    // Each stream's split-K tile counters sit right after its partials, in the same slot, and are
+    // zeroed with them: the GEMM's last split per tile runs the epilogue (see
+    // launch_prefill_gemm_fp8_splitk) and hands both back at zero.
+    unsigned* f8_cnt[2] = {nullptr, nullptr};
+    constexpr size_t kF8Counters = 128;
     size_t f8_p_bytes = 0;
     if (wide && fp8_ckpt && kFp8GemmMinRows > 0) {
         const int f8_kwide = std::max(H, lvdim);
@@ -5289,9 +5294,10 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
             f8_a[i] = a.alloc<signed char>((size_t)NA * f8_kwide);
             f8_sx[i] = a.alloc<float>(NA);
             f8_sw[i] = a.alloc<float>(f8_nwide);
-            f8_p[i] = a.alloc<float>((size_t)NA * f8_nwide);
+            f8_p[i] = a.alloc<float>((size_t)NA * f8_nwide + kF8Counters);
+            if (f8_p[i]) f8_cnt[i] = reinterpret_cast<unsigned*>(f8_p[i] + (size_t)NA * f8_nwide);
         }
-        f8_p_bytes = (size_t)NA * f8_nwide * sizeof(float);
+        f8_p_bytes = ((size_t)NA * f8_nwide + kF8Counters) * sizeof(float);
     }
     const bool fp8_gemm = f8_p[1] && N >= kFp8GemmMinRows;
     // WIDE-BATCH FFN OPERANDS. Above a handful of rows the row-GEMV stops being the right kernel:
@@ -5729,6 +5735,11 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
     // in how many graph nodes the verify carries.
     static const bool kNormFold = []{ const char* e = getenv("SPARKINFER_VERIFY_NORMFOLD");
                                       return !(e && e[0] == '0'); }();
+    // The same fold for the FP8 GEMM's per-row e4m3 staging: the GDN gated norm and the layer
+    // tail's add+norm write it, and fp8_stage then finds it staged. SPARKINFER_CB_FP8_NORMFOLD=0
+    // keeps the standalone quantize nodes (A/B).
+    static const bool kCbFp8NormFold = []{ const char* e = getenv("SPARKINFER_CB_FP8_NORMFOLD");
+                                           return !(e && e[0] == '0'); }();
     // Which of the A/B pair the NEXT quantize would write, and how to record it as written --
     // without issuing anything. The norm kernels below can emit the NVFP4 form of their own output
     // for free (they already hold the bf16-rounded values in registers), so a norm claims the
@@ -5759,6 +5770,9 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
     int f8_k[2] = {0, 0};
     bool f8_prefork[2] = {false, false};
     int f8_next = 0;
+    // The slot a layer tail staged the next layer's xn into (kCbFp8NormFold); like nv_staged_src,
+    // the next layer's cache reset keeps it.
+    int f8_staged = -1;
     auto fp8_stage = [&](const bf16* in, int k, bool prefork) -> int {
         for (int i = 0; i < 2; ++i)
             if (f8_src[i] == in && f8_k[i] == k) { f8_prefork[i] = f8_prefork[i] || prefork; return i; }
@@ -5787,8 +5801,18 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
         if (!lean) kernels::launch_prefill_fp8_wscales_bf16(w, f8_sw[slot], no, ps);
         const void* swb = lean ? w : nullptr;
         const void* we4 = static_cast<const char*>(w) + (size_t)no * 2;
+        // The K split aims at 96 blocks, not the prefill rule's 170: at these widths qkv shares
+        // the GPU with z and alpha/beta on the side stream, and a lighter split leaves them room
+        // (qkv 3 -> 2 slices, z 4 -> 2, out 5 -> 3). Measured on the packed step, c8 / c16 / c32:
+        // 96 beats 128 by 2.0 / 1.6 / 1.5% and 170 by 0.8 / 1.9 / 2.0%. Below 96, qkv would stop
+        // splitting at all. SPARKINFER_CB_FP8_SK_TARGET=0 restores the prefill rule (A/B).
+        static const int sk_target = [] {
+            const char* e = getenv("SPARKINFER_CB_FP8_SK_TARGET");
+            return e ? atoi(e) : 96;
+        }();
         if (!kernels::launch_prefill_gemm_fp8_splitk(f8_a[ai], we4, f8_sx[ai], f8_sw[slot], out,
-                                                     N, no, k, f8_p[slot], ps, swb, lean))
+                                                     N, no, k, f8_p[slot], ps, swb, lean, false,
+                                                     f8_cnt[slot], sk_target))
             kernels::launch_prefill_gemm_fp8(f8_a[ai], we4, f8_sx[ai], f8_sw[slot], out, N, no, k, ps,
                                              swb);
         return true;
@@ -6220,6 +6244,10 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
             if (nv_staged_b) { nvq_src_b = nv_staged_src; nvq_k_b = nv_staged_k; }
             else             { nvq_src_a = nv_staged_src; nvq_k_a = nv_staged_k; }
             nv_staged_src = nullptr;
+        }
+        if (f8_staged >= 0) {
+            f8_src[f8_staged] = xn; f8_k[f8_staged] = H;
+            f8_staged = -1;
         }
         vfail_L = L;
         vdbg_snapshot(xn, L);
@@ -6773,17 +6801,33 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
             signed char* gnq = nullptr; float* gns = nullptr;
             const bool gn_nv = !out_t && kNormFold && kernels::qwen38_nvfp4_dp4a_proj() &&
                                w.ssm_out_type == kernels::SI_QTYPE_NVFP4;
+            const bool gdn_out_gemm = wide && fp4_a && fp4_asf && N >= kProjGemmMinRows &&
+                                      w.gdn_out_fp4 && w.gdn_out_fp4_sf;
+            // The FP8 out-projection below reads lnrm only as its e4m3 staging, so the gated norm
+            // writes that staging itself (launch_prefill_gated_norm_fp8: the norm and
+            // launch_prefill_quantize_rows_fp8 in one pass, the same bytes) into the slot
+            // fp8_stage would take, and the bf16 lnrm is never written.
+            bool gn_f8 = false;
+            if (!out_t && !gn_nv && !gdn_out_gemm && kCbFp8NormFold && fp8_gemm && H >= 128 &&
+                w.ssm_out_type == kernels::SI_QTYPE_FP8) {
+                const int i = f8_next;
+                gn_f8 = kernels::launch_prefill_gated_norm_fp8(att, lz, w.ssm_norm, f8_a[i],
+                                                               f8_sx[i], N, vh, c.linear_head_dim,
+                                                               c.rms_eps, st);
+                if (gn_f8) {
+                    f8_next ^= 1;
+                    f8_src[i] = lnrm; f8_k[i] = lvdim; f8_prefork[i] = false;
+                }
+            }
             if (gn_nv) quant_nv_claim(&gnq, &gns);
             if (gn_nv && kernels::launch_prefill_gated_norm_nvfp4(
                              att, lz, w.ssm_norm, lnrm, gnq, gns, N, vh,
                              c.linear_head_dim, c.rms_eps, st)) {
                 quant_nv_commit(lnrm, lvdim);
-            } else if (!out_t) {
+            } else if (!out_t && !gn_f8) {
                 kernels::launch_prefill_gated_norm(att, lz, w.ssm_norm, lnrm, N, vh,
                                                     c.linear_head_dim, c.rms_eps, st);
             }
-            const bool gdn_out_gemm = wide && fp4_a && fp4_asf && N >= kProjGemmMinRows &&
-                                      w.gdn_out_fp4 && w.gdn_out_fp4_sf;
             if (out_t)
                 supported = kernels::launch_gemm_ptq1_i8_rows_bf16(
                     bt_q, bt_qd, bt_qs, tw->ssm_out, nullptr, ao, nullptr, N, H, lvdim, st,
@@ -7356,8 +7400,27 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
             signed char* nvq = nullptr; float* nvs = nullptr;
             if (!xn_rq_ready && kNormFold && kernels::qwen38_nvfp4_dp4a_proj())
                 quant_nv_claim(&nvq, &nvs);
+            // A next GDN layer whose qkv/z take the FP8 GEMM stages xn's e4m3 rows first thing
+            // (fp8_stage ahead of its fork). This kernel holds those values, so it writes them into
+            // the slot that stage would take, and the reset at the top of the next layer keeps it.
+            const Qwen35LayerWeights* nxl = L + 1 < c.n_layers ? &s.w.layers[L + 1] : nullptr;
+            const int f8i = f8_next;
+            const bool xn_f8 = !xn_rq_ready && kCbFp8NormFold && fp8_gemm && nxl &&
+                               nxl->linear_attn &&
+                               (nxl->wqkv_type == kernels::SI_QTYPE_FP8 ||
+                                nxl->wqkv_gate_type == kernels::SI_QTYPE_FP8);
             if (xn_rq_ready) {
                 // written above
+            } else if (xn_f8 && kernels::launch_add_rmsnorm2_q8_rows_fp8(
+                                    h, routed, nn, x, xn, q81, nvq, nvs, f8_a[f8i], f8_sx[f8i],
+                                    N, H, c.rms_eps, st)) {
+                if (nvq) {
+                    nv_staged_b = (nvq == nv_pq_b);
+                    nv_staged_src = xn; nv_staged_k = H;
+                    quant_nv_commit(xn, H);
+                }
+                f8_next ^= 1;
+                f8_staged = f8i;
             } else if (nvq && kernels::launch_add_rmsnorm2_q8_nvfp4_rows(h, routed, nn, x, xn, q81,
                                                                          nvq, nvs, N, H, c.rms_eps,
                                                                          st)) {

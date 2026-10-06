@@ -53,12 +53,17 @@ void launch_prefill_gemm_fp8(const void* A, const void* W,
 // keeps launch_prefill_gemm_fp8). SPARKINFER_PREFILL_GEMM_SPLITK=0 disables.
 // keep_zero: the caller holds `partials` at zero between launches (zeroed once); the epilogue
 // re-zeroes what it read, so no memset precedes the GEMM.
+// tile_counters (keep_zero only): one unsigned per output tile, held at zero the same way. Given,
+// the split that finishes a tile last runs the epilogue on it, so there is no separate epilogue
+// launch; the outputs are the same bytes.
 bool launch_prefill_gemm_fp8_splitk(const void* A, const void* W,
                                     const float* sx, const float* sw, void* C,
                                     int M, int N, int K, float* partials,
                                     cudaStream_t stream = nullptr,
                                     const void* sw_bf16 = nullptr, bool keep_zero = false,
-                                    bool resid = false);
+                                    bool resid = false, unsigned* tile_counters = nullptr,
+                                    // blocks the K split aims for (0 = the default rule's)
+                                    int sk_target = 0);
 
 // Fused SwiGLU + per-row int8 quantize: q[r,:] = int8(silu(gate[r,:]) * up[r,:]) with
 // scale[r] = amax_c|.| / 127. Replaces launch_prefill_swiglu + launch_prefill_quantize_rows_i8 on

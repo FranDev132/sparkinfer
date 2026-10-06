@@ -278,7 +278,12 @@ __global__ void add_rmsnorm2_kernel(const __nv_bfloat16* __restrict__ x,
 // the same `amax * (1/127)` scale and `127/amax` inverse, in the same order. The 16-element group
 // is two ADJACENT threads (each owns 8 consecutive elements of the row) and blockDim is a multiple
 // of 16, so a group never straddles a warp -- one shuffle completes it.
-template <bool NV>
+//
+// F8: also emit the per-row e4m3 form the FP8 GEMM reads (launch_prefill_quantize_rows_fp8's
+// layout): amax over the row's bf16-rounded values (max is exact in any order), d = amax / 2 with
+// the amax == 0 rule, e4m3(v / d) -- pf_quantize_rows_fp8_fast_kernel's arithmetic, in a TU with
+// the same flags (see rmsnorm_fp8_kernel), so every byte and scale match it run on out_norm.
+template <bool NV, bool F8 = false>
 __global__ void add_rmsnorm2_q8_kernel(const __nv_bfloat16* __restrict__ x,
                                        const __nv_bfloat16* __restrict__ residual,
                                        const __nv_bfloat16* __restrict__ weight,
@@ -287,7 +292,9 @@ __global__ void add_rmsnorm2_q8_kernel(const __nv_bfloat16* __restrict__ x,
                                        si_blk_q8_1* __restrict__ out_q8,
                                        signed char* __restrict__ nv_q,
                                        float* __restrict__ nv_s,
-                                       int cols, float eps) {
+                                       int cols, float eps,
+                                       __nv_fp8_e4m3* __restrict__ f8_q = nullptr,
+                                       float* __restrict__ f8_s = nullptr) {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
     // NV form only: its reader is the NVFP4 dp4a GEMV, which, launched programmatic, fetches its
     // weights now and waits for this grid before reading nv_q/nv_s. The plain form must NOT
@@ -340,6 +347,26 @@ __global__ void add_rmsnorm2_q8_kernel(const __nv_bfloat16* __restrict__ x,
     #pragma unroll
     for (int j = 0; j < 8; j++) { ov[j] = svb[j] * inv_rms * wv[j]; bv[j] = __bfloat162float(__float2bfloat16(ov[j])); }
     reinterpret_cast<uint4*>(out_norm + base)[t] = rn_pack8(ov);
+
+    if (F8) {
+        __shared__ float s_f8max[32];
+        float fm = 0.f;
+        #pragma unroll
+        for (int j = 0; j < 8; j++) fm = fmaxf(fm, fabsf(bv[j]));
+        #pragma unroll
+        for (int o = 16; o > 0; o >>= 1) fm = fmaxf(fm, __shfl_xor_sync(0xffffffffu, fm, o));
+        if ((t & 31) == 0) s_f8max[t >> 5] = fm;
+        __syncthreads();
+        float g = ((t & 31) < nw) ? s_f8max[t & 31] : 0.f;
+        #pragma unroll
+        for (int o = 16; o > 0; o >>= 1) g = fmaxf(g, __shfl_xor_sync(0xffffffffu, g, o));
+        const float d = (g == 0.f) ? 1.f : (g / kRnFp8Tgt);
+        if (t == 0) f8_s[blockIdx.x] = d;
+        __nv_fp8_e4m3 o8[8];
+        #pragma unroll
+        for (int j = 0; j < 8; j++) o8[j] = __nv_fp8_e4m3(bv[j] / d);
+        *reinterpret_cast<uint2*>(&f8_q[base + (size_t)t * 8]) = *reinterpret_cast<const uint2*>(o8);
+    }
 
     if (NV) {
         float a16 = 0.f;
@@ -1315,6 +1342,28 @@ bool launch_add_rmsnorm2_q8_nvfp4_rows(const void* x, const void* residual, cons
         reinterpret_cast<const __nv_bfloat16*>(weight), reinterpret_cast<__nv_bfloat16*>(out_sum),
         reinterpret_cast<__nv_bfloat16*>(out_norm), reinterpret_cast<si_blk_q8_1*>(out_q8),
         reinterpret_cast<signed char*>(nv_q), reinterpret_cast<float*>(nv_s), cols, eps);
+    return true;
+}
+
+bool launch_add_rmsnorm2_q8_rows_fp8(const void* x, const void* residual, const void* weight,
+                                     void* out_sum, void* out_norm, void* out_q8,
+                                     void* nv_q, void* nv_s, void* f8_q, float* f8_s,
+                                     int rows, int cols, float eps, cudaStream_t stream) {
+    if (!f8_q || !f8_s || rows <= 0 || (cols % 256) != 0 || (cols >> 3) > 1024) return false;
+    const auto* xb = reinterpret_cast<const __nv_bfloat16*>(x);
+    const auto* rb = reinterpret_cast<const __nv_bfloat16*>(residual);
+    const auto* wb = reinterpret_cast<const __nv_bfloat16*>(weight);
+    auto* sb = reinterpret_cast<__nv_bfloat16*>(out_sum);
+    auto* nb = reinterpret_cast<__nv_bfloat16*>(out_norm);
+    auto* qb = reinterpret_cast<si_blk_q8_1*>(out_q8);
+    auto* fq = reinterpret_cast<__nv_fp8_e4m3*>(f8_q);
+    if (nv_q && nv_s)
+        add_rmsnorm2_q8_kernel<true, true><<<rows, cols >> 3, 0, stream>>>(
+            xb, rb, wb, sb, nb, qb, reinterpret_cast<signed char*>(nv_q),
+            reinterpret_cast<float*>(nv_s), cols, eps, fq, f8_s);
+    else
+        add_rmsnorm2_q8_kernel<false, true><<<rows, cols >> 3, 0, stream>>>(
+            xb, rb, wb, sb, nb, qb, nullptr, nullptr, cols, eps, fq, f8_s);
     return true;
 }
 
