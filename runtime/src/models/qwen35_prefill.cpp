@@ -5004,13 +5004,33 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
     size_t recent_max = 0;
     for (size_t u : recent_used) recent_max = std::max(recent_max, u);
     const bool pf_oversized = shrink_on && pf_held > 2 * recent_max + (64ull << 20);
+    // What the arena keeps, the decode steps that follow cannot have. Qwen3.8 at 32 concurrent
+    // requests holds ~0.9-1.1 GB of it after the burst's two 4096-token passes with ~0.5 GB of the
+    // card left, and the first packed step's scratch then fails to allocate: that run's steps fall
+    // back and the same cb_bench run (int8 KV) lands at ~1,100 tok/s instead of ~1,670, two runs
+    // in eight. So the arena is kept only while the device still has
+    // SPARKINFER_PREFILL_ARENA_MIN_FREE_MB (1 GB) free beside it; a model with room to spare
+    // (Qwen3.6's MoE mixed steps, which the 2 GB keep is for) keeps it as before, and an arena
+    // past the 2 GB keep is released by the size rule anyway. 0 restores the size-only rule.
+    static const size_t kArenaMinFreeBytes = [] {
+        const char* e = getenv("SPARKINFER_PREFILL_ARENA_MIN_FREE_MB");
+        const long long v = e ? atoll(e) : 1024;
+        return (size_t)(v > 0 ? v : 0) << 20;
+    }();
+    bool pf_tight = false;
+    size_t pf_free = 0;
+    if (arena_reuse && !g_pf_hold_arena && kArenaMinFreeBytes && pf_held &&
+        pf_held <= kArenaKeepBytes && !pf_oversized) {
+        size_t total = 0;
+        if (cudaMemGetInfo(&pf_free, &total) == cudaSuccess) pf_tight = pf_free < kArenaMinFreeBytes;
+    }
+    const bool pf_release =
+        !arena_reuse || (!g_pf_hold_arena && (pf_held > kArenaKeepBytes || pf_oversized || pf_tight));
     if (arena_dbg)
-        fprintf(stderr, "[prefill-arena] N=%d held %.0f MB used %.0f MB recent max %.0f MB%s\n", N,
-                pf_held / 1048576.0, pf_used / 1048576.0, recent_max / 1048576.0,
-                (!arena_reuse || (!g_pf_hold_arena && (pf_held > kArenaKeepBytes || pf_oversized)))
-                    ? " -> release" : "");
-    if (!arena_reuse ||
-        (!g_pf_hold_arena && (pf_held > kArenaKeepBytes || pf_oversized))) {
+        fprintf(stderr, "[prefill-arena] N=%d held %.0f MB used %.0f MB recent max %.0f MB free %.0f MB%s\n",
+                N, pf_held / 1048576.0, pf_used / 1048576.0, recent_max / 1048576.0,
+                pf_free / 1048576.0, pf_release ? " -> release" : "");
+    if (pf_release) {
         if (shrink_on) kernels::prefill_scratch_release();
         a.free_all();
         a8.free_all();
