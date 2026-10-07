@@ -92,11 +92,13 @@ bool launch_prefill_nvfp4_gate_up_swiglu_pdl(const void* a_fp4, const void* sfa,
 bool launch_muse_tail_fp4_exact(const void* residual, const void* branch, const void* post_w,
                                 const void* next_w, void* out_x, void* out_xn, void* out_q8,
                                 void* dst_fp4, void* dst_sf, int rows, int rows_op, int cols,
-                                float post_eps, float eps, cudaStream_t stream = nullptr);
+                                float post_eps, float eps, cudaStream_t stream = nullptr,
+                                bool pdl = false);   // a programmatic dependent of the kernel ahead
 // launch_prefill_nvfp4_swiglu_quant_a over one [m, 2*k] tensor holding gate and up interleaved by
 // column (2j gate, 2j+1 up): the output of a plain GEMM over the interleaved operand. Same bytes.
 bool launch_prefill_nvfp4_swiglu_il_quant_a(const void* gu_bf16, void* dst_fp4, void* dst_sf,
-                                            int m, int k, cudaStream_t stream = nullptr);
+                                            int m, int k, cudaStream_t stream = nullptr,
+                                            bool pdl = false);
 // [m, 2*k] column-interleaved gate/up -> two [m, k] planes.
 bool launch_bf16_deinterleave_gate_up(const void* gu_bf16, void* gate_bf16, void* up_bf16, int m,
                                       int k, cudaStream_t stream = nullptr);

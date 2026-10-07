@@ -37,14 +37,16 @@ bool launch_prefill_nvfp4_gate_up_swiglu(const void*, const void*, const void*, 
 bool launch_prefill_nvfp4_gate_up_swiglu_pdl(const void*, const void*, const void*, const void*,
                                              void*, void*, int, int, int, float, float, void*,
                                              cudaStream_t) { return false; }
-bool launch_prefill_nvfp4_swiglu_il_quant_a(const void*, void*, void*, int, int, cudaStream_t) {
+bool launch_prefill_nvfp4_swiglu_il_quant_a(const void*, void*, void*, int, int, cudaStream_t,
+                                            bool) {
     return false;
 }
 bool launch_bf16_deinterleave_gate_up(const void*, void*, void*, int, int, cudaStream_t) {
     return false;
 }
 bool launch_muse_tail_fp4_exact(const void*, const void*, const void*, const void*, void*, void*,
-                                void*, void*, void*, int, int, int, float, float, cudaStream_t) {
+                                void*, void*, void*, int, int, int, float, float, cudaStream_t,
+                                bool) {
     return false;
 }
 bool launch_prefill_nvfp4_quant_b(const void*, void*, void*, int, int, cudaStream_t) { return false; }

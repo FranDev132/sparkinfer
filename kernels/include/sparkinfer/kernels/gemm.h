@@ -162,6 +162,9 @@ void launch_quantize_q8_1_blocks(const void* x, void* y, int K, cudaStream_t str
 // Intended to run on a side stream during a latency-bound kernel, so the next weight-streaming
 // GEMV finds its leading slice already resident. Never changes a computed value.
 void launch_l2_prefetch(const void* p, size_t bytes, cudaStream_t stream = nullptr);
+// The same range pulled with TMA bulk prefetches from 16 single-thread blocks (sm_90+; no-op
+// below): the whole range lands, at the bus rate, from a footprint that leaves the SMs free.
+void launch_l2_prefetch_bulk(const void* p, size_t bytes, cudaStream_t stream = nullptr);
 // Row-batched Q8_1 quantize: `rows` activation rows of K values, x row stride `x_stride` elements,
 // y rows contiguous (llama_q8_1_bytes(K) apart). Same per-row math as the single-row launcher.
 void launch_quantize_q8_1_rows(const void* x, void* y, int K, int rows, int x_stride,

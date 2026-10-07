@@ -207,6 +207,26 @@ bool muse_packed_pdl_on() {
     }();
     return v;
 }
+// The small kernel behind each of the packed step's decode GEMMs (the QK-norm, the FP4 tails, the
+// interleaved SwiGLU quantize) launches as its programmatic dependent: the GEMM signals at its
+// start, so that kernel is resident and waiting when the GEMM retires instead of launching then.
+// SPARKINFER_MUSE_PACKED_SMALL_PDL=0 launches them normally (A/B).
+bool muse_small_pdl_on() {
+    static const bool v = [] {
+        const char* e = getenv("SPARKINFER_MUSE_PACKED_SMALL_PDL");
+        return muse_packed_pdl_on() && !(e && e[0] == '0');
+    }();
+    return v;
+}
+// The attention split and combine in the same programmatic chain (SPARKINFER_MUSE_PACKED_ATTN_PDL=0
+// launches them normally, A/B).
+bool muse_attn_pdl_on() {
+    static const bool v = [] {
+        const char* e = getenv("SPARKINFER_MUSE_PACKED_ATTN_PDL");
+        return muse_small_pdl_on() && !(e && e[0] == '0');
+    }();
+    return v;
+}
 bool muse_tail_fp4_on() {
     static const bool v = [] {
         const char* e = getenv("SPARKINFER_MUSE_TAIL_FP4");
@@ -6066,6 +6086,15 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
         return !(e && e[0] == '0');
     }();
     const bool fork_shared = shared_stream_on && s.stream_k && s.stream_k != s.stream;
+    // Muse Glimmer's packed step: the side stream that pulls the head of each layer's gate/up
+    // weights into L2 while that layer's attention runs (see muse_l2pf_mb below).
+    static thread_local cudaStream_t muse_pf_st = nullptr;
+    static thread_local cudaEvent_t muse_pf_fork = nullptr, muse_pf_done = nullptr;
+    if (c.muse_glimmer && packed && !muse_pf_st) {
+        pf_cu(cudaStreamCreateWithFlags(&muse_pf_st, cudaStreamNonBlocking), "muse l2pf stream");
+        pf_cu(cudaEventCreateWithFlags(&muse_pf_fork, cudaEventDisableTiming), "muse l2pf fork");
+        pf_cu(cudaEventCreateWithFlags(&muse_pf_done, cudaEventDisableTiming), "muse l2pf done");
+    }
     if (fork_shared && !ev_fork) {
         pf_cu(cudaEventCreateWithFlags(&ev_fork, cudaEventDisableTiming), "verify fork event");
         pf_cu(cudaEventCreateWithFlags(&ev_join, cudaEventDisableTiming), "verify join event");
@@ -6611,6 +6640,9 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
     // (Declared, then assigned, for the same goto.)
     bool pk_xn_fp4;
     pk_xn_fp4 = false;
+    // A packed Muse layer forked its gate/up L2 prefetch onto muse_pf_st (joined after the loop).
+    bool muse_pf_out;
+    muse_pf_out = false;
     for (int L = 0; L < c.n_layers && supported; ++L) {
         // Reset the dp4a activation cache every layer. `xn` is the SAME buffer at every layer, so
         // a pointer-keyed cache that is never invalidated silently reuses layer 0's quantization
@@ -6839,22 +6871,51 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
             const int* rtab = w.swa ? (btab_rows_win ? btab_rows_win
                                                      : (btab_rows ? btab_rows : btable_win))
                                     : (btab_rows ? btab_rows : btable);
+            // The attention block (QK-norm, split, combine) reads a few MB of KV and leaves DRAM
+            // idle for ~10 us a layer, and the o GEMM after it, 52 latency-bound CTAs, does not
+            // fill the bus either; then the interleaved gate/up GEMM streams 150 MB at the bus
+            // rate. Pull the head of that operand -- the rows its first CTAs read, and their scale
+            // factors -- into L2 from a side stream now, so those bytes are off the GEMM's stream.
+            // TMA bulk prefetches from 16 one-thread blocks (launch_l2_prefetch_bulk): the range
+            // really lands, and the attention kernels keep their SMs. Same bytes; only where they
+            // are served from changes. Only where that GEMM runs (the FP4 gate/up arm's row floor).
+            // Step time against no prefetch, us: 4 rows 10155 -> 9828 at 48 MB (16 MB 10012),
+            // 8 rows 10242 -> 9908, 16 rows 10646 -> 10393; 32 rows 11307 -> 11117 at 16 MB, where
+            // 40-48 MB lose to no prefetch at all. SPARKINFER_MUSE_PACKED_L2PF_MB sets one size for
+            // every width (0 = off).
+            static const int muse_l2pf_env = [] {
+                const char* e = getenv("SPARKINFER_MUSE_PACKED_L2PF_MB");
+                return e ? std::max(0, atoi(e)) : -1;
+            }();
+            const int muse_l2pf_mb = muse_l2pf_env >= 0 ? muse_l2pf_env : N <= 16 ? 48 : 16;
+            if (muse_l2pf_mb > 0 && muse_pf_st && wide && topk == 1 && N >= gu_gemm_min_rows() &&
+                w.gu_interleaved && w.gate_fp4 && w.gate_fp4_sf) {
+                const size_t data = (size_t)2 * ffn * (H / 2), sf = (size_t)2 * ffn * (H / 16);
+                const size_t want = std::min(data, (size_t)muse_l2pf_mb << 20);
+                pf_cu(cudaEventRecord(muse_pf_fork, st), "muse l2pf fork");
+                pf_cu(cudaStreamWaitEvent(muse_pf_st, muse_pf_fork, 0), "muse l2pf fork wait");
+                kernels::launch_l2_prefetch_bulk(w.gate_fp4, want, muse_pf_st);
+                kernels::launch_l2_prefetch_bulk(w.gate_fp4_sf, std::min(sf, want / 8), muse_pf_st);
+                muse_pf_out = true;
+            }
             // QK-norm, RoPE and the bf16 KV append as ONE launch instead of three per layer, with the
             // same bytes (launch_muse_qknorm_rope_kv_rows). SPARKINFER_MUSE_PACKED_QKNORM_FUSE=0
             // issues the three again.
             static const bool qkn_fuse = [] {
                 const char* e = getenv("SPARKINFER_MUSE_PACKED_QKNORM_FUSE");
                 return !(e && e[0] == '0'); }();
+            // It waits for the kernel ahead in griddepcontrol.wait whatever that kernel is.
+            const bool small_pdl = muse_small_pdl_on();
             const bool qkn_done = qkn_fuse &&
                 (kv8 ? (qkv_in_place
                         ? kernels::launch_muse_qknorm_rope_kv_int8_rows(
                               fp4_qkv, nullptr, nullptr, w.q_norm, w.k_norm, kp, vp, ks, vs, rtab,
                               pos, N, c.n_q_heads, c.n_kv_heads, c.head_dim, c.rope_theta,
-                              c.rms_eps, w.swa != 0, bs, mbs, st, qkvg_n, qb)
+                              c.rms_eps, w.swa != 0, bs, mbs, st, qkvg_n, qb, small_pdl)
                         : kernels::launch_muse_qknorm_rope_kv_int8_rows(
                               qb, kf, vf, w.q_norm, w.k_norm, kp, vp, ks, vs, rtab, pos, N,
                               c.n_q_heads, c.n_kv_heads, c.head_dim, c.rope_theta, c.rms_eps,
-                              w.swa != 0, bs, mbs, st))
+                              w.swa != 0, bs, mbs, st, 0, nullptr, small_pdl))
                      : kernels::launch_muse_qknorm_rope_kv_rows(
                            qb, kf, vf, w.q_norm, w.k_norm, kp, vp, rtab, pos, N, c.n_q_heads,
                            c.n_kv_heads, c.head_dim, c.rope_theta, c.rms_eps, w.swa != 0, bs,
@@ -6911,7 +6972,7 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
             if (gate_combine && wo_want_fp4 && !attn_gq8)
                 kernels::fa_combine_fp4_gate_arm(qkv_in_place ? fp4_qkv + qdim : qg,
                                                  qkv_in_place ? qkvg_n : qdim, fp4_a, fp4_asf,
-                                                 qdim);
+                                                 qdim, muse_attn_pdl_on());
             if (w.swa) {
                 kernels::launch_flash_decode_split(
                     qb, kp, vp, swa_vtbl, swa_vlen, att, fa_m, fa_l, fa_acc,
@@ -6962,7 +7023,7 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
                 kernels::prefill_nvfp4_supported(Ng, 2 * ffn, H) &&
                 kernels::launch_muse_tail_fp4_exact(x, ao, w.post_attn_norm, w.ffn_norm, h, hn,
                                                     q81, fp4_a, fp4_asf, N, Ng, H, 1e-8f,
-                                                    c.rms_eps, st);
+                                                    c.rms_eps, st, muse_small_pdl_on());
             if (hn_fp4_pk) {
                 hn_q8_ready = q81 != nullptr;
             } else if (packed_tail) {
@@ -7018,7 +7079,8 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
                 if (gu_gemm && dn4 && dn4_sf)
                     dn_gemm =
                         kernels::launch_prefill_nvfp4_swiglu_il_quant_a(packed_gu_buf, fp4_a,
-                                                                        fp4_asf, Ng, ffn, st) &&
+                                                                        fp4_asf, Ng, ffn, st,
+                                                                        muse_small_pdl_on()) &&
                         (muse_packed_pdl_on()
                          ? kernels::launch_prefill_nvfp4_gemm_pdl(fp4_a, fp4_asf, dn4, dn4_sf,
                                                                  routed, Ng, H, ffn, fp4_ws, st,
@@ -7078,7 +7140,7 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
                 pnw->qkvg_fp4_sf && kernels::prefill_nvfp4_supported(Ng, qkvg_n, H) &&
                 kernels::launch_muse_tail_fp4_exact(h, routed, w.post_ffn_norm, nn, x, xn, q81,
                                                     fp4_a, fp4_asf, N, Ng, H, 1e-8f, c.rms_eps,
-                                                    st);
+                                                    st, muse_small_pdl_on());
             if (pk_xn_fp4) {
                 xn_q8_ready = q81 != nullptr;
             } else if (packed_tail) {
@@ -8055,6 +8117,11 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
                                              N, H, c.rms_eps, st);
         q81_src = xn; q81_k = H;
         capture(L);
+    }
+    if (muse_pf_out) {
+        pf_cu(cudaEventRecord(muse_pf_done, muse_pf_st), "muse l2pf done");
+        pf_cu(cudaStreamWaitEvent(st, muse_pf_done, 0), "muse l2pf join");
+        muse_pf_out = false;
     }
     if (!supported) {
         // Name the layer. Every decline that has an obvious cause already prints one (missing

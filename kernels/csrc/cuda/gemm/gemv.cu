@@ -4073,6 +4073,29 @@ __global__ void si_l2_load_kernel(const uint4* __restrict__ p, size_t n16) {
     if (acc == 0xFFFFFFFFu && n16 == 0) si_l2_pf_sink = acc;   // never taken
 }
 
+// TMA bulk prefetch of [p, p + bytes) into L2, 64 KB a request from one thread per block: the
+// hardware fetches the whole range at the bus rate from a footprint of a few warps, where the
+// per-line prefetch above needs hundreds of blocks and is partly dropped under load. Measured on
+// a 150 MB decode GEMM, DRAM-cold: 16 MB prefetched this way first saves 11.4 us of it (the
+// bytes' whole bus time); per-line hints save 6.4 and the 16 KB / 1 MB request sizes 6.6 / 3.0.
+__global__ void si_l2_prefetch_bulk_kernel(const char* __restrict__ p, size_t bytes) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+    constexpr size_t kChunk = 65536;
+    if (threadIdx.x) return;
+    for (size_t off = (size_t)blockIdx.x * kChunk; off < bytes; off += (size_t)gridDim.x * kChunk) {
+        const unsigned n = (unsigned)(bytes - off < kChunk ? bytes - off : kChunk);
+        asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" :: "l"(p + off), "r"(n) : "memory");
+    }
+#endif
+}
+void launch_l2_prefetch_bulk(const void* p, size_t bytes, cudaStream_t stream) {
+    if (!p || bytes < 16) return;
+    bytes &= ~(size_t)15;                       // bulk sizes are multiples of 16 bytes
+    const size_t chunks = (bytes + 65535) >> 16;
+    const int blocks = (int)(chunks < 16 ? chunks : 16);
+    si_l2_prefetch_bulk_kernel<<<blocks, 32, 0, stream>>>(reinterpret_cast<const char*>(p), bytes);
+}
+
 void launch_l2_prefetch(const void* p, size_t bytes, cudaStream_t stream) {
     if (!p || !bytes) return;
     static int mode = -1;

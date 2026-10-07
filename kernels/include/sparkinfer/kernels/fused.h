@@ -97,7 +97,9 @@ bool launch_muse_qknorm_rope_kv_int8_rows(void* q, const void* k, const void* v,
                                           cudaStream_t stream,
                                           // q, k, v read from one packed q|gate|k|v buffer of row
                                           // pitch src_ld (q points at it); normed q to q_out
-                                          int src_ld = 0, void* q_out = nullptr);
+                                          int src_ld = 0, void* q_out = nullptr,
+                                          // a programmatic dependent of the kernel ahead
+                                          bool pdl = false);
 bool launch_muse_qknorm_rope_kv_rows(void* q, const void* k, const void* v, const void* q_w,
                                      const void* k_w, void* k_pool, void* v_pool,
                                      const int* block_table, const int* positions, int n_rows,

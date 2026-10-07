@@ -1169,6 +1169,17 @@ __global__ void muse_qknorm_rope_kv_int8_rows_kernel(
     int n_q_heads, int n_kv_heads, int head_dim, float theta, float eps,
     int block_size, int max_blocks_per_seq
 ) {
+    // The q/k norm weight is a model constant: read it before the wait below.
+    uint4 w4pre = make_uint4(0u, 0u, 0u, 0u);
+    if ((int)threadIdx.x < (head_dim >> 3) && (int)blockIdx.x < n_q_heads + n_kv_heads)
+        w4pre = __ldg(reinterpret_cast<const uint4*>((int)blockIdx.x < n_q_heads ? q_w : k_w) +
+                      threadIdx.x);
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+    // Launched programmatic behind the q|gate|k|v GEMM: wait for it before the first read, and
+    // only then let the attention split behind this launch.
+    asm volatile("griddepcontrol.wait;" ::: "memory");
+    asm volatile("griddepcontrol.launch_dependents;");
+#endif
     const int hh = blockIdx.x, row = blockIdx.y, t = threadIdx.x;
     const int npack = head_dim >> 3;
     const int pos = positions[row];
@@ -1215,7 +1226,7 @@ __global__ void muse_qknorm_rope_kv_int8_rows_kernel(
         float nv[8];
         if (live) {
             float wv[8], ov[8];
-            rn_unpack8(__ldg(reinterpret_cast<const uint4*>(is_q ? q_w : k_w) + t), wv);
+            rn_unpack8(w4pre, wv);
             #pragma unroll
             for (int j = 0; j < 8; j++) ov[j] = xv[j] * inv_rms * wv[j];
             rn_unpack8(rn_pack8(ov), nv);         // the bf16 the append kernel loads back
@@ -1343,12 +1354,21 @@ bool launch_muse_qknorm_rope_kv_int8_rows(void* q, const void* k, const void* v,
                                           const int* positions, int n_rows, int n_q_heads,
                                           int n_kv_heads, int head_dim, float theta, float eps,
                                           bool do_rope, int block_size, int max_blocks_per_seq,
-                                          cudaStream_t stream, int src_ld, void* q_out) {
+                                          cudaStream_t stream, int src_ld, void* q_out, bool pdl) {
     // One thread per 8-value pack, every pack inside one warp; the pool rows take 8-byte stores.
     if (n_rows < 1 || (head_dim & 7) || (head_dim >> 3) > 32 || !k_scale || !v_scale) return false;
     if (src_ld && (!q_out || (src_ld & 7))) return false;
     const dim3 grid(n_q_heads + 2 * n_kv_heads, n_rows);
-#define SI_MUSE_QKN_I8(ROPE_) muse_qknorm_rope_kv_int8_rows_kernel<ROPE_><<<grid, 32, 0, stream>>>( \
+    cudaLaunchConfig_t lc = {};
+    lc.gridDim = grid;
+    lc.blockDim = dim3(32);
+    lc.stream = stream;
+    cudaLaunchAttribute la{};
+    la.id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    la.val.programmaticStreamSerializationAllowed = 1;
+    lc.attrs = &la;
+    lc.numAttrs = pdl ? 1 : 0;
+#define SI_MUSE_QKN_I8(ROPE_) cudaLaunchKernelEx(&lc, muse_qknorm_rope_kv_int8_rows_kernel<ROPE_>, \
         reinterpret_cast<__nv_bfloat16*>(q), reinterpret_cast<const __nv_bfloat16*>(k), \
         reinterpret_cast<const __nv_bfloat16*>(v), src_ld, reinterpret_cast<__nv_bfloat16*>(q_out), \
         reinterpret_cast<const __nv_bfloat16*>(q_w), reinterpret_cast<const __nv_bfloat16*>(k_w), \

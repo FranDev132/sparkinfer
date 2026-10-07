@@ -350,6 +350,13 @@ struct MmaPrefetchA : Base {
                 }
             }
         }
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+        // CUTLASS's sm_120 kernels never signal their dependents, so a programmatic dependent
+        // could only launch once this grid had retired. Signal at the start instead: the small
+        // kernel behind a decode GEMM (a tail, a quantize, the QK-norm) comes up on the SMs this
+        // grid leaves idle and waits in griddepcontrol.wait, which still covers the whole grid.
+        asm volatile("griddepcontrol.launch_dependents;");
+#endif
         return inputs;
     }
 };
@@ -1014,6 +1021,10 @@ __global__ void swiglu_il_quant_rows(const __nv_bfloat16* __restrict__ gu,
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
     // A programmatic dependent (the block-scaled GEMM reading dst) may launch once every CTA here
     // has issued this; it still waits for the whole grid before its first global read.
+    // Launched programmatic (behind a decode GEMM, which signals at its start), wait for it
+    // before touching memory -- and only then let the next GEMM launch, so its weight prefetch
+    // lands in this kernel's window rather than on top of the GEMM still streaming.
+    asm volatile("griddepcontrol.wait;" ::: "memory");
     asm volatile("griddepcontrol.launch_dependents;");
 #endif
     constexpr int LPG = LPG_, VPL = 16 / LPG, V = 16;
@@ -1581,11 +1592,6 @@ __global__ __launch_bounds__(1024) void muse_tail_fp4_exact(
         si_q8_blk* __restrict__ out_q8, unsigned char* __restrict__ dst,
         cutlass::float_ue4m3_t* __restrict__ sf, int cols, float post_eps, float eps,
         Layout layout) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
-    // A programmatic dependent (the block-scaled GEMM reading dst) may launch once every CTA here
-    // has issued this; it still waits for the whole grid before its first global read.
-    asm volatile("griddepcontrol.launch_dependents;");
-#endif
     const int row = blockIdx.x;
     const size_t base = (size_t)row * cols;
     const int npack = cols >> 3;
@@ -1598,11 +1604,27 @@ __global__ __launch_bounds__(1024) void muse_tail_fp4_exact(
         for (int j = 0; j < 8; j++) o[j] = __bfloat162float(h[j]);
     };
     float bv[8], rv[8], pv[8], nv[8];
+    // The two norm weights are model constants, so they are read before the wait below and land
+    // while the GEMM ahead still drains.
+    uint4 pw4 = make_uint4(0u, 0u, 0u, 0u), nw4 = pw4;
+    if (live) {
+        pw4 = __ldg(reinterpret_cast<const uint4*>(post_w) + p);
+        nw4 = __ldg(reinterpret_cast<const uint4*>(next_w) + p);
+    }
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+    // A programmatic dependent (the block-scaled GEMM reading dst) may launch once every CTA here
+    // has issued this; it still waits for the whole grid before its first global read.
+    // Launched programmatic (behind a decode GEMM, which signals at its start), wait for it
+    // before touching the activations -- and only then let the next GEMM launch, so its weight
+    // prefetch lands in this kernel's window rather than on top of the GEMM still streaming.
+    asm volatile("griddepcontrol.wait;" ::: "memory");
+    asm volatile("griddepcontrol.launch_dependents;");
+#endif
     if (live) {
         unpack8(__ldg(reinterpret_cast<const uint4*>(branch + base) + p), bv);
         unpack8(__ldg(reinterpret_cast<const uint4*>(residual + base) + p), rv);
-        unpack8(__ldg(reinterpret_cast<const uint4*>(post_w) + p), pv);
-        unpack8(__ldg(reinterpret_cast<const uint4*>(next_w) + p), nv);
+        unpack8(pw4, pv);
+        unpack8(nw4, nv);
     }
     float ss = 0.f;
     if (live) {
@@ -1700,17 +1722,32 @@ __global__ __launch_bounds__(1024) void muse_tail_fp4_exact(
         if ((p & 1) == 0) { auto scales = cute::make_tensor(sf, layout); scales(row, p * 8, 0) = qs; }
     }
 }
+// Launches `kernel` as a programmatic dependent of the stream's previous kernel when `pdl` is set.
+template <typename... KArgs, typename... Args>
+static void launch_pdl_opt(void (*kernel)(KArgs...), dim3 grid, dim3 block, cudaStream_t st,
+                           bool pdl, Args... args) {
+    cudaLaunchConfig_t cfg = {};
+    cfg.gridDim = grid;
+    cfg.blockDim = block;
+    cfg.stream = st;
+    cudaLaunchAttribute attr{};
+    attr.id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attr.val.programmaticStreamSerializationAllowed = 1;
+    cfg.attrs = &attr;
+    cfg.numAttrs = pdl ? 1 : 0;
+    cudaLaunchKernelEx(&cfg, kernel, args...);
+}
 bool launch_muse_tail_fp4_exact(const void* residual, const void* branch, const void* post_w,
                                 const void* next_w, void* out_x, void* out_xn, void* out_q8,
                                 void* dst_fp4, void* dst_sf, int rows, int rows_op, int cols,
-                                float post_eps, float eps, cudaStream_t st) {
+                                float post_eps, float eps, cudaStream_t st, bool pdl) {
     const int npack = cols >> 3;
     if (!residual || !branch || !post_w || !next_w || !out_x || !out_xn || !dst_fp4 || !dst_sf ||
         rows < 1 || rows > rows_op || (cols & 31) || npack > 1024 || (npack & 31) ||
         !prefill_nvfp4_supported(rows_op, 128, cols))
         return false;
     auto l = sfa_layout(rows_op, 128, cols);
-    muse_tail_fp4_exact<<<rows, 1024, 0, st>>>(
+    launch_pdl_opt(muse_tail_fp4_exact<decltype(l)>, dim3(rows), dim3(1024), st, pdl,
         (const __nv_bfloat16*)residual, (const __nv_bfloat16*)branch,
         (const __nv_bfloat16*)post_w, (const __nv_bfloat16*)next_w, (__nv_bfloat16*)out_x,
         (__nv_bfloat16*)out_xn, (si_q8_blk*)out_q8, (unsigned char*)dst_fp4,
@@ -1811,17 +1848,19 @@ bool launch_prefill_nvfp4_swiglu_quant_a(const void* g, const void* u, void* d, 
     return cudaPeekAtLastError() == cudaSuccess;
 }
 bool launch_prefill_nvfp4_swiglu_il_quant_a(const void* gu, void* d, void* sf, int m, int k,
-                                            cudaStream_t st) {
+                                            cudaStream_t st, bool pdl) {
     if (!gu || !d || !sf || !prefill_nvfp4_supported(m,128,k)) return false;
     auto l = sfa_layout(m,128,k);
     const int lpg = (m > 0 && m <= kQuantNarrowLaneMaxRows) ? 8 : 2;
     int blocks = (m * (k / 16) * lpg + 255) / 256; if (blocks > 4096) blocks = 4096;
     if (lpg == 8)
-        swiglu_il_quant_rows<8><<<blocks,256,0,st>>>((const __nv_bfloat16*)gu, (unsigned char*)d,
-                                                     (cutlass::float_ue4m3_t*)sf, m, k, l);
+        launch_pdl_opt(swiglu_il_quant_rows<8, decltype(l)>, dim3(blocks), dim3(256), st, pdl,
+                       (const __nv_bfloat16*)gu, (unsigned char*)d, (cutlass::float_ue4m3_t*)sf,
+                       m, k, l);
     else
-        swiglu_il_quant_rows<2><<<blocks,256,0,st>>>((const __nv_bfloat16*)gu, (unsigned char*)d,
-                                                     (cutlass::float_ue4m3_t*)sf, m, k, l);
+        launch_pdl_opt(swiglu_il_quant_rows<2, decltype(l)>, dim3(blocks), dim3(256), st, pdl,
+                       (const __nv_bfloat16*)gu, (unsigned char*)d, (cutlass::float_ue4m3_t*)sf,
+                       m, k, l);
     return cudaPeekAtLastError() == cudaSuccess;
 }
 bool launch_bf16_deinterleave_gate_up(const void* gu, void* g, void* u, int m, int k,

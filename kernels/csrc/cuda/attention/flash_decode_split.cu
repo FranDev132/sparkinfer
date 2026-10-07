@@ -805,6 +805,7 @@ __global__ void fa_combine_gate_fp4_kernel(
 ) {
     static_assert(HEAD_DIM == 32 * DG, "one value per lane");
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+    asm volatile("griddepcontrol.wait;" ::: "memory");   // launched programmatic: the split
     asm volatile("griddepcontrol.launch_dependents;");   // the o GEMM reading dst (it waits)
 #endif
     const int seq = blockIdx.y, qh = blockIdx.x / DG, dg = blockIdx.x % DG;
@@ -865,8 +866,10 @@ __global__ void fa_combine_gate_fp4_kernel(
 // bf16 output. Armed by fa_combine_fp4_gate_arm, consumed by fa_launch_combine_dispatch, and the
 // caller asks fa_combine_fp4_gate_taken afterwards; a launch that never reached the combine leaves
 // it untaken and the caller quantizes the bf16 output itself.
+// With pdl set, the int8 split and this combine launch as programmatic dependents of the kernel
+// ahead of each (both wait for it before their first read).
 struct FaFp4GateReq { const __nv_bfloat16* gate; int gate_ld; unsigned char* dst; unsigned char* sf;
-                      int qdim; bool armed, taken; };
+                      int qdim; bool armed, taken, pdl; };
 static FaFp4GateReq g_fa_fp4_req = {};
 
 #ifndef FA_COMBINE_DG
@@ -1250,6 +1253,12 @@ __global__ void __launch_bounds__(fa_mma_block_threads<HEAD_DIM, GQA>::v,
     const __half* __restrict__ k_scale, const __half* __restrict__ v_scale
 ) {
     using namespace nvcuda::wmma;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+    // Launched programmatic (FaFp4GateReq::pdl): wait for the kernel that wrote q and the new
+    // keys, then let the combine behind this launch come up. Both are no-ops otherwise.
+    asm volatile("griddepcontrol.wait;" ::: "memory");
+    asm volatile("griddepcontrol.launch_dependents;");
+#endif
     constexpr int KH = HEAD_DIM / 16;
     // The changes below apply where they measured faster: hd128 at every group width and the 8:1
     // hd256 group (PV on mma.sync, staged block ids, register P', folded correction, float4
@@ -1731,8 +1740,16 @@ static inline void fa_launch_combine_gate_fp4(
     const float* part_m, const float* part_l, const float* part_acc, __nv_bfloat16* out,
     int num_q_heads, int n_splits, int num_seqs, cudaStream_t stream
 ) {
-    dim3 g(num_q_heads * FA_COMBINE_DG, num_seqs);
-    fa_combine_gate_fp4_kernel<128, FA_COMBINE_DG, NW><<<g, NW * 32, 0, stream>>>(
+    cudaLaunchConfig_t lc = {};
+    lc.gridDim = dim3(num_q_heads * FA_COMBINE_DG, num_seqs);
+    lc.blockDim = dim3(NW * 32);
+    lc.stream = stream;
+    cudaLaunchAttribute la{};
+    la.id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    la.val.programmaticStreamSerializationAllowed = 1;
+    lc.attrs = &la;
+    lc.numAttrs = g_fa_fp4_req.pdl ? 1 : 0;
+    cudaLaunchKernelEx(&lc, fa_combine_gate_fp4_kernel<128, FA_COMBINE_DG, NW>,
         part_m, part_l, part_acc, out, g_fa_fp4_req.gate, g_fa_fp4_req.gate_ld, g_fa_fp4_req.dst,
         g_fa_fp4_req.sf, g_fa_fp4_req.qdim, num_q_heads, n_splits);
 }
@@ -1814,10 +1831,11 @@ void launch_fa_combine_hd256(
             reinterpret_cast<fa_block_q8_1*>(out_q8), 1, stream);
 }
 
-void fa_combine_fp4_gate_arm(const void* gate, int gate_ld, void* dst_fp4, void* dst_sf, int qdim) {
+void fa_combine_fp4_gate_arm(const void* gate, int gate_ld, void* dst_fp4, void* dst_sf, int qdim,
+                             bool pdl) {
     g_fa_fp4_req = {reinterpret_cast<const __nv_bfloat16*>(gate), gate_ld,
                     reinterpret_cast<unsigned char*>(dst_fp4), reinterpret_cast<unsigned char*>(dst_sf),
-                    qdim, true, false};
+                    qdim, true, false, pdl};
 }
 bool fa_combine_fp4_gate_taken() {
     const bool t = g_fa_fp4_req.taken;
@@ -2382,8 +2400,17 @@ void launch_flash_decode_split(
         const size_t i8_smem = (size_t)2 * 16 * 128 * sizeof(signed char)
                              + (size_t)(16 + GQA) * 128 * sizeof(float)
                              + (size_t)(16 + 16 + 128 + 128 + 16 + 16) * sizeof(float);
-        dim3 gq(num_kv_heads * ns, num_seqs);
-        fa_split_gqa_mma_i8_kernel<128, GQA><<<gq, MMA_THREADS, i8_smem, stream>>>(
+        cudaLaunchConfig_t lc = {};
+        lc.gridDim = dim3(num_kv_heads * ns, num_seqs);
+        lc.blockDim = dim3(MMA_THREADS);
+        lc.dynamicSmemBytes = i8_smem;
+        lc.stream = stream;
+        cudaLaunchAttribute la{};
+        la.id = cudaLaunchAttributeProgrammaticStreamSerialization;
+        la.val.programmaticStreamSerializationAllowed = 1;
+        lc.attrs = &la;
+        lc.numAttrs = (g_fa_fp4_req.armed && g_fa_fp4_req.pdl && !gate128 && !out_q8) ? 1 : 0;
+        cudaLaunchKernelEx(&lc, fa_split_gqa_mma_i8_kernel<128, GQA>,
             reinterpret_cast<const __nv_bfloat16*>(q), reinterpret_cast<const signed char*>(k_pool),
             reinterpret_cast<const signed char*>(v_pool), block_table, seq_lens,
             part_m, part_l, part_acc, scale, num_q_heads, num_kv_heads, block_size, max_blocks, ns,

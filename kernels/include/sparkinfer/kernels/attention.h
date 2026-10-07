@@ -169,7 +169,9 @@ void launch_flash_decode_local_hd256(
 // (gate_quant_rows' bytes: x * sigmoid(gate[row * gate_ld + col]) to e2m1 + ue4m3 scales in the
 // SFA layout, qdim columns). fa_combine_fp4_gate_taken() reports whether a combine took it, and
 // clears it either way.
-void fa_combine_fp4_gate_arm(const void* gate, int gate_ld, void* dst_fp4, void* dst_sf, int qdim);
+// `pdl` also launches the int8 split and that combine as programmatic dependents.
+void fa_combine_fp4_gate_arm(const void* gate, int gate_ld, void* dst_fp4, void* dst_sf, int qdim,
+                             bool pdl = false);
 bool fa_combine_fp4_gate_taken();
 void launch_flash_decode_split(
     const void* q, const void* k_pool, const void* v_pool,
