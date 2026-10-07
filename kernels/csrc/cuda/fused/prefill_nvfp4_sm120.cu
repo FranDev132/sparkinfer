@@ -3,6 +3,13 @@
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
+// launch_prefill_nvfp4_gemm_pdl launches the GEMM as a programmatic dependent, and CUTLASS's
+// wait_on_dependent_grids() -- the griddepcontrol.wait its producers run before their first global
+// read -- is compiled in only with this switch (arch/grid_dependency_control.h; it covers the
+// sm_120 family too). Without a programmatic dependency the wait returns at once.
+#ifndef CUTLASS_ENABLE_GDC_FOR_SM100
+#define CUTLASS_ENABLE_GDC_FOR_SM100 1
+#endif
 // arch/config.h FIRST, and specifically before float_subbyte.h. float_subbyte.h derives
 // CUDA_PTX_FP4FP6_CVT_ENABLED -- the switch that gives this translation unit the hardware FP4
 // encode instead of a software one -- from CUTLASS_ARCH_MMA_SM120A_ENABLED, and it tests that
@@ -698,6 +705,11 @@ bool prefer_transposed(int m, int n) {
     return on && m > 0 && m <= max_rows && !(n & 7);
 }
 
+// Set by launch_prefill_nvfp4_gemm_pdl for the launch it wraps: the GEMM goes out as a programmatic
+// dependent of the kernel ahead of it (CUTLASS's mainloop and epilogue producers wait on it before
+// their first global read), so its CTAs are resident and past their prologue when that kernel ends.
+bool g_gemm_pdl = false;
+
 template <class C>
 bool run_gemm(const void* a, const void* sa, const void* b, const void* sb,
               void* d, int m, int n, int k, void* ws, cudaStream_t st, float alpha,
@@ -706,7 +718,7 @@ bool run_gemm(const void* a, const void* sa, const void* b, const void* sb,
     auto ar = args<C>(a, sa, b, sb, d, m, n, k, alpha, c);
     return gemm.can_implement(ar) == cutlass::Status::kSuccess &&
            gemm.initialize(ar, ws, st) == cutlass::Status::kSuccess &&
-           gemm.run(st) == cutlass::Status::kSuccess;
+           gemm.run(st, nullptr, g_gemm_pdl) == cutlass::Status::kSuccess;
 }
 } // namespace
 
@@ -865,19 +877,29 @@ __global__ __launch_bounds__(kNormQuantThreads) void rmsnorm_quant_rows_exact(
 // of squares taken from those bf16 values in the order rmsnorm_kernel would read them back (same
 // 256-thread pack stride), and pass 3 is rmsnorm_quant_rows_exact's. Both bf16 tensors are still
 // written. The row stays in registers across the passes: cols <= 8 * 4 * 256.
-template <class Layout>
+//
+// BF: the branch is already a bf16 tensor (the block-scaled o and down GEMMs write one), and pass 1
+// is norm_then_add_reg_kernel's instead (si_fused): the branch's bf16 values as they are, the same
+// fma.rn.ftz square sum and pack order, and the same output contraction (bv * inv) * w + r.
+template <class Layout, bool BF = false>
 __global__ __launch_bounds__(kNormQuantThreads) void norm_add_norm_quant_exact(
         const __nv_bfloat16* __restrict__ residual, const int* __restrict__ acc,
+        const __nv_bfloat16* __restrict__ branch,
         const float* __restrict__ sxr, const float* __restrict__ rs,
         const __nv_bfloat16* __restrict__ w_post, float eps_post,
         __nv_bfloat16* __restrict__ out_sum, const __nv_bfloat16* __restrict__ w_pre,
         float eps_pre, __nv_bfloat16* __restrict__ out_norm, unsigned char* __restrict__ dst,
         cutlass::float_ue4m3_t* __restrict__ sf, int rows, int cols, Layout layout, int zero_acc) {
     constexpr int KP = 4;                       // packs per thread
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+    // One wave of one CTA per row: let a programmatic dependent (the GEMM that reads dst) take the
+    // idle SMs and run its prologue now. It still waits for this grid before reading anything.
+    asm volatile("griddepcontrol.launch_dependents;");
+#endif
     const int row = blockIdx.x;
     if (row >= rows) return;
     const size_t base = (size_t)row * cols;
-    const float sr = sxr[row];
+    const float sr = BF ? 0.f : sxr[row];
     __shared__ float s_warp[32];
     const int npack = cols >> 3;
     auto block_inv = [&](float ss, float eps) {
@@ -904,18 +926,24 @@ __global__ __launch_bounds__(kNormQuantThreads) void norm_add_norm_quant_exact(
     // load latency instead of one per pass; the arithmetic below is unchanged.
     const int4* a4 = reinterpret_cast<const int4*>(acc + base);
     const float4* rs4 = reinterpret_cast<const float4*>(rs);
+    const uint4* b4 = reinterpret_cast<const uint4*>(branch + base);
     const uint4* r4 = reinterpret_cast<const uint4*>(residual + base);
     const uint4* wp4 = reinterpret_cast<const uint4*>(w_post);
     const uint4* w4 = reinterpret_cast<const uint4*>(w_pre);
     int4 aq[KP][2];
     float4 sq[KP][2];
+    uint4 bq[KP];
     uint4 rq[KP], wpq[KP], wq3[KP];
     #pragma unroll
     for (int k = 0; k < KP; k++) {
         const int p = threadIdx.x + k * kNormQuantThreads;
         if (p < npack) {
-            aq[k][0] = a4[2 * p];     aq[k][1] = a4[2 * p + 1];
-            sq[k][0] = __ldg(rs4 + 2 * p); sq[k][1] = __ldg(rs4 + 2 * p + 1);
+            if constexpr (BF) {
+                bq[k] = __ldg(b4 + p);
+            } else {
+                aq[k][0] = a4[2 * p];     aq[k][1] = a4[2 * p + 1];
+                sq[k][0] = __ldg(rs4 + 2 * p); sq[k][1] = __ldg(rs4 + 2 * p + 1);
+            }
             rq[k] = __ldg(r4 + p); wpq[k] = __ldg(wp4 + p); wq3[k] = __ldg(w4 + p);
         }
     }
@@ -924,7 +952,14 @@ __global__ __launch_bounds__(kNormQuantThreads) void norm_add_norm_quant_exact(
     #pragma unroll
     for (int k = 0; k < KP; k++) {
         const int p = threadIdx.x + k * kNormQuantThreads;
-        if (p < npack) {
+        if (p < npack && BF) {
+            const __nv_bfloat16* bh = reinterpret_cast<const __nv_bfloat16*>(&bq[k]);
+            #pragma unroll
+            for (int j = 0; j < 8; j++) {
+                v[k][j] = __bfloat162float(bh[j]);
+                ss = fm_fma(v[k][j], v[k][j], ss);
+            }
+        } else if (p < npack) {
             const int ai[8] = {aq[k][0].x, aq[k][0].y, aq[k][0].z, aq[k][0].w,
                                aq[k][1].x, aq[k][1].y, aq[k][1].z, aq[k][1].w};
             const float sc[8] = {sq[k][0].x, sq[k][0].y, sq[k][0].z, sq[k][0].w,
@@ -1048,9 +1083,27 @@ bool launch_prefill_nvfp4_norm_add_norm_quant_exact(const void* residual, const 
         return false;
     auto l = sfa_layout(m,128,k);
     norm_add_norm_quant_exact<<<m,kNormQuantThreads,0,st>>>(
-        (const __nv_bfloat16*)residual, acc, sxr, rs, (const __nv_bfloat16*)w_post, eps_post,
-        (__nv_bfloat16*)out_sum, (const __nv_bfloat16*)w_pre, eps_pre, (__nv_bfloat16*)out_norm,
-        (unsigned char*)d, (cutlass::float_ue4m3_t*)sf, m, k, l, zero_acc ? 1 : 0);
+        (const __nv_bfloat16*)residual, acc, nullptr, sxr, rs, (const __nv_bfloat16*)w_post,
+        eps_post, (__nv_bfloat16*)out_sum, (const __nv_bfloat16*)w_pre, eps_pre,
+        (__nv_bfloat16*)out_norm, (unsigned char*)d, (cutlass::float_ue4m3_t*)sf, m, k, l,
+        zero_acc ? 1 : 0);
+    return cudaPeekAtLastError() == cudaSuccess;
+}
+bool launch_prefill_nvfp4_norm_add_norm_quant_bf16_exact(const void* residual, const void* branch,
+                                                          const void* w_post, float eps_post,
+                                                          void* out_sum, const void* w_pre,
+                                                          float eps_pre, void* out_norm, void* d,
+                                                          void* sf, int m, int k,
+                                                          cudaStream_t st) {
+    if (!residual || !branch || !w_post || !out_sum || !w_pre || !d || !sf ||
+        !prefill_nvfp4_supported(m,128,k) || (k & 15) || k > 8 * 4 * kNormQuantThreads)
+        return false;
+    auto l = sfa_layout(m,128,k);
+    norm_add_norm_quant_exact<decltype(l), true><<<m,kNormQuantThreads,0,st>>>(
+        (const __nv_bfloat16*)residual, nullptr, (const __nv_bfloat16*)branch, nullptr, nullptr,
+        (const __nv_bfloat16*)w_post, eps_post, (__nv_bfloat16*)out_sum,
+        (const __nv_bfloat16*)w_pre, eps_pre, (__nv_bfloat16*)out_norm, (unsigned char*)d,
+        (cutlass::float_ue4m3_t*)sf, m, k, l, 0);
     return cudaPeekAtLastError() == cudaSuccess;
 }
 bool launch_prefill_nvfp4_gate_quant_a(const void* sr, const void* g, void* d, void* sf,
@@ -1371,6 +1424,14 @@ bool launch_prefill_nvfp4_gemm(const void* a,const void* sa,const void* b,const 
                                   : run_gemm<WideEF>(a,sa,b,sb,d,m,n,k,ws,st,alpha,c);
     return prefer_narrow(m,n) ? run_gemm<Narrow>(a,sa,b,sb,d,m,n,k,ws,st,alpha,c)
                               : run_gemm<Wide>(a,sa,b,sb,d,m,n,k,ws,st,alpha,c);
+}
+bool launch_prefill_nvfp4_gemm_pdl(const void* a, const void* sa, const void* b, const void* sb,
+                                   void* d, int m, int n, int k, void* ws, cudaStream_t st,
+                                   float alpha, const void* c) {
+    g_gemm_pdl = true;
+    const bool ok = launch_prefill_nvfp4_gemm(a, sa, b, sb, d, m, n, k, ws, st, alpha, c);
+    g_gemm_pdl = false;
+    return ok;
 }
 
 // ---- HuggingFace "compressed-tensors" NVFP4 checkpoint dequant (load-time, one-shot) ----

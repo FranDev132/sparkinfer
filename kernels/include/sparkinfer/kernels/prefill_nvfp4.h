@@ -36,6 +36,15 @@ bool launch_prefill_nvfp4_norm_add_norm_quant_exact(const void* residual, const 
                                                      cudaStream_t stream = nullptr,
                                                      // write zeros back over acc[0, m*k) once read
                                                      bool zero_acc = false);
+// launch_norm_then_add (si_fused) followed by the exact fold above, in one pass and byte-identical
+// to both, for a branch that is already bf16: out_sum = residual + RMSNorm(branch) * w_post,
+// out_norm = RMSNorm(out_sum) * w_pre and its FP4 operand. k must be a multiple of 16, <= 8192.
+bool launch_prefill_nvfp4_norm_add_norm_quant_bf16_exact(const void* residual, const void* branch,
+                                                          const void* w_post, float eps_post,
+                                                          void* out_sum, const void* w_pre,
+                                                          float eps_pre, void* out_norm,
+                                                          void* dst_fp4, void* dst_sf, int m,
+                                                          int k, cudaStream_t stream = nullptr);
 // Muse's attention gate fused into the A-operand quantize: x * sigmoid(g) straight to FP4, the
 // same fold launch_prefill_gate_quant_rows_i8 does for the int8 o-projection.
 // gate_ld: row pitch of `gate` in elements, when it is a COLUMN SLICE of a wider packed
@@ -83,6 +92,13 @@ bool launch_prefill_nvfp4_gemm(const void* a_fp4, const void* sfa,
                                void* d_bf16, int m, int n, int k,
                                void* workspace, cudaStream_t stream = nullptr,
                                float alpha = 1.f, const void* c_bf16 = nullptr);
+// The same GEMM launched as a programmatic dependent of the kernel ahead of it on `stream` (PDL):
+// it waits for that kernel before its first global read, so only its launch and prologue overlap.
+bool launch_prefill_nvfp4_gemm_pdl(const void* a_fp4, const void* sfa,
+                                   const void* b_fp4, const void* sfb,
+                                   void* d_bf16, int m, int n, int k,
+                                   void* workspace, cudaStream_t stream = nullptr,
+                                   float alpha = 1.f, const void* c_bf16 = nullptr);
 
 // Scatter a compressed-tensors row-major UE4M3 scale [n, k/16] into the CUTLASS
 // SFB layout launch_prefill_nvfp4_gemm expects for B. Packed E2M1 bytes are

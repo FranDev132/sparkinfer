@@ -178,6 +178,40 @@ bool muse_norm_fp4_at(int n) {
     return on && n >= minn;
 }
 
+// Muse's sandwich norm and the pre-norm after it as one pass when the branch is bf16 (the
+// block-scaled o and down projections), as the int32-accumulator branch already runs them:
+// launch_prefill_nvfp4_norm_add_norm_quant_bf16_exact. Byte-identical; the sum is read back from
+// registers instead of from [N, H] in memory, and one launch per site goes away.
+// SPARKINFER_MUSE_SANDWICH_BF16_FOLD=0 keeps the two launches (A/B).
+bool muse_sandwich_bf16_fold_on() {
+    static const bool v = [] {
+        const char* e = getenv("SPARKINFER_MUSE_SANDWICH_BF16_FOLD");
+        return !(e && e[0] == '0');
+    }();
+    return v;
+}
+// The GEMM that reads a fused norm's FP4 operand (q|gate|k|v after the post-FFN norm, gate after
+// the post-attention one) is launched as its programmatic dependent: the norm is one wave of 128
+// CTAs on 170 SMs and triggers at once, so the GEMM's CTAs are resident and through their prologue
+// when it ends. SPARKINFER_MUSE_GEMM_PDL=0 launches it normally (A/B).
+bool muse_gemm_pdl_on() {
+    static const bool v = [] {
+        const char* e = getenv("SPARKINFER_MUSE_GEMM_PDL");
+        return !(e && e[0] == '0');
+    }();
+    return v;
+}
+// With that fold the bf16 pre-norm (hn, the next layer's xn) has no reader: the FP4 operand
+// beside it is what the next GEMM takes, and an arm that declines writes the bf16 norm itself.
+// SPARKINFER_MUSE_SANDWICH_NORM_OUT=1 writes it anyway (A/B).
+bool muse_sandwich_norm_out() {
+    static const bool v = [] {
+        const char* e = getenv("SPARKINFER_MUSE_SANDWICH_NORM_OUT");
+        return e && e[0] == '1';
+    }();
+    return v;
+}
+
 // See muse_tail_chunked in prefill_batched_run. SPARKINFER_MUSE_CHUNK_TAIL=0 restores the two
 // whole-prompt sandwich norms.
 bool muse_chunk_tail_on() {
@@ -2696,6 +2730,8 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
     // Set when the post-FFN sandwich norm already produced the next layer's xn and its FP4
     // operand (launch_prefill_nvfp4_norm_add_norm_quant_exact), so the end-of-layer norm is skipped.
     bool xn_done_early = false;
+    // ...and left the bf16 xn unwritten (its FP4 operand is the only form the next arm reads).
+    bool xn_unwritten = false;
     // qb_partials was handed back zeroed by a sandwich-norm pass (its zero_acc) and nothing has
     // written it since, so the named GEMM may skip its memset and launch programmatically behind
     // its quantize (QB_F_ZEROED | QB_F_PDL). Each is cleared at the end of the block that
@@ -3111,8 +3147,13 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                            x, w.input_norm, fp4_a, fp4_as, N, H, eps, st)
                      : xn_fp4_ready ||
                        kernels::launch_prefill_nvfp4_quant_a(xn, fp4_a, fp4_as, N, H, st)) &&
-                    kernels::launch_prefill_nvfp4_gemm(fp4_a, fp4_as, w.qkvg_fp4, w.qkvg_fp4_sf,
-                                                       fp4_qkv, N, qkvg_n, H, fp4_ws, st)) {
+                    (xn_fp4_ready && !attn_norm_deferred && muse_gemm_pdl_on()
+                     ? kernels::launch_prefill_nvfp4_gemm_pdl(fp4_a, fp4_as, w.qkvg_fp4,
+                                                             w.qkvg_fp4_sf, fp4_qkv, N, qkvg_n,
+                                                             H, fp4_ws, st)
+                     : kernels::launch_prefill_nvfp4_gemm(fp4_a, fp4_as, w.qkvg_fp4,
+                                                         w.qkvg_fp4_sf, fp4_qkv, N, qkvg_n, H,
+                                                         fp4_ws, st))) {
                     // q, k and v are NOT copied out: the QK-norm + RoPE + KV-append kernel below
                     // already reads every one of those elements, so handing it the packed pitch
                     // costs nothing and the three copies -- 2.10 MB of the 2.23 MB per layer, at
@@ -3149,8 +3190,9 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                 // reads the bf16 xn, so write it after all when that arm did not take the layer.
                 xn_fp4_ready = false;   // consumed (or not needed: xn itself is current)
                 if (!qkvg_fp4) zero_for_o = false;   // the int8 arms below write qb_partials
-                if (!qkvg_fp4 && attn_norm_deferred)
+                if (!qkvg_fp4 && (attn_norm_deferred || xn_unwritten))
                     kernels::launch_rmsnorm(x, w.input_norm, xn, N, H, eps, st);
+                xn_unwritten = false;
                 if (!qkvg_fp4 && muse_group && muse_qb && use_i8 &&
                     kernels::pfm_moe_gemm_qi8_supported(w.wq_type)) {
                     const int at = w.wq_type;
@@ -3519,6 +3561,7 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
         zero_for_o = false;
 
         bool muse_ffn_norm_fp4 = false;   // Muse: hn left unwritten, the FP4 quantize norms h itself
+        bool hn_unwritten = false;        // Muse: hn left unwritten, its FP4 operand is in fp4_a
         bool muse_tail_chunked = false;   // Muse: both sandwich norms run per FFN chunk (see below)
         int tail_rows = 0;                // rows whose post-FFN sandwich norm a chunk already ran
         const bool ffn_norm_fp4 = !c.muse_glimmer && !moe && N >= 16384 && gu_nvfp4 &&
@@ -3561,7 +3604,16 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                     kernels::launch_norm_then_add_acc(x, qb_partials, sx, w.wo_rs,
                                                       w.post_attn_norm, h, N, H, 1e-8f, st);
             } else if (!muse_tail_chunked) {
-                kernels::launch_norm_then_add(x, ao, w.post_attn_norm, h, N, H, 1e-8f, st);
+                // The block-scaled o projection left a bf16 `ao`: the same one-pass fold. hn's
+                // only reader is then gate/up's FP4 operand, so the bf16 hn is not written; the
+                // FFN writes it after all if that arm declines.
+                hn_fp4_ready = hn_exact && muse_sandwich_bf16_fold_on() &&
+                    kernels::launch_prefill_nvfp4_norm_add_norm_quant_bf16_exact(
+                        x, ao, w.post_attn_norm, 1e-8f, h, w.ffn_norm, eps,
+                        muse_sandwich_norm_out() ? hn : nullptr, fp4_a, fp4_as, N, H, st);
+                hn_unwritten = hn_fp4_ready && !muse_sandwich_norm_out();
+                if (!hn_fp4_ready)
+                    kernels::launch_norm_then_add(x, ao, w.post_attn_norm, h, N, H, 1e-8f, st);
             }
             // hn's only consumer is the grouped FFN's row-quantize, so emit the int8 in the same
             // pass. Only when one chunk covers the prompt: a second chunk would need A_i8/sx again
@@ -3907,9 +3959,13 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                      : (hn_fp4_ready && fo == 0 && fn == N) ||
                        kernels::launch_prefill_nvfp4_quant_a(
                            hn_c, fp4_a, fp4_as, fn, H, st)) &&
-                    kernels::launch_prefill_nvfp4_gemm(fp4_a, fp4_as, f4_g, f4_gs,
-                                                       ffg, fn, ffn, H, fp4_ws, st,
-                                                       f4_ga) &&
+                    (hn_fp4_ready && fo == 0 && fn == N && !muse_ffn_norm_fp4 &&
+                     !ffn_norm_fp4 && muse_gemm_pdl_on()
+                     ? kernels::launch_prefill_nvfp4_gemm_pdl(fp4_a, fp4_as, f4_g, f4_gs, ffg, fn,
+                                                             ffn, H, fp4_ws, st, f4_ga)
+                     : kernels::launch_prefill_nvfp4_gemm(fp4_a, fp4_as, f4_g, f4_gs,
+                                                         ffg, fn, ffn, H, fp4_ws, st,
+                                                         f4_ga)) &&
                     kernels::launch_prefill_nvfp4_gemm(fp4_a, fp4_as, f4_u, f4_us,
                                                        ffu, fn, ffn, H, fp4_ws, st,
                                                        f4_ua);
@@ -3974,7 +4030,7 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                     }
                     continue;
                 }
-                if (muse_ffn_norm_fp4)   // the FP4 arm declined: the arms below read the bf16 hn
+                if (muse_ffn_norm_fp4 || hn_unwritten)   // the FP4 arm declined: the arms below read the bf16 hn
                     kernels::launch_rmsnorm(h + (size_t)fo * H, w.ffn_norm, (bf16*)hn_c, fn, H,
                                             eps, st);
                 if (ffn_qi8) {
@@ -4307,7 +4363,17 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                         kernels::launch_norm_then_add_acc(h, qb_partials, sx, w.down_rs,
                                                           w.post_ffn_norm, x, N, H, 1e-8f, st);
                 } else if (tail_rows != N) {   // re-running rows a chunk already did is harmless
-                    kernels::launch_norm_then_add(h, ao, w.post_ffn_norm, x, N, H, 1e-8f, st);
+                    // The block-scaled down projection left a bf16 `ao`: the same one-pass fold.
+                    // The next layer's q|gate|k|v GEMM is xn's only reader and takes the FP4
+                    // operand, so the bf16 xn is not written (that arm writes it if it declines).
+                    xn_done_early = tail_rows == 0 && muse_sandwich_bf16_fold_on() &&
+                        xn_exact_for(nwf) &&
+                        kernels::launch_prefill_nvfp4_norm_add_norm_quant_bf16_exact(
+                            h, ao, w.post_ffn_norm, 1e-8f, x, nwf->input_norm, eps,
+                            muse_sandwich_norm_out() ? xn : nullptr, fp4_a, fp4_as, N, H, st);
+                    xn_unwritten = xn_done_early && !muse_sandwich_norm_out();
+                    if (!xn_done_early)
+                        kernels::launch_norm_then_add(h, ao, w.post_ffn_norm, x, N, H, 1e-8f, st);
                 }
             } else if (!ffn_fused && !ffn_fp4_resid && !down_resid) {
                 // x += ffn_out (skipped when the down GEMM already accumulated into x per chunk,

@@ -20,6 +20,11 @@ bool launch_prefill_nvfp4_norm_add_norm_quant_exact(const void*, const int*, con
                                                      const float*, const void*, float, void*,
                                                      const void*, float, void*, void*, void*, int,
                                                      int, cudaStream_t, bool) { return false; }
+bool launch_prefill_nvfp4_norm_add_norm_quant_bf16_exact(const void*, const void*, const void*,
+                                                          float, void*, const void*, float, void*,
+                                                          void*, void*, int, int, cudaStream_t) {
+    return false;
+}
 bool launch_prefill_nvfp4_gate_quant_a(const void*, const void*, void*, void*, int, int,
                                        cudaStream_t, int) { return false; }
 bool launch_prefill_nvfp4_swiglu_quant_a(const void*, const void*, void*, void*, int, int,
@@ -33,6 +38,10 @@ bool launch_prefill_nvfp4_quant_b_q6k(const void*, void*, void*, int, int, int, 
                                       cudaStream_t) { return false; }
 bool launch_prefill_nvfp4_gemm(const void*, const void*, const void*, const void*, void*, int, int,
                                int, void*, cudaStream_t, float, const void*) { return false; }
+bool launch_prefill_nvfp4_gemm_pdl(const void*, const void*, const void*, const void*, void*, int,
+                                   int, int, void*, cudaStream_t, float, const void*) {
+    return false;
+}
 size_t prefill_nvfp4_workspace_bytes_f32(int, int, int) { return 0; }
 bool launch_prefill_nvfp4_gemm_f32(const void*, const void*, const void*, const void*, void*, int,
                                    int, int, void*, cudaStream_t, float) { return false; }
