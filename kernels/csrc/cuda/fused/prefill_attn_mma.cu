@@ -2044,13 +2044,19 @@ bool launch_prefill_attn_mma(
 // mantissa, so P*V is evaluated as p_hi*V + p_lo*V: two mma's over the SAME V fragment, ~fp32
 // accuracy in P for 1.5x the PV work. `l` is then summed from float(p_hi)+float(p_lo) so the
 // denominator matches the numerator exactly rather than being the unrounded fp32 sum.
+// The hd128 eight-warp instantiation (Muse Glimmer's bf16-KV prompt pass) is bounded to two
+// blocks an SM. Unbounded, ptxas gave it 186 registers, so one 256-thread block held a whole SM's
+// register file and a 512-token pass (32 q-tiles x 16 head pairs = 512 blocks) ran 3.01 waves;
+// at 128 registers it spills nothing and two blocks share an SM. Muse shapes, us, alone:
+// 512 tokens 55.0 -> 39.2, 1024 166 -> 118, 2048 573 -> 409 (with the order below in both).
 template <int HEAD_DIM, int GROUP_BLKS, int RQH, bool PSPLIT, bool VINT8 = false>
-__global__ __launch_bounds__(GROUP_BLKS * 32) void pf_attn_mma_bf16_kernel(
+__global__ __launch_bounds__(GROUP_BLKS * 32, (HEAD_DIM == 128 && GROUP_BLKS == 8) ? 2 : 1)
+void pf_attn_mma_bf16_kernel(
     const __nv_bfloat16* __restrict__ q, const __nv_bfloat16* __restrict__ k_pool,
     const void* __restrict__ v_pool_raw, const __half* __restrict__ v_scale,
     const int* __restrict__ block_table,
     __nv_bfloat16* __restrict__ attn, int n_tokens, int n_q_heads, int n_kv_heads,
-    int block_size, int max_blocks_per_seq, float scale, int qld, int pld, int q_pos0) {
+    int block_size, int max_blocks_per_seq, float scale, int qld, int pld, int q_pos0, int lpt) {
     // q_pos0 is where this pass's queries START in the sequence. It was implicitly 0 while
     // prefill always ingested [0, N) in a single pass; carrying it lets a long prompt be
     // ingested in windows. Queries and outputs stay addressed by the LOCAL row, while the
@@ -2067,8 +2073,15 @@ __global__ __launch_bounds__(GROUP_BLKS * 32) void pf_attn_mma_bf16_kernel(
     constexpr int RPW   = BM / WARPS;            // softmax rows per warp
 
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, tid = threadIdx.x;
-    const int qbase = blockIdx.x * BM;
-    const int head0 = blockIdx.y * RQH;                       // first q-head this block owns
+    // Blocks go out in linear order, so a grid laid out (query tile, head group) handed the last
+    // wave the causally heaviest tiles of the last head groups -- a long tail of the most expensive
+    // blocks. Walk the linear index heaviest tile first across every head group instead (each
+    // block computes exactly what it did; only which block runs when changes). lpt = 0 keeps the
+    // grid's own order.
+    const int lin = blockIdx.x + blockIdx.y * gridDim.x;
+    const int qtile = lpt ? (int)gridDim.x - 1 - lin / (int)gridDim.y : (int)blockIdx.x;
+    const int qbase = qtile * BM;
+    const int head0 = (lpt ? lin % (int)gridDim.y : (int)blockIdx.y) * RQH;   // first q-head
     const int gqa   = n_q_heads / n_kv_heads;
     const int kvh   = head0 / gqa;                            // all RQH heads share this kv-head
     const size_t KVLD = (size_t)n_kv_heads * HEAD_DIM;
@@ -2464,6 +2477,16 @@ __global__ __launch_bounds__(GROUP_BLKS * 32) void pf_attn_mma_bf16_kernel(
     }
 }
 
+// Heaviest query tiles first (see pf_attn_mma_bf16_kernel). SPARKINFER_PREFILL_ATTN_LPT=0 keeps
+// the grid order (A/B).
+static bool attn_lpt_on() {
+    static const bool v = [] {
+        const char* e = getenv("SPARKINFER_PREFILL_ATTN_LPT");
+        return !(e && e[0] == '0');
+    }();
+    return v;
+}
+
 template <int HD, int GROUP_BLKS, int RQH, bool PSPLIT, bool VINT8 = false>
 static bool launch_attn_bf16_gqa(const void* q, const void* k_pool, const void* v_pool,
                                  const void* v_scale, const int* block_table, void* attn, int n_tokens,
@@ -2493,7 +2516,7 @@ static bool launch_attn_bf16_gqa(const void* q, const void* k_pool, const void* 
         reinterpret_cast<const __nv_bfloat16*>(q), reinterpret_cast<const __nv_bfloat16*>(k_pool),
         v_pool, reinterpret_cast<const __half*>(v_scale), block_table,
         reinterpret_cast<__nv_bfloat16*>(attn), n_tokens, n_q_heads, n_kv_heads,
-        block_size, max_blocks_per_seq, scale, qld, pld, q_pos0);
+        block_size, max_blocks_per_seq, scale, qld, pld, q_pos0, attn_lpt_on() ? 1 : 0);
     // A rejected launch (e.g. smem over the device limit) enqueues nothing; peek --
     // rather than get -- so a pre-existing sticky error is not silently cleared here.
     return cudaPeekAtLastError() == cudaSuccess;
