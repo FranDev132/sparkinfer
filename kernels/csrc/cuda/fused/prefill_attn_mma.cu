@@ -2477,6 +2477,17 @@ void pf_attn_mma_bf16_kernel(
     }
 }
 
+static int attn_sm_count() {
+    static const int n = [] {
+        int dev = 0, c = 0;
+        if (cudaGetDevice(&dev) != cudaSuccess ||
+            cudaDeviceGetAttribute(&c, cudaDevAttrMultiProcessorCount, dev) != cudaSuccess)
+            return 0;
+        return c;
+    }();
+    return n;
+}
+
 // Heaviest query tiles first (see pf_attn_mma_bf16_kernel). SPARKINFER_PREFILL_ATTN_LPT=0 keeps
 // the grid order (A/B).
 static bool attn_lpt_on() {
@@ -2676,8 +2687,16 @@ bool launch_prefill_attn_mma_bf16_muse_hd128(
             n_tokens, n_q_heads, n_kv_heads, block_size, max_blocks_per_seq, scale, stream, q_pos0)\
       : launch_attn_bf16_gqa<128, 8, RQH_, false>(q, k_pool, v_pool, nullptr, block_table, attn,  \
             n_tokens, n_q_heads, n_kv_heads, block_size, max_blocks_per_seq, scale, stream, q_pos0)))
-    if (rqh_env >= 4 && SI_MMA_MUSE_BF16_TRY(4)) return true;
-    if (rqh_env >= 2 && SI_MMA_MUSE_BF16_TRY(2)) return true;
+    // Two heads a block halve the grid. That pays from 256 tokens up, but below one block an SM
+    // (prefill@128: 8 query tiles x 16 head pairs = 128 blocks on 170 SMs) it only idles SMs, so
+    // such a pass takes one head a block: 256 blocks, 9.8 -> 8.8 us at 128 tokens, same bytes.
+    // An explicit SPARKINFER_MUSE_ATTN_BF16_RQH keeps its choice.
+    static const bool rqh_set = getenv("SPARKINFER_MUSE_ATTN_BF16_RQH") != nullptr;
+    const int qtiles = (n_tokens + 15) / 16;
+    const int rqh = (!rqh_set && rqh_env >= 2 && qtiles * (n_q_heads / 2) < attn_sm_count()) ? 1
+                                                                                           : rqh_env;
+    if (rqh >= 4 && SI_MMA_MUSE_BF16_TRY(4)) return true;
+    if (rqh >= 2 && SI_MMA_MUSE_BF16_TRY(2)) return true;
     return SI_MMA_MUSE_BF16_TRY(1);
 #undef SI_MMA_MUSE_BF16_TRY
 }
