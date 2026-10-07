@@ -17,6 +17,7 @@
 // Portable CUDA — sm_89/90/100/120, the set CMAKE_CUDA_ARCHITECTURES builds; sm_121 is excluded.
 
 #include <cuda_bf16.h>
+#include <cuda_fp8.h>
 #include <cuda_fp16.h>
 #include <climits>
 #ifndef SPARKINFER_NVRTC_DEVICE_ONLY
@@ -779,6 +780,94 @@ __global__ void fa_combine_gated_q8_kernel(
         if (lane == 0) out_q8[blk].ds = __floats2half2_rn(d, d * (float)ssum);
     }
 }
+
+// The ungated combine with the o projection's gated FP4 A operand written in its tail instead of
+// the bf16 output: gate_quant_rows (si_nvfp4) over the value this kernel would have stored, so the
+// packed step's separate gate-quantize launch and its re-read of the attention tile go away.
+// Bytes are gate_quant_rows': x = bf16(bf16(acc*inv) / (1 + __expf(-g))) with an IEEE divide (that
+// translation unit is not fast-math), the 16-value max-abs, the ue4m3 scale fmax(a/6, 2^-9), and the
+// e2m1 code of x / scale, nearest-even, packed low nibble first. hd128 with DG == 4, so warp 0's 32
+// lanes hold 32 consecutive dims: two scale groups of 16 lanes each.
+__device__ __forceinline__ unsigned fa_e2m1_rn(float v) {
+    const float a = fabsf(v);
+    if (a != a) return 7u;
+    const unsigned c = a <= 0.25f ? 0u : a < 0.75f ? 1u : a <= 1.25f ? 2u : a < 1.75f ? 3u
+                     : a <= 2.5f  ? 4u : a < 3.5f  ? 5u : a <= 5.f   ? 6u : 7u;
+    return c | ((__float_as_uint(v) >> 28) & 8u);
+}
+template <int HEAD_DIM, int DG, int NW>
+__global__ void fa_combine_gate_fp4_kernel(
+    const float* __restrict__ part_m, const float* __restrict__ part_l,
+    const float* __restrict__ part_acc, __nv_bfloat16* __restrict__ out,
+    const __nv_bfloat16* __restrict__ gate, int gate_ld,
+    unsigned char* __restrict__ dst, unsigned char* __restrict__ sf, int qdim,
+    int num_q_heads, int n_splits
+) {
+    static_assert(HEAD_DIM == 32 * DG, "one value per lane");
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+    asm volatile("griddepcontrol.launch_dependents;");   // the o GEMM reading dst (it waits)
+#endif
+    const int seq = blockIdx.y, qh = blockIdx.x / DG, dg = blockIdx.x % DG;
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int idxbase = (seq * num_q_heads + qh) * n_splits;
+    const int doff = dg * (HEAD_DIM / DG) + lane;
+    float lm = -1e30f;
+    for (int s = warp; s < n_splits; s += NW) lm = fmaxf(lm, part_m[idxbase + s]);
+    float ll = 0.f, lacc = 0.f;
+    for (int s = warp; s < n_splits; s += NW) {
+        const float sc = __expf(part_m[idxbase + s] - lm);
+        ll += part_l[idxbase + s] * sc;
+        lacc += sc * part_acc[(size_t)(idxbase + s) * HEAD_DIM + doff];
+    }
+    __shared__ float s_m[NW], s_l[NW], s_acc[NW][32];
+    if (lane == 0) { s_m[warp] = lm; s_l[warp] = ll; }
+    s_acc[warp][lane] = lacc;
+    __syncthreads();
+    if (warp != 0) return;
+    float gm = -1e30f;
+    #pragma unroll
+    for (int w = 0; w < NW; w++) gm = fmaxf(gm, s_m[w]);
+    float gl = 0.f, acc = 0.f;
+    #pragma unroll
+    for (int w = 0; w < NW; w++) {
+        const float sc = __expf(s_m[w] - gm);
+        gl += s_l[w] * sc;
+        acc += sc * s_acc[w][lane];
+    }
+    const float inv = (gl > 0.f) ? (1.f / gl) : 0.f;
+    const __nv_bfloat16 sb = __float2bfloat16(acc * inv);
+    out[(size_t)(seq * num_q_heads + qh) * HEAD_DIM + doff] = sb;     // still stored, as before
+    const float sv = __bfloat162float(sb);
+    const int col = qh * HEAD_DIM + doff;
+    const float g = __bfloat162float(gate[(size_t)seq * gate_ld + col]);
+    float den;
+    asm("add.rn.f32 %0, %1, %2;" : "=f"(den) : "f"(1.f), "f"(__expf(-g)));
+    const float x = __bfloat162float(__float2bfloat16(__fdiv_rn(sv, den)));
+    float a = fabsf(x);
+    #pragma unroll
+    for (int d = 8; d; d >>= 1) a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, d));
+    const __nv_fp8_storage_t q8 = __nv_cvt_float_to_fp8(fmaxf(a * (1.f / 6.f), 0x1p-9f),
+                                                        __NV_SATFINITE, __NV_E4M3);
+    const float qsf = __half2float(__half(__nv_cvt_fp8_to_halfraw(q8, __NV_E4M3)));
+    const unsigned code = fa_e2m1_rn(__fdiv_rn(x, qsf));
+    const unsigned hi = __shfl_down_sync(0xffffffffu, code, 1);
+    const size_t e = (size_t)seq * qdim + col;
+    if (!(lane & 1)) dst[e >> 1] = (unsigned char)(code | (hi << 4));
+    if ((lane & 15) == 0) {
+        const int r = seq, gi = col >> 4, ng = qdim >> 4;
+        const size_t off = ((size_t)(r >> 7) * (size_t)(ng >> 2) + (size_t)(gi >> 2)) * 512 +
+                           (size_t)((r & 31) * 16 + ((r >> 5) & 3) * 4 + (gi & 3));
+        sf[off] = (unsigned char)q8;
+    }
+}
+
+// One-shot request for the next hd128 combine: write the gated FP4 operand (above) instead of the
+// bf16 output. Armed by fa_combine_fp4_gate_arm, consumed by fa_launch_combine_dispatch, and the
+// caller asks fa_combine_fp4_gate_taken afterwards; a launch that never reached the combine leaves
+// it untaken and the caller quantizes the bf16 output itself.
+struct FaFp4GateReq { const __nv_bfloat16* gate; int gate_ld; unsigned char* dst; unsigned char* sf;
+                      int qdim; bool armed, taken; };
+static FaFp4GateReq g_fa_fp4_req = {};
 
 #ifndef FA_COMBINE_DG
 #define FA_COMBINE_DG 4     // head-dim groups (DG x blocks); sweepable
@@ -1637,11 +1726,31 @@ static inline void fa_launch_combine_gated_dispatch(
     else                      fa_launch_combine_gated<FA_COMBINE_NW>(part_m, part_l, part_acc, out, gate, num_q_heads, n_splits, out_q8, num_seqs, stream);
 }
 
+template <int NW>
+static inline void fa_launch_combine_gate_fp4(
+    const float* part_m, const float* part_l, const float* part_acc, __nv_bfloat16* out,
+    int num_q_heads, int n_splits, int num_seqs, cudaStream_t stream
+) {
+    dim3 g(num_q_heads * FA_COMBINE_DG, num_seqs);
+    fa_combine_gate_fp4_kernel<128, FA_COMBINE_DG, NW><<<g, NW * 32, 0, stream>>>(
+        part_m, part_l, part_acc, out, g_fa_fp4_req.gate, g_fa_fp4_req.gate_ld, g_fa_fp4_req.dst,
+        g_fa_fp4_req.sf, g_fa_fp4_req.qdim, num_q_heads, n_splits);
+}
+
 static inline void fa_launch_combine_dispatch(
     const float* part_m, const float* part_l, const float* part_acc,
     __nv_bfloat16* out, int num_q_heads, int n_splits, fa_block_q8_1* out_q8,
     int num_seqs, cudaStream_t stream
 ) {
+    if (g_fa_fp4_req.armed && !out_q8 && FA_COMBINE_DG * 32 == 128 &&
+        g_fa_fp4_req.qdim == num_q_heads * 128) {
+        g_fa_fp4_req.armed = false;
+        g_fa_fp4_req.taken = true;
+        if (n_splits >= 128)      fa_launch_combine_gate_fp4<16>(part_m, part_l, part_acc, out, num_q_heads, n_splits, num_seqs, stream);
+        else if (n_splits >= 64)  fa_launch_combine_gate_fp4<8>(part_m, part_l, part_acc, out, num_q_heads, n_splits, num_seqs, stream);
+        else                      fa_launch_combine_gate_fp4<FA_COMBINE_NW>(part_m, part_l, part_acc, out, num_q_heads, n_splits, num_seqs, stream);
+        return;
+    }
     if (n_splits >= 128)      fa_launch_combine<16>(part_m, part_l, part_acc, out, num_q_heads, n_splits, out_q8, num_seqs, stream);
     else if (n_splits >= 64)  fa_launch_combine<8>(part_m, part_l, part_acc, out, num_q_heads, n_splits, out_q8, num_seqs, stream);
     else                      fa_launch_combine<FA_COMBINE_NW>(part_m, part_l, part_acc, out, num_q_heads, n_splits, out_q8, num_seqs, stream);
@@ -1703,6 +1812,17 @@ void launch_fa_combine_hd256(
         fa_launch_combine_dispatch_hd256(part_m, part_l, part_acc,
             reinterpret_cast<__nv_bfloat16*>(out), num_q_heads, n_splits,
             reinterpret_cast<fa_block_q8_1*>(out_q8), 1, stream);
+}
+
+void fa_combine_fp4_gate_arm(const void* gate, int gate_ld, void* dst_fp4, void* dst_sf, int qdim) {
+    g_fa_fp4_req = {reinterpret_cast<const __nv_bfloat16*>(gate), gate_ld,
+                    reinterpret_cast<unsigned char*>(dst_fp4), reinterpret_cast<unsigned char*>(dst_sf),
+                    qdim, true, false};
+}
+bool fa_combine_fp4_gate_taken() {
+    const bool t = g_fa_fp4_req.taken;
+    g_fa_fp4_req = {};
+    return t;
 }
 
 void launch_flash_decode_split(

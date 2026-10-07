@@ -315,8 +315,47 @@ struct MmaEvictFirstB : Base {
     }
 };
 
+// The first PF_K k-tiles of this CTA's A tile (and its scales) prefetched into L2 from load_init,
+// which every thread runs before the kernel's programmatic wait. Launched as a programmatic
+// dependent (launch_prefill_nvfp4_gemm_pdl), the CTA is resident while the kernel ahead of it
+// still runs -- a packed decode step's norms, attention and quantizers, which leave DRAM idle --
+// so its first weight tiles stream in during that kernel instead of after it. Only A (the
+// weights in the transposed decode GEMM) is touched: it never depends on the kernel ahead. CTA l
+// prefetches M tile l, so a one-wave grid covers every tile once whatever its raster order. A
+// prefetch is a cache hint and changes no value.
+template <class Base, int PF_K>
+struct MmaPrefetchA : Base {
+    using Base::Base;
+    using typename Base::Params;
+
+    template <class ProblemShape_MNKL>
+    CUTLASS_DEVICE auto load_init(ProblemShape_MNKL const& problem_shape_MNKL,
+                                  Params const& params) const {
+        auto inputs = Base::load_init(problem_shape_MNKL, params);
+        if (threadIdx.x == 0) {
+            using cute::_;
+            auto gA_mkl = cute::get<0>(inputs);
+            auto gSFA_mkl = cute::get<2>(inputs);
+            const int m_tiles = int(cute::size<2>(gA_mkl));
+            const int tile = int(blockIdx.x + blockIdx.y * gridDim.x);
+            if (tile < m_tiles) {
+                auto tma_a = params.tma_load_a.get_slice(0);
+                auto tma_sfa = params.tma_load_sfa.get_slice(0);
+                Tensor tAgA = tma_a.partition_S(gA_mkl(_,_,tile,_,0));
+                Tensor tAgSFA = tma_sfa.partition_S(gSFA_mkl(_,_,tile,_,0));
+                const int kt = int(cute::size<3>(tAgA)) < PF_K ? int(cute::size<3>(tAgA)) : PF_K;
+                for (int k = 0; k < kt; ++k) {
+                    cute::prefetch(params.tma_load_a, tAgA(_,_,_,k));
+                    cute::prefetch(params.tma_load_sfa, tAgSFA(_,_,_,k));
+                }
+            }
+        }
+        return inputs;
+    }
+};
+
 template <class TileShape, bool EvictFirstB = false, class ElemD = BF,
-          class LayoutCD = cutlass::layout::RowMajor>
+          class LayoutCD = cutlass::layout::RowMajor, int PF_K = 0>
 struct Cfg {
     // Alignment is 128 bits / sizeof(element): 8 for bf16, 4 for float.
     static constexpr int kAlignD = 16 / (int)sizeof(ElemD);
@@ -332,7 +371,9 @@ struct Cfg {
         cutlass::gemm::collective::StageCountAutoCarveout<
             static_cast<int>(sizeof(typename Epilogue::SharedStorage))>,
         cutlass::gemm::collective::KernelScheduleAuto>::CollectiveOp;
-    using MainloopSel = cute::conditional_t<EvictFirstB, MmaEvictFirstB<Mainloop>, Mainloop>;
+    using MainloopSel = cute::conditional_t<
+        EvictFirstB, MmaEvictFirstB<Mainloop>,
+        cute::conditional_t<(PF_K > 0), MmaPrefetchA<Mainloop, PF_K>, Mainloop>>;
     using Kernel = cutlass::gemm::kernel::GemmUniversal<
         Shape<int, int, int, int>, MainloopSel, Epilogue, void>;
     using Gemm = cutlass::gemm::device::GemmUniversalAdapter<Kernel>;
@@ -411,6 +452,11 @@ using WideN256 = Cfg<Shape<_128, _256, _128>>;
 // the 16-wide tile simply runs two N tiles, which doubles the grid and still wins.
 // SPARKINFER_NVFP4_TRANSPOSED_NTILE=64 restores the wider tile for an A/B out of one binary.
 using NarrowT = Cfg<Shape<_128, _16, _256>, false, BF, cutlass::layout::ColumnMajor>;
+// The same with its first four weight k-tiles (64 KB a CTA) prefetched ahead of the programmatic
+// wait (MmaPrefetchA). Packed Muse Glimmer decode, cb @c4 / @c8 over the plain tile: 2 k-tiles
+// +1.4 / +1.6%, 4 +1.7 / +1.8%, 8 +0.9 / +1.3% -- past the window of the kernel ahead, the extra
+// requests only queue in front of the GEMM's own.
+using NarrowTP = Cfg<Shape<_128, _16, _256>, false, BF, cutlass::layout::ColumnMajor, 4>;
 using NarrowT64 = Cfg<Shape<_128, _64, _256>, false, BF, cutlass::layout::ColumnMajor>;
 // M is the axis that pays (256x128 beat 128x128 by 6.7% at m=16384 while 128x256 lost 14%), so
 // probe further up it. K stays >=128: at 64 the mainloop has too few elements per stage to cover
@@ -867,6 +913,11 @@ __global__ void gate_quant_rows(const __nv_bfloat16* __restrict__ src,
                                 const __nv_bfloat16* __restrict__ gate,
                                 unsigned char* dst, cutlass::float_ue4m3_t* sf,
                                 int rows, int cols, Layout layout, int gate_ld) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+    // A programmatic dependent (the block-scaled GEMM reading dst) may launch once every CTA here
+    // has issued this; it still waits for the whole grid before its first global read.
+    asm volatile("griddepcontrol.launch_dependents;");
+#endif
     constexpr int V = 16, LPG = V / 2;
     const int glane = threadIdx.x & (LPG - 1);
     const int groups = rows * (cols / V);
@@ -960,6 +1011,11 @@ template <int LPG_, class Layout>
 __global__ void swiglu_il_quant_rows(const __nv_bfloat16* __restrict__ gu,
                                      unsigned char* dst, cutlass::float_ue4m3_t* sf,
                                      int rows, int cols, Layout layout) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+    // A programmatic dependent (the block-scaled GEMM reading dst) may launch once every CTA here
+    // has issued this; it still waits for the whole grid before its first global read.
+    asm volatile("griddepcontrol.launch_dependents;");
+#endif
     constexpr int LPG = LPG_, VPL = 16 / LPG, V = 16;
     const int glane = threadIdx.x & (LPG - 1);
     const int groups = rows * (cols / V);
@@ -1525,6 +1581,11 @@ __global__ __launch_bounds__(1024) void muse_tail_fp4_exact(
         si_q8_blk* __restrict__ out_q8, unsigned char* __restrict__ dst,
         cutlass::float_ue4m3_t* __restrict__ sf, int cols, float post_eps, float eps,
         Layout layout) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+    // A programmatic dependent (the block-scaled GEMM reading dst) may launch once every CTA here
+    // has issued this; it still waits for the whole grid before its first global read.
+    asm volatile("griddepcontrol.launch_dependents;");
+#endif
     const int row = blockIdx.x;
     const size_t base = (size_t)row * cols;
     const int npack = cols >> 3;
@@ -2122,9 +2183,17 @@ bool launch_prefill_nvfp4_gemm(const void* a,const void* sa,const void* b,const 
             const char* e = getenv("SPARKINFER_NVFP4_TRANSPOSED_NTILE");
             return e && atoi(e) == 64;
         }();
+        // A programmatic launch prefetches its first weight tiles while the kernel ahead still
+        // runs (NarrowTP). SPARKINFER_NVFP4_TRANSPOSED_PF=0 keeps the plain tile (A/B).
+        static const bool pf_on = [] {
+            const char* e = getenv("SPARKINFER_NVFP4_TRANSPOSED_PF");
+            return !(e && e[0] == '0');
+        }();
         if (wide_ntile) {
             if (run_gemm<NarrowT64>(b,sb,a,sa,d,n,m,k,ws,st,alpha,c)) return true;
-        } else if (run_gemm<NarrowT>(b,sb,a,sa,d,n,m,k,ws,st,alpha,c)) return true;
+        } else if (g_gemm_pdl && pf_on ? run_gemm<NarrowTP>(b,sb,a,sa,d,n,m,k,ws,st,alpha,c)
+                                       : run_gemm<NarrowT>(b,sb,a,sa,d,n,m,k,ws,st,alpha,c))
+            return true;
     }
     if (prefer_n256(m,n) && run_gemm<WideN256>(a,sa,b,sb,d,m,n,k,ws,st,alpha,c)) return true;
     if (use_ef)

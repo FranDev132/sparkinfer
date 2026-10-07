@@ -195,6 +195,18 @@ bool muse_sandwich_bf16_fold_on() {
 // it just stored: byte-identical, one launch fewer at each of the two tails a layer. Only while
 // the tail runs its default 1024-thread register path, which that kernel reproduces.
 // SPARKINFER_MUSE_TAIL_FP4=0 keeps the separate quantize (A/B).
+// The packed step's block-scaled GEMMs launch as programmatic dependents of the kernel that just
+// wrote their FP4 operand (the FP4 tail, the gate quantize, the interleaved SwiGLU quantize), which
+// trigger at their start: the GEMM's CTAs come up and run their prologue on the SMs those small
+// grids leave, and CUTLASS's producers wait for them before any global read.
+// SPARKINFER_MUSE_PACKED_PDL=0 launches them normally (A/B).
+bool muse_packed_pdl_on() {
+    static const bool v = [] {
+        const char* e = getenv("SPARKINFER_MUSE_PACKED_PDL");
+        return !(e && e[0] == '0');
+    }();
+    return v;
+}
 bool muse_tail_fp4_on() {
     static const bool v = [] {
         const char* e = getenv("SPARKINFER_MUSE_TAIL_FP4");
@@ -6738,8 +6750,13 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
                     kernels::prefill_nvfp4_supported(Ng, qkvg_n, H) &&
                     (xn_fp4_given ||
                      kernels::launch_prefill_nvfp4_quant_a(xn, fp4_a, fp4_asf, Ng, H, st)) &&
-                    kernels::launch_prefill_nvfp4_gemm(fp4_a, fp4_asf, w.qkvg_fp4, w.qkvg_fp4_sf,
-                                                       fp4_qkv, Ng, qkvg_n, H, fp4_ws, st)) {
+                    (xn_fp4_given && muse_packed_pdl_on()
+                     ? kernels::launch_prefill_nvfp4_gemm_pdl(fp4_a, fp4_asf, w.qkvg_fp4,
+                                                             w.qkvg_fp4_sf, fp4_qkv, Ng, qkvg_n,
+                                                             H, fp4_ws, st)
+                     : kernels::launch_prefill_nvfp4_gemm(fp4_a, fp4_asf, w.qkvg_fp4,
+                                                         w.qkvg_fp4_sf, fp4_qkv, Ng, qkvg_n, H,
+                                                         fp4_ws, st))) {
                     // With an int8 cache the fused QK-norm reads q/k/v from the packed rows and
                     // writes the normed q to qb, and the FP4 o quantize reads the gate columns:
                     // nothing reads the four tight copies the unpack would make.
@@ -6884,6 +6901,17 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
             void* attn_q8 = attn_gq8 ? q81 : nullptr;
             const void* attn_gate = attn_gq8 ? static_cast<const void*>(qg) : nullptr;
             const int gq8_hd128 = attn_gq8 ? 1 : 0;
+            // The FP4 o arm's gate quantize rides the attention combine (fa_combine_fp4_gate_arm):
+            // same bytes, one launch and one pass over the attention tile fewer. Taken or not is
+            // read back below; an untaken request falls through to the standalone quantize.
+            // SPARKINFER_MUSE_PACKED_GATE_COMBINE=0 keeps the standalone quantize (A/B).
+            static const bool gate_combine = [] {
+                const char* e = getenv("SPARKINFER_MUSE_PACKED_GATE_COMBINE");
+                return !(e && e[0] == '0'); }();
+            if (gate_combine && wo_want_fp4 && !attn_gq8)
+                kernels::fa_combine_fp4_gate_arm(qkv_in_place ? fp4_qkv + qdim : qg,
+                                                 qkv_in_place ? qkvg_n : qdim, fp4_a, fp4_asf,
+                                                 qdim);
             if (w.swa) {
                 kernels::launch_flash_decode_split(
                     qb, kp, vp, swa_vtbl, swa_vlen, att, fa_m, fa_l, fa_acc,
@@ -6901,14 +6929,19 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
             // The o projection through the block-scaled FP4 copy prefill already holds, with the
             // gate folded into its quantize, instead of the Q4_K mma rows. Rows past N are scratch.
             // SPARKINFER_MUSE_PACKED_WO_MIN_ROWS=33 restores the Q4_K projection.
+            const bool gate_q_done = kernels::fa_combine_fp4_gate_taken();
             const bool wo_fp4_done = wo_want_fp4 &&
-                (qkv_in_place
-                 ? kernels::launch_prefill_nvfp4_gate_quant_a(att, fp4_qkv + qdim, fp4_a, fp4_asf,
-                                                              Ng, qdim, st, qkvg_n)
-                 : kernels::launch_prefill_nvfp4_gate_quant_a(att, qg, fp4_a, fp4_asf, Ng, qdim,
-                                                              st)) &&
-                kernels::launch_prefill_nvfp4_gemm(fp4_a, fp4_asf, wo4, wo4_sf,
-                                                   ao, Ng, H, qdim, fp4_ws, st);
+                (gate_q_done ||
+                 (qkv_in_place
+                  ? kernels::launch_prefill_nvfp4_gate_quant_a(att, fp4_qkv + qdim, fp4_a,
+                                                               fp4_asf, Ng, qdim, st, qkvg_n)
+                  : kernels::launch_prefill_nvfp4_gate_quant_a(att, qg, fp4_a, fp4_asf, Ng,
+                                                               qdim, st))) &&
+                (muse_packed_pdl_on()
+                 ? kernels::launch_prefill_nvfp4_gemm_pdl(fp4_a, fp4_asf, wo4, wo4_sf, ao, Ng, H,
+                                                         qdim, fp4_ws, st)
+                 : kernels::launch_prefill_nvfp4_gemm(fp4_a, fp4_asf, wo4, wo4_sf,
+                                                     ao, Ng, H, qdim, fp4_ws, st));
             if (!wo_fp4_done) {
                 if (!attn_gq8)
                     kernels::launch_qwen36_mul_sigmoid(att, qg, N * qdim, st);
@@ -6974,15 +7007,25 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
                 gu_gemm =
                     (hn_fp4_pk ||
                      kernels::launch_prefill_nvfp4_quant_a(hn, fp4_a, fp4_asf, Ng, H, st)) &&
-                    kernels::launch_prefill_nvfp4_gemm(fp4_a, fp4_asf, w.gate_fp4, w.gate_fp4_sf,
-                                                       packed_gu_buf, Ng, 2 * ffn, H, fp4_ws, st,
-                                                       w.gate_fp4_alpha);
+                    (hn_fp4_pk && muse_packed_pdl_on()
+                     ? kernels::launch_prefill_nvfp4_gemm_pdl(fp4_a, fp4_asf, w.gate_fp4,
+                                                             w.gate_fp4_sf, packed_gu_buf, Ng,
+                                                             2 * ffn, H, fp4_ws, st,
+                                                             w.gate_fp4_alpha)
+                     : kernels::launch_prefill_nvfp4_gemm(fp4_a, fp4_asf, w.gate_fp4,
+                                                         w.gate_fp4_sf, packed_gu_buf, Ng, 2 * ffn,
+                                                         H, fp4_ws, st, w.gate_fp4_alpha));
                 if (gu_gemm && dn4 && dn4_sf)
                     dn_gemm =
                         kernels::launch_prefill_nvfp4_swiglu_il_quant_a(packed_gu_buf, fp4_a,
                                                                         fp4_asf, Ng, ffn, st) &&
-                        kernels::launch_prefill_nvfp4_gemm(fp4_a, fp4_asf, dn4, dn4_sf, routed, Ng,
-                                                           H, ffn, fp4_ws, st, w.down_fp4_alpha);
+                        (muse_packed_pdl_on()
+                         ? kernels::launch_prefill_nvfp4_gemm_pdl(fp4_a, fp4_asf, dn4, dn4_sf,
+                                                                 routed, Ng, H, ffn, fp4_ws, st,
+                                                                 w.down_fp4_alpha)
+                         : kernels::launch_prefill_nvfp4_gemm(fp4_a, fp4_asf, dn4, dn4_sf, routed,
+                                                             Ng, H, ffn, fp4_ws, st,
+                                                             w.down_fp4_alpha));
                 // The fp16 Q4_K down reads SwiGLU of the interleaved output itself; the other arms
                 // get it split into sg/su.
                 if (gu_gemm && !dn_gemm && muse_f16 && w.down_qtype == 12)

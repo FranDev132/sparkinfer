@@ -165,6 +165,12 @@ void launch_flash_decode_local_hd256(
 //   part_acc:      [num_seqs*num_q_heads*n_splits*head_dim] (fp32 scratch)
 // out_q8 (optional): when non-null, the combine also emits Q8_1(out) into it (one si_block_q8_1
 // per 32 attn dims), so the O-projection MMVQ can skip its standalone attn-quantize node.
+// One-shot: the next hd128 split-K combine also writes the o projection's gated FP4 A operand
+// (gate_quant_rows' bytes: x * sigmoid(gate[row * gate_ld + col]) to e2m1 + ue4m3 scales in the
+// SFA layout, qdim columns). fa_combine_fp4_gate_taken() reports whether a combine took it, and
+// clears it either way.
+void fa_combine_fp4_gate_arm(const void* gate, int gate_ld, void* dst_fp4, void* dst_sf, int qdim);
+bool fa_combine_fp4_gate_taken();
 void launch_flash_decode_split(
     const void* q, const void* k_pool, const void* v_pool,
     const int* block_table, const int* seq_lens, void* out,
