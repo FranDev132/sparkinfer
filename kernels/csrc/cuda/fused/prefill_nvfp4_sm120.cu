@@ -143,7 +143,7 @@ struct MmaEvictFirstB : Base {
 };
 
 template <class TileShape, bool EvictFirstB = false, class ElemD = BF,
-          class LayoutCD = cutlass::layout::RowMajor>
+          class LayoutCD = cutlass::layout::RowMajor, class Scheduler = void>
 struct Cfg {
     // Alignment is 128 bits / sizeof(element): 8 for bf16, 4 for float.
     static constexpr int kAlignD = 16 / (int)sizeof(ElemD);
@@ -161,7 +161,7 @@ struct Cfg {
         cutlass::gemm::collective::KernelScheduleAuto>::CollectiveOp;
     using MainloopSel = cute::conditional_t<EvictFirstB, MmaEvictFirstB<Mainloop>, Mainloop>;
     using Kernel = cutlass::gemm::kernel::GemmUniversal<
-        Shape<int, int, int, int>, MainloopSel, Epilogue, void>;
+        Shape<int, int, int, int>, MainloopSel, Epilogue, Scheduler>;
     using Gemm = cutlass::gemm::device::GemmUniversalAdapter<Kernel>;
 };
 
@@ -188,6 +188,9 @@ using NarrowEF = Cfg<Shape<_128, _64, _256>, true>;
 // -- and non-power-of-two tiles fail cute's stride-divisibility and the epilogue's
 // MMA_TILE_M | EPI_TILE_M check, so 256x128x128 is the reachable optimum.
 using BigM = Cfg<Shape<_256, _128, _128>, true>;
+// The same tile on CUTLASS's stream-K scheduler (deterministic reduction): see prefer_bigm_sk.
+using BigMSK = Cfg<Shape<_256, _128, _128>, true, BF, cutlass::layout::RowMajor,
+                   cutlass::gemm::StreamKScheduler>;
 // Same wide tile, float output. The LM head is the one GEMM in this runtime whose destination is
 // the logit buffer rather than an activation, and logits are float: rounding them to bf16 would
 // put ties into argmax that the Q4_K head it replaces does not have.
@@ -644,6 +647,28 @@ bool prefer_narrow(int m, int n) {
 // It is expressed against the SM count rather than a literal n so it carries to another part.
 // Above this batch width the tile is not selected at all: from m=64 the M dimension is no longer
 // mostly padding and the tilings already tuned for prefill are the right ones.
+// The 256x128 tile runs a long-K GEMM at the tensor cores' rate per SM, but at prefill@512 Muse's
+// down projection (n=6656, k=19968) is 2 x 52 = 104 tiles: one wave on 104 of 170 SMs. Stream-K
+// hands the 66 idle SMs part of every tile's K range and reduces the partials in a fixed order.
+// Measured on RTX 5090 (graph replay, us), BigM -> stream-K: down m=512 133.5 -> 118.8, m=1024
+// 304.2 -> 221.4, m=2048 449.6 -> 417.8, but m=4096 739.7 -> 801.0; the shorter-K GEMMs lose
+// at every m (o 32.0 -> 41.4, q|gate|k|v 50.2 -> 61.7, gate/up 106.6 -> 122.6 at m=512). So
+// only K >= SPARKINFER_NVFP4_BIGM_SK_MINK (18432: Muse's down) and grids up to 1.25 waves.
+// SPARKINFER_NVFP4_BIGM_SK=0 keeps the persistent scheduler (A/B).
+int bigm_sk_max_tiles() { return sm_count() + sm_count() / 4; }
+bool prefer_bigm_sk(int m, int n, int k) {
+    static const bool on = [] {
+        const char* e = getenv("SPARKINFER_NVFP4_BIGM_SK");
+        return !e || atoi(e) != 0;
+    }();
+    static const int mink = [] {
+        const char* e = getenv("SPARKINFER_NVFP4_BIGM_SK_MINK");
+        return e ? atoi(e) : 18432;
+    }();
+    const long tiles = (long)((m + 255) / 256) * ((n + 127) / 128);
+    return on && m >= 512 && k >= mink && tiles <= bigm_sk_max_tiles();
+}
+
 bool prefer_n256(int m, int n) {
     static const bool on = [] {
         const char* e = getenv("SPARKINFER_NVFP4_N256_TILE");
@@ -720,6 +745,26 @@ bool run_gemm(const void* a, const void* sa, const void* b, const void* sb,
            gemm.initialize(ar, ws, st) == cutlass::Status::kSuccess &&
            gemm.run(st, nullptr, g_gemm_pdl) == cutlass::Status::kSuccess;
 }
+
+using SkParams = cutlass::gemm::kernel::detail::PersistentTileSchedulerSm90StreamKParams;
+template <class C>
+typename C::Gemm::Arguments args_sk(const void* a, const void* sa, const void* b, const void* sb,
+                                    void* d, int m, int n, int k, float alpha, const void* c) {
+    auto ar = args<C>(a, sa, b, sb, d, m, n, k, alpha, c);
+    ar.scheduler.decomposition_mode = SkParams::DecompositionMode::StreamK;
+    ar.scheduler.reduction_mode = SkParams::ReductionMode::Deterministic;
+    return ar;
+}
+template <class C>
+bool run_gemm_sk(const void* a, const void* sa, const void* b, const void* sb,
+                 void* d, int m, int n, int k, void* ws, cudaStream_t st, float alpha,
+                 const void* c) {
+    typename C::Gemm gemm;
+    auto ar = args_sk<C>(a, sa, b, sb, d, m, n, k, alpha, c);
+    return gemm.can_implement(ar) == cutlass::Status::kSuccess &&
+           gemm.initialize(ar, ws, st) == cutlass::Status::kSuccess &&
+           gemm.run(st, nullptr, g_gemm_pdl) == cutlass::Status::kSuccess;
+}
 } // namespace
 
 bool prefill_nvfp4_supported(int m, int n, int k) {
@@ -760,7 +805,19 @@ size_t prefill_nvfp4_workspace_bytes(int m, int n, int k) {
     if (tw64 > tw) tw = tw64;
     size_t r = w > nw ? w : nw;
     if (n2 > r) r = n2;
-    return r > tw ? r : tw;
+    if (tw > r) r = tw;
+    // Stream-K partials: sized for the largest m <= this one that takes the stream-K arm, since
+    // the buffer is reserved at the pass's widest chunk and a shorter last chunk may take it.
+    if (nvfp4_big_tile()) {
+        int msk = m;
+        while (msk >= 512 && !prefer_bigm_sk(msk, n, k)) msk -= 256;
+        if (msk >= 512) {
+            const size_t sk = BigMSK::Gemm::get_workspace_size(
+                args_sk<BigMSK>(nullptr,nullptr,nullptr,nullptr,nullptr,msk,n,k,1.f,nullptr));
+            if (sk > r) r = sk;
+        }
+    }
+    return r;
 }
 // RMSNorm + FP4 A-operand quantize in one pass that reproduces the two-kernel path BYTE FOR BYTE:
 // launch_rmsnorm (si_fused, built with --use_fast_math) writing the bf16 norm, then quant_rows_t
@@ -1404,6 +1461,8 @@ bool launch_prefill_nvfp4_gemm(const void* a,const void* sa,const void* b,const 
     // implement the shape.
     const int big = nvfp4_big_tile();
     if (big && m >= 512) {
+        if (prefer_bigm_sk(m,n,k) && run_gemm_sk<BigMSK>(a,sa,b,sb,d,m,n,k,ws,st,alpha,c))
+            return true;
         if (run_gemm<BigM>(a,sa,b,sb,d,m,n,k,ws,st,alpha,c)) return true;
 
     }
