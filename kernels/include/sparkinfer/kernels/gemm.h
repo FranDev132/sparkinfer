@@ -263,6 +263,9 @@ bool launch_mmvq_q4k_f16_rows2(const void* x, const void* W1, const void* W2, vo
 // projection straight from its gate/up planes. bf16 output.
 bool launch_q4k_f16_rows_swiglu(const void* gate, const void* up, const void* W, void* y, int M,
                                 int N, int K, cudaStream_t stream);
+// The same with gate and up interleaved by column in one [M, 2K] bf16 tensor (2j gate, 2j+1 up).
+bool launch_q4k_f16_rows_swiglu_il(const void* gate_up, const void* W, void* y, int M, int N,
+                                   int K, cudaStream_t stream);
 bool q4k_f16_rows_enabled();
 // Allocates `stream`'s fp16 staging for the arms above (a no-op once done). Must run outside any
 // graph capture; the arms decline on a stream that was never reserved.

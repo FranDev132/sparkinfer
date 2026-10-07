@@ -190,6 +190,40 @@ bool muse_sandwich_bf16_fold_on() {
     }();
     return v;
 }
+// The packed decode's sandwich tail writes the FP4 A operand of the next block-scaled GEMM in the
+// same pass (launch_muse_tail_fp4_exact) instead of leaving it to a separate quantize over the row
+// it just stored: byte-identical, one launch fewer at each of the two tails a layer. Only while
+// the tail runs its default 1024-thread register path, which that kernel reproduces.
+// SPARKINFER_MUSE_TAIL_FP4=0 keeps the separate quantize (A/B).
+bool muse_tail_fp4_on() {
+    static const bool v = [] {
+        const char* e = getenv("SPARKINFER_MUSE_TAIL_FP4");
+        if (e && e[0] == '0') return false;
+        const char* w = getenv("SPARKINFER_MUSE_TAIL_W");
+        const char* r = getenv("SPARKINFER_MUSE_TAIL_REG");
+        return (!w || atoi(w) == 1024) && !(r && r[0] == '0');
+    }();
+    return v;
+}
+// Which interleaved gate/up route a chunk of fn rows takes: the GEMM with the SwiGLU epilogue,
+// or the plain GEMM + interleaved SwiGLU quantize. Measured on RTX 5090 (graph replay, us, against
+// main's two GEMMs + SwiGLU quantize at Muse's shape): fused / plain = 128 rows 99.8 / 98.0 vs
+// 106.2; 256 133.3 / 134.6 vs 134.7; 512 237.3 / 229.6 vs 227.8; 1024 471.2 / 461.7 vs 447.1;
+// 2048 848.5 / 899.1 vs 950.1; 4096 1666.8 / 1822.0 vs 1814.3. The epilogue pays once the GEMM is
+// compute-bound over several waves (>= 2048 rows); below that the plain GEMM is level or ahead
+// (prefill@128 end to end: plain +0.97% over the epilogue route). SPARKINFER_MUSE_GU_FUSED_MINN
+// moves that edge; SPARKINFER_MUSE_GU_FUSED_MAXN=N also sends chunks of <= N rows to it.
+bool muse_gu_fused_at(int fn) {
+    static const int lo = [] {
+        const char* e = getenv("SPARKINFER_MUSE_GU_FUSED_MAXN");
+        return e ? atoi(e) : 0;
+    }();
+    static const int hi = [] {
+        const char* e = getenv("SPARKINFER_MUSE_GU_FUSED_MINN");
+        return e ? atoi(e) : 2048;
+    }();
+    return fn <= lo || fn >= hi;
+}
 // The GEMM that reads a fused norm's FP4 operand (q|gate|k|v after the post-FFN norm, gate after
 // the post-attention one) is launched as its programmatic dependent: the norm is one wave of 128
 // CTAs on 170 SMs and triggers at once, so the GEMM's CTAs are resident and through their prologue
@@ -1108,6 +1142,11 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
     // forked streams, a liveness argument this has not been checked against.
     const bool ffn_alias = !moe && (size_t)FC * (size_t)ffn <= (size_t)N * (size_t)wide
                                 && (size_t)FC * (size_t)ffn <= (size_t)N * (size_t)lvdim;
+    // Muse with gate/up as one interleaved operand: the gate|up pair is ONE allocation (up = its
+    // second half), so a plain GEMM over the interleaved operand can write [fn, 2*ffn] into it.
+    // Same bytes as the two buffers.
+    const bool ffn_gu_one = !ffn_alias && !moe && c.muse_glimmer && !s.w.layers.empty() &&
+                            s.w.layers[0].gu_interleaved;
     // An explicit SPARKINFER_PREFILL_FFN_CHUNK is an operator decision -- honour it as given.
     if (!ffn_alias && !moe && !getenv("SPARKINFER_PREFILL_FFN_CHUNK")) {
         size_t fb = 0, tb = 0;
@@ -1145,6 +1184,8 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
             // pinned). On a first pass the arena holds nothing and this is the old sum.
             auto need = [&](int fc) {
                 const size_t pair = (size_t)fc * (size_t)ffn * sizeof(bf16);
+                if (ffn_gu_one)
+                    return a.fresh({2 * pair, (size_t)maxw * sizeof(bf16), (size_t)N * sizeof(int)});
                 return a.fresh({pair, pair, (size_t)maxw * sizeof(bf16), (size_t)N * sizeof(int)});
             };
             // Test the HALVED value, not the current one: `FC > floor` would step straight past it.
@@ -1177,8 +1218,9 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
             }
         }
     }
-    bf16* ffg  = ffn_alias ? b8 : a.alloc<bf16>((size_t)FC * ffn);   // ffn gate, bounded to FC tokens
-    bf16* ffu  = ffn_alias ? lz : a.alloc<bf16>((size_t)FC * ffn);   // ffn up,   bounded to FC tokens
+    bf16* ffg  = ffn_alias ? b8 : a.alloc<bf16>((size_t)FC * ffn * (ffn_gu_one ? 2 : 1));   // ffn gate, bounded to FC tokens
+    bf16* ffu  = ffn_alias ? lz : ffn_gu_one ? (ffg ? ffg + (size_t)FC * ffn : nullptr)
+                                             : a.alloc<bf16>((size_t)FC * ffn);   // ffn up,   bounded to FC tokens
     bf16* ffh  = ffg;                                    // SwiGLU computed in-place into ffg (down reads it)
     bf16* wbuf = a.alloc<bf16>(maxw);                    // dequantized-weight scratch (reused)
     int*  d_ids = a.alloc<int>((size_t)N);
@@ -3961,6 +4003,51 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                     kernels::prefill_nvfp4_swiglu_epilogue_on() &&
                     kernels::prefill_nvfp4_supported(fn, H, ffn);
                 bool swi_done = false;
+                // Gate and up: two GEMMs into ffg/ffu, or -- the operand interleaved -- one GEMM
+                // whose epilogue writes the down projection's FP4 operand (gu_down_done), or at
+                // the widths where that is slower one plain GEMM over the interleaved operand into
+                // the ffg|ffu allocation and the interleaved SwiGLU quantize. Every route hands
+                // the down GEMM the same bytes.
+                const bool gu_pdl = hn_fp4_ready && fo == 0 && fn == N && !muse_ffn_norm_fp4 &&
+                                    !ffn_norm_fp4 && muse_gemm_pdl_on();
+                bool gu_down_done = false;
+                auto gate_up = [&]() -> bool {
+                    if (!w.gu_interleaved)
+                        return (gu_pdl
+                                ? kernels::launch_prefill_nvfp4_gemm_pdl(fp4_a, fp4_as, f4_g, f4_gs,
+                                                                         ffg, fn, ffn, H, fp4_ws,
+                                                                         st, f4_ga)
+                                : kernels::launch_prefill_nvfp4_gemm(fp4_a, fp4_as, f4_g, f4_gs,
+                                                                     ffg, fn, ffn, H, fp4_ws, st,
+                                                                     f4_ga)) &&
+                               ((swi_epi && (swi_done = kernels::launch_prefill_nvfp4_gemm_swiglu_quant(
+                                                 fp4_a, fp4_as, f4_u, f4_us, ffg, fp4_down_a,
+                                                 fp4_down_as, fn, ffn, H, st, f4_ua))) ||
+                                kernels::launch_prefill_nvfp4_gemm(fp4_a, fp4_as, f4_u, f4_us,
+                                                                   ffu, fn, ffn, H, fp4_ws, st,
+                                                                   f4_ua));
+                    if (!(nvfp4_down && dn_fp4 && dn_fp4_sf && fp4_down_a && fp4_down_as))
+                        return false;
+                    if (muse_gu_fused_at(fn) || f4_ga != f4_ua || !ffn_gu_one) {
+                        gu_down_done = gu_pdl
+                            ? kernels::launch_prefill_nvfp4_gate_up_swiglu_pdl(
+                                  fp4_a, fp4_as, f4_g, f4_gs, fp4_down_a, fp4_down_as, fn, ffn, H,
+                                  f4_ga, f4_ua, fp4_ws, st)
+                            : kernels::launch_prefill_nvfp4_gate_up_swiglu(
+                                  fp4_a, fp4_as, f4_g, f4_gs, fp4_down_a, fp4_down_as, fn, ffn, H,
+                                  f4_ga, f4_ua, fp4_ws, st);
+                        return gu_down_done;
+                    }
+                    gu_down_done =
+                        (gu_pdl
+                         ? kernels::launch_prefill_nvfp4_gemm_pdl(fp4_a, fp4_as, f4_g, f4_gs, ffg,
+                                                                  fn, 2 * ffn, H, fp4_ws, st, f4_ga)
+                         : kernels::launch_prefill_nvfp4_gemm(fp4_a, fp4_as, f4_g, f4_gs, ffg, fn,
+                                                              2 * ffn, H, fp4_ws, st, f4_ga)) &&
+                        kernels::launch_prefill_nvfp4_swiglu_il_quant_a(ffg, fp4_down_a,
+                                                                        fp4_down_as, fn, ffn, st);
+                    return gu_down_done;
+                };
                 const bool layer_fp4 = gu_nvfp4 && f4_g && f4_gs &&
                     f4_u && f4_us && fp4_a && fp4_as &&
                     kernels::prefill_nvfp4_supported(fn, ffn, H) &&
@@ -3974,26 +4061,13 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                      : (hn_fp4_ready && fo == 0 && fn == N) ||
                        kernels::launch_prefill_nvfp4_quant_a(
                            hn_c, fp4_a, fp4_as, fn, H, st)) &&
-                    (hn_fp4_ready && fo == 0 && fn == N && !muse_ffn_norm_fp4 &&
-                     !ffn_norm_fp4 && muse_gemm_pdl_on()
-                     ? kernels::launch_prefill_nvfp4_gemm_pdl(fp4_a, fp4_as, f4_g, f4_gs, ffg, fn,
-                                                             ffn, H, fp4_ws, st, f4_ga)
-                     : kernels::launch_prefill_nvfp4_gemm(fp4_a, fp4_as, f4_g, f4_gs,
-                                                         ffg, fn, ffn, H, fp4_ws, st,
-                                                         f4_ga)) &&
-                    ((swi_epi && (swi_done = kernels::launch_prefill_nvfp4_gemm_swiglu_quant(
-                                      fp4_a, fp4_as, f4_u, f4_us, ffg, fp4_down_a,
-                                      fp4_down_as, fn, ffn, H, st, f4_ua))) ||
-                     kernels::launch_prefill_nvfp4_gemm(fp4_a, fp4_as, f4_u, f4_us,
-                                                        ffu, fn, ffn, H, fp4_ws, st,
-                                                        f4_ua));
+                    gate_up();
                 if (layer_fp4) {
                     bf16* xc = x + (size_t)fo * H;
-                    const bool down_swiglu_q = swi_done ||
-                        (nvfp4_down && dn_fp4 && dn_fp4_sf &&
-                         fp4_down_a && fp4_down_as &&
-                         kernels::launch_prefill_nvfp4_swiglu_quant_a(
-                             ffg, ffu, fp4_down_a, fp4_down_as, fn, ffn, st));
+                    const bool down_swiglu_q = gu_down_done || swi_done || (nvfp4_down && dn_fp4 && dn_fp4_sf &&
+                        fp4_down_a && fp4_down_as &&
+                        kernels::launch_prefill_nvfp4_swiglu_quant_a(
+                            ffg, ffu, fp4_down_a, fp4_down_as, fn, ffn, st));
                     const bool down_fp4_resid = down_swiglu_q && ffn_fp4_resid &&
                         kernels::launch_prefill_nvfp4_gemm(
                             fp4_down_a, fp4_down_as, f4_d, f4_ds,
@@ -5385,7 +5459,7 @@ static bool packed_gate_up_nvfp4(const Qwen35LayerWeights& w, const void* hn, in
                                  int ffn, int H, unsigned char* fp4_a, unsigned char* fp4_asf,
                                  unsigned char* fp4_ws, bf16* sg, bf16* su, cudaStream_t st) {
     if (!fp4_a || !fp4_asf || !sg || !su) return false;
-    if (!w.gate_fp4 || !w.gate_fp4_sf || !w.up_fp4 || !w.up_fp4_sf) return false;
+    if (!w.gate_fp4 || !w.gate_fp4_sf || !w.up_fp4 || !w.up_fp4_sf || w.gu_interleaved) return false;
     if (!kernels::prefill_nvfp4_supported(rows, ffn, H)) return false;
     return kernels::launch_prefill_nvfp4_quant_a(hn, fp4_a, fp4_asf, rows, H, st) &&
            kernels::launch_prefill_nvfp4_gemm(fp4_a, fp4_asf, w.gate_fp4, w.gate_fp4_sf, sg,
@@ -5692,6 +5766,9 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
     static unsigned char* packed_wo_sf = nullptr;
     static unsigned char* packed_dn_data = nullptr;
     static unsigned char* packed_dn_sf = nullptr;
+    // Interleaved gate/up (Qwen35LayerWeights::gu_interleaved): the [rows, 2*ffn] output of the
+    // one GEMM over the interleaved operand.
+    static bf16* packed_gu_buf = nullptr;
     static bool packed_stream_tried = false;
     if (packed && muse && !packed_stream_tried) {
         packed_stream_tried = true;
@@ -5707,6 +5784,11 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
             try_pair(&packed_dn_data, &packed_dn_sf,
                      kernels::prefill_nvfp4_data_bytes(H, ffn),
                      kernels::prefill_nvfp4_scale_bytes_b(H, ffn));
+        if (!s.w.layers.empty() && s.w.layers[0].gu_interleaved) {
+            void* gb = nullptr;
+            if (cudaMalloc(&gb, (size_t)kVerifyMaxRows * 2 * ffn * sizeof(bf16)) == cudaSuccess)
+                packed_gu_buf = static_cast<bf16*>(gb);
+        }
     }
     // DEBUG ONLY (dspark_tau_check bisection, 2026-08-17): SPARKINFER_DFLASH_VERIFY_DUMP_ROW=<row>
     // dumps that row's pre-attn-norm xn after EVERY layer, plus the post-final-norm xn, into
@@ -6513,6 +6595,10 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
     bool xn_rq_ready, hn_rq_ready, norm_rq;
     xn_rq_ready = hn_rq_ready = false;
     norm_rq = packed && s.bonsai_dec_layers && bt_q && s.bonsai_sign_hidden;
+    // Set by a packed Muse post-FFN tail that also wrote the next layer's FP4 xn operand.
+    // (Declared, then assigned, for the same goto.)
+    bool pk_xn_fp4;
+    pk_xn_fp4 = false;
     for (int L = 0; L < c.n_layers && supported; ++L) {
         // Reset the dp4a activation cache every layer. `xn` is the SAME buffer at every layer, so
         // a pointer-keyed cache that is never invalidated silently reuses layer 0's quantization
@@ -6567,6 +6653,31 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
             // One grid for the Q4_K ones (12 = Q4_K). A Q4_K_M file gives half of Muse's
             // layers a Q6_K attn_v, so the fusion takes q/gate/k plus v only where v is Q4_K
             // too, and a Q6_K v follows on its own path exactly as before.
+            //
+            // The o projection's operand is settled here, ahead of q|gate|k|v (a streamed copy is
+            // converted now rather than after the attention; it reads only weights), so that block
+            // knows whether the gate's only reader will be the FP4 o arm's quantize.
+            static const int wo_fp4_min_rows = [] {
+                const char* e = getenv("SPARKINFER_MUSE_PACKED_WO_MIN_ROWS");
+                const int v = e ? atoi(e) : 1;
+                return v < 1 ? 1 : v; }();
+            static const bool packed_wo_gq8 = [] {
+                const char* e = getenv("SPARKINFER_MUSE_PACKED_WO_GATE_Q8");
+                return !(e && e[0] == '0'); }();
+            const void* wo4 = w.wo_fp4;
+            const void* wo4_sf = w.wo_fp4_sf;
+            if (!wo4 && packed_wo_data && packed_wo_sf && packed && N >= packed_stream_min && w.wo &&
+                kernels::prefill_nvfp4_supported(Ng, H, qdim) &&
+                muse_stream_nvfp4_b(w.wo_type, w.wo, H, qdim, packed_wo_data, packed_wo_sf,
+                                    nullptr, 0, st, N)) {
+                wo4 = packed_wo_data;
+                wo4_sf = packed_wo_sf;
+            }
+            const bool wo_want_fp4 = N >= wo_fp4_min_rows && fp4_a && fp4_asf &&
+                wo4 && wo4_sf && kernels::prefill_nvfp4_supported(Ng, H, qdim);
+            // q|gate|k|v left in the GEMM's packed buffer (no unpack): set below when the int8
+            // QK-norm reads q/k/v from it and the FP4 o quantize reads the gate from it.
+            bool qkv_in_place = false;
             {
                 const bool v4 = (w.wv_type == 12);
                 // Which projections share the grid depends on the width. Under nine rows all
@@ -6620,14 +6731,27 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
                     const int v = e ? atoi(e) : 2;
                     return v < 1 ? 1 : v; }();
                 bool qkvg_done = false;
+                const bool xn_fp4_given = pk_xn_fp4;
+                pk_xn_fp4 = false;   // consumed here, or stale once anything else writes fp4_a
                 if (qkvg_fp4_on && N >= qkvg_min_rows && fp4_a && fp4_asf && fp4_qkv &&
                     w.qkvg_fp4 && w.qkvg_fp4_sf &&
                     kernels::prefill_nvfp4_supported(Ng, qkvg_n, H) &&
-                    kernels::launch_prefill_nvfp4_quant_a(xn, fp4_a, fp4_asf, Ng, H, st) &&
+                    (xn_fp4_given ||
+                     kernels::launch_prefill_nvfp4_quant_a(xn, fp4_a, fp4_asf, Ng, H, st)) &&
                     kernels::launch_prefill_nvfp4_gemm(fp4_a, fp4_asf, w.qkvg_fp4, w.qkvg_fp4_sf,
                                                        fp4_qkv, Ng, qkvg_n, H, fp4_ws, st)) {
-                    kernels::launch_muse_qkvg_unpack(fp4_qkv, qkvg_n, qb, qg, kf, vf,
-                                                     N, qdim, kvdim, st);
+                    // With an int8 cache the fused QK-norm reads q/k/v from the packed rows and
+                    // writes the normed q to qb, and the FP4 o quantize reads the gate columns:
+                    // nothing reads the four tight copies the unpack would make.
+                    // SPARKINFER_MUSE_PACKED_UNPACK_SKIP=0 keeps the unpack (A/B).
+                    static const bool unpack_skip = [] {
+                        const char* e = getenv("SPARKINFER_MUSE_PACKED_UNPACK_SKIP");
+                        const char* f = getenv("SPARKINFER_MUSE_PACKED_QKNORM_FUSE");
+                        return !(e && e[0] == '0') && !(f && f[0] == '0'); }();
+                    qkv_in_place = unpack_skip && kv8 && wo_want_fp4 && !(qkvg_n & 7);
+                    if (!qkv_in_place)
+                        kernels::launch_muse_qkvg_unpack(fp4_qkv, qkvg_n, qb, qg, kf, vf,
+                                                         N, qdim, kvdim, st);
                     qkvg_done = true;
                     supported = true;
                 }
@@ -6704,11 +6828,26 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
             static const bool qkn_fuse = [] {
                 const char* e = getenv("SPARKINFER_MUSE_PACKED_QKNORM_FUSE");
                 return !(e && e[0] == '0'); }();
-            const bool qkn_done = qkn_fuse && !kv8 &&
-                kernels::launch_muse_qknorm_rope_kv_rows(qb, kf, vf, w.q_norm, w.k_norm, kp, vp,
-                                                         rtab, pos, N, c.n_q_heads, c.n_kv_heads,
-                                                         c.head_dim, c.rope_theta, c.rms_eps,
-                                                         w.swa != 0, bs, mbs, st);
+            const bool qkn_done = qkn_fuse &&
+                (kv8 ? (qkv_in_place
+                        ? kernels::launch_muse_qknorm_rope_kv_int8_rows(
+                              fp4_qkv, nullptr, nullptr, w.q_norm, w.k_norm, kp, vp, ks, vs, rtab,
+                              pos, N, c.n_q_heads, c.n_kv_heads, c.head_dim, c.rope_theta,
+                              c.rms_eps, w.swa != 0, bs, mbs, st, qkvg_n, qb)
+                        : kernels::launch_muse_qknorm_rope_kv_int8_rows(
+                              qb, kf, vf, w.q_norm, w.k_norm, kp, vp, ks, vs, rtab, pos, N,
+                              c.n_q_heads, c.n_kv_heads, c.head_dim, c.rope_theta, c.rms_eps,
+                              w.swa != 0, bs, mbs, st))
+                     : kernels::launch_muse_qknorm_rope_kv_rows(
+                           qb, kf, vf, w.q_norm, w.k_norm, kp, vp, rtab, pos, N, c.n_q_heads,
+                           c.n_kv_heads, c.head_dim, c.rope_theta, c.rms_eps, w.swa != 0, bs,
+                           mbs, st));
+            // The arms below read the tight copies: make them after all if the in-place form
+            // declined.
+            if (qkv_in_place && !qkn_done) {
+                kernels::launch_muse_qkvg_unpack(fp4_qkv, qkvg_n, qb, qg, kf, vf, N, qdim, kvdim, st);
+                qkv_in_place = false;
+            }
             // QK-norm is per HEAD vector, so N tokens is just N*heads rows of the same kernel.
             if (!qkn_done) {
                 kernels::launch_rmsnorm(qb, w.q_norm, qb, N * c.n_q_heads,  c.head_dim, c.rms_eps, st);
@@ -6740,24 +6879,6 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
             // fill did not keep. The FP4 wo arm folds the gate into its own quantize, so the
             // combine stays ungated there (double-gating would be wrong).
             // SPARKINFER_MUSE_PACKED_WO_GATE_Q8=0 restores the split path.
-            static const int wo_fp4_min_rows = [] {
-                const char* e = getenv("SPARKINFER_MUSE_PACKED_WO_MIN_ROWS");
-                const int v = e ? atoi(e) : 1;
-                return v < 1 ? 1 : v; }();
-            static const bool packed_wo_gq8 = [] {
-                const char* e = getenv("SPARKINFER_MUSE_PACKED_WO_GATE_Q8");
-                return !(e && e[0] == '0'); }();
-            const void* wo4 = w.wo_fp4;
-            const void* wo4_sf = w.wo_fp4_sf;
-            if (!wo4 && packed_wo_data && packed_wo_sf && packed && N >= packed_stream_min && w.wo &&
-                kernels::prefill_nvfp4_supported(Ng, H, qdim) &&
-                muse_stream_nvfp4_b(w.wo_type, w.wo, H, qdim, packed_wo_data, packed_wo_sf,
-                                    nullptr, 0, st, N)) {
-                wo4 = packed_wo_data;
-                wo4_sf = packed_wo_sf;
-            }
-            const bool wo_want_fp4 = N >= wo_fp4_min_rows && fp4_a && fp4_asf &&
-                wo4 && wo4_sf && kernels::prefill_nvfp4_supported(Ng, H, qdim);
             const bool attn_gq8 = packed_wo_gq8 && !wo_want_fp4 && qg && q81 &&
                 (w.wo_type == 12 || w.wo_type == 8) && (qdim % 32 == 0);
             void* attn_q8 = attn_gq8 ? q81 : nullptr;
@@ -6781,7 +6902,11 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
             // gate folded into its quantize, instead of the Q4_K mma rows. Rows past N are scratch.
             // SPARKINFER_MUSE_PACKED_WO_MIN_ROWS=33 restores the Q4_K projection.
             const bool wo_fp4_done = wo_want_fp4 &&
-                kernels::launch_prefill_nvfp4_gate_quant_a(att, qg, fp4_a, fp4_asf, Ng, qdim, st) &&
+                (qkv_in_place
+                 ? kernels::launch_prefill_nvfp4_gate_quant_a(att, fp4_qkv + qdim, fp4_a, fp4_asf,
+                                                              Ng, qdim, st, qkvg_n)
+                 : kernels::launch_prefill_nvfp4_gate_quant_a(att, qg, fp4_a, fp4_asf, Ng, qdim,
+                                                              st)) &&
                 kernels::launch_prefill_nvfp4_gemm(fp4_a, fp4_asf, wo4, wo4_sf,
                                                    ao, Ng, H, qdim, fp4_ws, st);
             if (!wo_fp4_done) {
@@ -6797,7 +6922,17 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
             // rather than the model's rms_eps. ffn_norm is a genuine separate pre-FFN norm here,
             // not post_attn_norm doing double duty like every other architecture in this file.
             bool hn_q8_ready = false;
-            if (packed_tail) {
+            // The interleaved gate/up GEMM below reads hn as an FP4 operand: let the tail write it.
+            const bool hn_fp4_pk = packed_tail && muse_tail_fp4_on() && w.gu_interleaved &&
+                wide && topk == 1 && N >= gu_gemm_min_rows() && fp4_a && fp4_asf &&
+                packed_gu_buf && w.gate_fp4_alpha == w.up_fp4_alpha &&
+                kernels::prefill_nvfp4_supported(Ng, 2 * ffn, H) &&
+                kernels::launch_muse_tail_fp4_exact(x, ao, w.post_attn_norm, w.ffn_norm, h, hn,
+                                                    q81, fp4_a, fp4_asf, N, Ng, H, 1e-8f,
+                                                    c.rms_eps, st);
+            if (hn_fp4_pk) {
+                hn_q8_ready = q81 != nullptr;
+            } else if (packed_tail) {
                 // The tail also hands the FFN its input already quantized; nothing between here
                 // and the dense FFN touches q81 on this architecture, exactly as AR relies on.
                 hn_q8_ready = kernels::launch_muse_sandwich_tail(
@@ -6813,25 +6948,63 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
             // Wide enough to be worth a block-scaled GEMM: run gate/up through the FP4 operands
             // this model already holds for prefill and hand the pair to the call below, which then
             // does only the SwiGLU and the GGUF down GEMV.
-            const bool gu_gemm =
-                wide && topk == 1 && N >= gu_gemm_min_rows() &&
-                packed_gate_up_nvfp4(w, hn, Ng, ffn, H, fp4_a, fp4_asf, fp4_ws, sg, su, st);
+            const bool gu_want = wide && topk == 1 && N >= gu_gemm_min_rows();
             // ...and down through its FP4 copy when it is resident, or a streamed Q6_K convert
             // into the persistent operand when it is not -- the Q4_K MMA was a quarter of the step.
             const void* dn4 = w.down_fp4;
             const void* dn4_sf = w.down_fp4_sf;
-            if (!dn4 && gu_gemm && packed_dn_data && packed_dn_sf && N >= packed_stream_min &&
-                w.down_q && kernels::prefill_nvfp4_supported(Ng, H, ffn) &&
-                muse_stream_nvfp4_b(w.down_qtype, w.down_q, H, ffn, packed_dn_data, packed_dn_sf,
-                                    nullptr, 0, st, N)) {
-                dn4 = packed_dn_data;
-                dn4_sf = packed_dn_sf;
+            auto stream_dn = [&]() {
+                if (!dn4 && packed_dn_data && packed_dn_sf && N >= packed_stream_min &&
+                    w.down_q && kernels::prefill_nvfp4_supported(Ng, H, ffn) &&
+                    muse_stream_nvfp4_b(w.down_qtype, w.down_q, H, ffn, packed_dn_data,
+                                        packed_dn_sf, nullptr, 0, st, N)) {
+                    dn4 = packed_dn_data;
+                    dn4_sf = packed_dn_sf;
+                }
+            };
+            bool gu_gemm = false, dn_gemm = false, dn_il = false;
+            if (gu_want && w.gu_interleaved && fp4_a && fp4_asf && packed_gu_buf &&
+                w.gate_fp4_alpha == w.up_fp4_alpha &&
+                kernels::prefill_nvfp4_supported(Ng, 2 * ffn, H)) {
+                // One GEMM over the interleaved operand -- at these widths it takes the transposed
+                // 16-row tile with the weights as M, as the two separate GEMMs did, so the SwiGLU
+                // epilogue's 128-row M tile would only waste it. With down in FP4 the interleaved
+                // SwiGLU quantize forms its operand; otherwise the output is split into sg/su.
+                stream_dn();
+                gu_gemm =
+                    (hn_fp4_pk ||
+                     kernels::launch_prefill_nvfp4_quant_a(hn, fp4_a, fp4_asf, Ng, H, st)) &&
+                    kernels::launch_prefill_nvfp4_gemm(fp4_a, fp4_asf, w.gate_fp4, w.gate_fp4_sf,
+                                                       packed_gu_buf, Ng, 2 * ffn, H, fp4_ws, st,
+                                                       w.gate_fp4_alpha);
+                if (gu_gemm && dn4 && dn4_sf)
+                    dn_gemm =
+                        kernels::launch_prefill_nvfp4_swiglu_il_quant_a(packed_gu_buf, fp4_a,
+                                                                        fp4_asf, Ng, ffn, st) &&
+                        kernels::launch_prefill_nvfp4_gemm(fp4_a, fp4_asf, dn4, dn4_sf, routed, Ng,
+                                                           H, ffn, fp4_ws, st, w.down_fp4_alpha);
+                // The fp16 Q4_K down reads SwiGLU of the interleaved output itself; the other arms
+                // get it split into sg/su.
+                if (gu_gemm && !dn_gemm && muse_f16 && w.down_qtype == 12)
+                    dn_il = kernels::launch_q4k_f16_rows_swiglu_il(packed_gu_buf, w.down_q,
+                                                                   routed, N, H, ffn, st);
+                if (gu_gemm && !dn_gemm && !dn_il)
+                    gu_gemm = sg && su &&
+                        kernels::launch_bf16_deinterleave_gate_up(packed_gu_buf, sg, su, Ng, ffn,
+                                                                  st);
+            } else if (gu_want && !w.gu_interleaved) {
+                gu_gemm = packed_gate_up_nvfp4(w, hn, Ng, ffn, H, fp4_a, fp4_asf, fp4_ws, sg, su,
+                                               st);
+                if (gu_gemm) stream_dn();
             }
-            const bool dn_gemm = gu_gemm && dn4 && dn4_sf &&
-                kernels::launch_prefill_nvfp4_swiglu_quant_a(sg, su, fp4_a, fp4_asf, Ng, ffn, st) &&
-                kernels::launch_prefill_nvfp4_gemm(fp4_a, fp4_asf, dn4, dn4_sf,
-                                                   routed, Ng, H, ffn, fp4_ws, st,
-                                                   w.down_fp4_alpha);
+            if (dn_il) dn_gemm = true;   // routed is written: skip the remaining down arms
+            if (!dn_gemm)
+                dn_gemm = gu_gemm && dn4 && dn4_sf &&
+                    kernels::launch_prefill_nvfp4_swiglu_quant_a(sg, su, fp4_a, fp4_asf, Ng, ffn,
+                                                                 st) &&
+                    kernels::launch_prefill_nvfp4_gemm(fp4_a, fp4_asf, dn4, dn4_sf,
+                                                       routed, Ng, H, ffn, fp4_ws, st,
+                                                       w.down_fp4_alpha);
             // With gate/up already in bf16 planes, the Q4_K down reads SwiGLU of them at fp16.
             const bool dn_f16 = !dn_gemm && gu_gemm && muse_f16 && w.down_qtype == 12 &&
                 kernels::launch_q4k_f16_rows_swiglu(sg, su, w.down_q, routed, N, H, ffn, st);
@@ -6845,7 +7018,27 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
             // Sandwich norm (post-FFN): x = h + RMSNorm(routed) * post_ffn_norm, same 1e-8.
             const void* nn = (L + 1 < c.n_layers) ? s.w.layers[L + 1].input_norm : s.w.final_norm;
             bool xn_q8_ready = false;
-            if (packed_tail) {
+            // The next layer's fused q|gate|k|v GEMM reads xn as an FP4 operand: let the tail
+            // write it, and that arm skips its quantize (pk_xn_fp4).
+            const Qwen35LayerWeights* pnw = L + 1 < c.n_layers ? &s.w.layers[L + 1] : nullptr;
+            // The q|gate|k|v arm's own switches (SPARKINFER_MUSE_QKVG_FP4 / _MIN_ROWS, read
+            // where that arm is), so the tail predicts exactly whether it runs.
+            static const bool pk_qkvg_on = [] {
+                const char* e = getenv("SPARKINFER_MUSE_QKVG_FP4");
+                return !(e && e[0] == '0'); }();
+            static const int pk_qkvg_min = [] {
+                const char* e = getenv("SPARKINFER_MUSE_QKVG_MIN_ROWS");
+                const int v = e ? atoi(e) : 2;
+                return v < 1 ? 1 : v; }();
+            pk_xn_fp4 = packed_tail && muse_tail_fp4_on() && pnw && pk_qkvg_on &&
+                N >= pk_qkvg_min && fp4_a && fp4_asf && fp4_qkv && pnw->qkvg_fp4 &&
+                pnw->qkvg_fp4_sf && kernels::prefill_nvfp4_supported(Ng, qkvg_n, H) &&
+                kernels::launch_muse_tail_fp4_exact(h, routed, w.post_ffn_norm, nn, x, xn, q81,
+                                                    fp4_a, fp4_asf, N, Ng, H, 1e-8f, c.rms_eps,
+                                                    st);
+            if (pk_xn_fp4) {
+                xn_q8_ready = q81 != nullptr;
+            } else if (packed_tail) {
                 xn_q8_ready = kernels::launch_muse_sandwich_tail(
                     h, routed, w.post_ffn_norm, nn, x, xn, q81, N, H, 1e-8f, c.rms_eps, st);
             } else {

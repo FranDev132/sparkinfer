@@ -86,6 +86,18 @@ void launch_muse_qknorm_rope_kv_int8(void* q, void* k, const void* v, const void
                                      const int* pos_slot, int n_q_heads, int n_kv_heads,
                                      int head_dim, float theta, int block_size, float eps,
                                      bool do_rope, cudaStream_t stream);
+// launch_muse_qknorm_rope_kv_rows for an int8 cache: launch_rmsnorm(q), launch_rmsnorm(k) and
+// launch_muse_kv_append_int8 in one launch, byte-identical to them. False when it declines.
+bool launch_muse_qknorm_rope_kv_int8_rows(void* q, const void* k, const void* v, const void* q_w,
+                                          const void* k_w, void* k_pool, void* v_pool,
+                                          void* k_scale, void* v_scale, const int* block_table,
+                                          const int* positions, int n_rows, int n_q_heads,
+                                          int n_kv_heads, int head_dim, float theta, float eps,
+                                          bool do_rope, int block_size, int max_blocks_per_seq,
+                                          cudaStream_t stream,
+                                          // q, k, v read from one packed q|gate|k|v buffer of row
+                                          // pitch src_ld (q points at it); normed q to q_out
+                                          int src_ld = 0, void* q_out = nullptr);
 bool launch_muse_qknorm_rope_kv_rows(void* q, const void* k, const void* v, const void* q_w,
                                      const void* k_w, void* k_pool, void* v_pool,
                                      const int* block_table, const int* positions, int n_rows,

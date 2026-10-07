@@ -65,6 +65,41 @@ bool launch_prefill_nvfp4_gemm_swiglu_quant(const void* a, const void* sa, const
                                             const void* sb, const void* gate_bf16,
                                             void* dst_fp4, void* dst_sf, int m, int n, int k,
                                             cudaStream_t stream, float alpha = 1.f);
+// Gate and up B operands (each [ffn, k] FP4 + SFB) row-interleaved into one [2*ffn, k] operand:
+// row 2j is gate row j, row 2j+1 is up row j. dst_sf is prefill_nvfp4_scale_bytes_b(2*ffn, k).
+bool launch_prefill_nvfp4_interleave_gate_up(const void* gate_fp4, const void* gate_sf,
+                                             const void* up_fp4, const void* up_sf,
+                                             void* dst_fp4, void* dst_sf, int ffn, int k,
+                                             cudaStream_t stream = nullptr);
+// One GEMM over the interleaved operand whose epilogue writes SwiGLU(gate*alpha_g, up*alpha_u)
+// as the down projection's FP4 A operand (d_fp4 [m, ffn], d_sf its SFA), byte-identical to the
+// two launch_prefill_nvfp4_gemm calls + launch_prefill_nvfp4_swiglu_quant_a. Needs no workspace.
+bool launch_prefill_nvfp4_gate_up_swiglu(const void* a_fp4, const void* sfa,
+                                         const void* b_gu_fp4, const void* sfb_gu,
+                                         void* d_fp4, void* d_sf, int m, int ffn, int k,
+                                         float alpha_g, float alpha_u, void* workspace,
+                                         cudaStream_t stream = nullptr);
+// The same, launched as a programmatic dependent of the kernel ahead of it (see the _pdl GEMM).
+bool launch_prefill_nvfp4_gate_up_swiglu_pdl(const void* a_fp4, const void* sfa,
+                                             const void* b_gu_fp4, const void* sfb_gu,
+                                             void* d_fp4, void* d_sf, int m, int ffn, int k,
+                                             float alpha_g, float alpha_u, void* workspace,
+                                             cudaStream_t stream = nullptr);
+// launch_muse_sandwich_tail (x, xn and Q8_1(xn) for `rows` rows, out_q8 may be null) plus the
+// FP4 A operand of xn in the SFA layout of an rows_op-row operand (rows <= rows_op; the pad rows
+// are left as they are). Byte-identical to the tail followed by launch_prefill_nvfp4_quant_a.
+// cols must be a multiple of 256 with cols/8 <= 1024.
+bool launch_muse_tail_fp4_exact(const void* residual, const void* branch, const void* post_w,
+                                const void* next_w, void* out_x, void* out_xn, void* out_q8,
+                                void* dst_fp4, void* dst_sf, int rows, int rows_op, int cols,
+                                float post_eps, float eps, cudaStream_t stream = nullptr);
+// launch_prefill_nvfp4_swiglu_quant_a over one [m, 2*k] tensor holding gate and up interleaved by
+// column (2j gate, 2j+1 up): the output of a plain GEMM over the interleaved operand. Same bytes.
+bool launch_prefill_nvfp4_swiglu_il_quant_a(const void* gu_bf16, void* dst_fp4, void* dst_sf,
+                                            int m, int k, cudaStream_t stream = nullptr);
+// [m, 2*k] column-interleaved gate/up -> two [m, k] planes.
+bool launch_bf16_deinterleave_gate_up(const void* gu_bf16, void* gate_bf16, void* up_bf16, int m,
+                                      int k, cudaStream_t stream = nullptr);
 bool launch_prefill_nvfp4_quant_b(const void* src_bf16, void* dst_fp4, void* dst_sf,
                                   int n, int k, cudaStream_t stream = nullptr);
 // Rows [n0, n0+rows) of the same `n`-row operand, read from a bf16 buffer holding ONLY those rows

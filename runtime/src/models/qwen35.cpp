@@ -74,6 +74,16 @@
 namespace sparkinfer {
 
 namespace {
+
+// See Qwen35LayerWeights::gu_interleaved. SPARKINFER_MUSE_GU_INTERLEAVE=0 keeps gate and up as two
+// operands (A/B; read once, at load).
+bool muse_gu_interleave_on() {
+    static const bool v = [] {
+        const char* e = getenv("SPARKINFER_MUSE_GU_INTERLEAVE");
+        return !(e && e[0] == '0');
+    }();
+    return v;
+}
 inline void cu(cudaError_t e, const char* what) {
     if (e == cudaSuccess) return;
     // Record context-killing errors so the engine can refuse new work instead of
@@ -10005,6 +10015,35 @@ bool Qwen35Model::load_gguf(const std::string& path) {
             const int ut = lw.prefill_up_q ? lw.prefill_up_qtype : lw.up_qtype;
             ok = convert(g, gt, c.moe_ffn, H, &lw.gate_fp4, &lw.gate_fp4_sf) &&
                  convert(u, ut, c.moe_ffn, H, &lw.up_fp4, &lw.up_fp4_sf);
+            // One operand for both (see Qwen35LayerWeights::gu_interleaved): the batched
+            // prefill then runs gate and up as one GEMM whose epilogue writes the down
+            // projection's FP4 operand, instead of two GEMMs and a SwiGLU pass over the bf16
+            // pair. Same bytes per row, so no extra VRAM once the two copies are released.
+            // SPARKINFER_MUSE_GU_INTERLEAVE=0 keeps them separate (A/B).
+            if (ok && muse_gu_interleave_on()) {
+                const size_t db = kernels::prefill_nvfp4_data_bytes(2 * c.moe_ffn, H);
+                const size_t sb = kernels::prefill_nvfp4_scale_bytes_b(2 * c.moe_ffn, H);
+                void* gd = nullptr; void* gs = nullptr;
+                if (cudaMalloc(&gd, db) == cudaSuccess && cudaMalloc(&gs, sb) == cudaSuccess &&
+                    cudaMemsetAsync(gs, 0, sb, s.stream) == cudaSuccess &&
+                    kernels::launch_prefill_nvfp4_interleave_gate_up(
+                        lw.gate_fp4, lw.gate_fp4_sf, lw.up_fp4, lw.up_fp4_sf, gd, gs, c.moe_ffn, H,
+                        s.stream) &&
+                    cudaStreamSynchronize(s.stream) == cudaSuccess) {
+                    for (const void** p : {&lw.gate_fp4, &lw.gate_fp4_sf, &lw.up_fp4, &lw.up_fp4_sf}) {
+                        auto it = std::find(s.owned.begin(), s.owned.end(), const_cast<void*>(*p));
+                        if (it != s.owned.end()) { cudaFree(*it); s.owned.erase(it); }
+                    }
+                    s.owned.push_back(gd); s.owned.push_back(gs);
+                    lw.gate_fp4 = lw.up_fp4 = gd;
+                    lw.gate_fp4_sf = lw.up_fp4_sf = gs;
+                    lw.gu_interleaved = true;
+                } else {
+                    if (gd) cudaFree(gd);
+                    if (gs) cudaFree(gs);
+                    cudaGetLastError();
+                }
+            }
             // The attention projection group. ~1.7 GB across 52 layers, against 3.9 GB for an
             // ffn_down copy of the same kind, and it is the last dense int8 GEMM in the layer.
             // Best-effort: a layer whose four weights are not all present just keeps the int8

@@ -1145,6 +1145,139 @@ __global__ void muse_qknorm_rope_kv_rows_kernel(
     else      reinterpret_cast<uint4*>(k_pool + (ctok * n_kv_heads + head) * head_dim)[t] = p;
 }
 
+// int8-KV form of the kernel above, for the packed step with an int8 cache: launch_rmsnorm(q),
+// launch_rmsnorm(k) and launch_muse_kv_append_int8 -- three launches a layer -- in one.
+//
+// Bit-identical to those three, by construction:
+//   * the per-head RMS is the kernel above's (rmsnorm_kernel's pack-of-8 accumulation and warp
+//     tree), and the normed pack is rounded to bf16, as launch_rmsnorm stored it;
+//   * from there it is muse_kv_append_int8_kernel's own arithmetic over those bf16 values: Q's
+//     NORMAL rotation written back as bf16, K's rotation kept in float, the per-(token, kv head)
+//     max-abs, d = a / 127, round(val / d) and the half scale; V quantized as it comes. A thread
+//     holds one 8-value pack, so a rotation pair (2i, 2i+1) never leaves the thread, and the
+//     max-abs is the same set of values whichever lanes reduce it.
+// src_ld > 0: q, k and v are read from one packed [rows, src_ld] q|gate|k|v buffer (`q` at column
+// 0, k at 2*nq*hd, v after it) instead of tight arrays, and the normed, rotated q goes to q_out.
+template <bool ROPE>
+__global__ void muse_qknorm_rope_kv_int8_rows_kernel(
+    __nv_bfloat16* __restrict__ q, const __nv_bfloat16* __restrict__ k,
+    const __nv_bfloat16* __restrict__ v, int src_ld, __nv_bfloat16* __restrict__ q_out,
+    const __nv_bfloat16* __restrict__ q_w, const __nv_bfloat16* __restrict__ k_w,
+    signed char* __restrict__ k_pool, signed char* __restrict__ v_pool,
+    __half* __restrict__ k_scale, __half* __restrict__ v_scale,
+    const int* __restrict__ block_table, const int* __restrict__ positions,
+    int n_q_heads, int n_kv_heads, int head_dim, float theta, float eps,
+    int block_size, int max_blocks_per_seq
+) {
+    const int hh = blockIdx.x, row = blockIdx.y, t = threadIdx.x;
+    const int npack = head_dim >> 3;
+    const int pos = positions[row];
+    const int blk = pos / block_size, within = pos % block_size;
+    const size_t ctok = (size_t)(block_table[row * max_blocks_per_seq + blk] * block_size + within);
+    const bool live = t < npack;
+    float val[8];
+    int kvh;
+    bool is_k;
+    const int qd = n_q_heads * head_dim, kd = n_kv_heads * head_dim;
+    if (hh >= n_q_heads + n_kv_heads) {          // V: raw values, quantized below
+        kvh = hh - n_q_heads - n_kv_heads;
+        is_k = false;
+        const __nv_bfloat16* vsrc = src_ld
+            ? q + (size_t)row * src_ld + 2 * qd + kd + (size_t)kvh * head_dim
+            : v + ((size_t)row * n_kv_heads + kvh) * head_dim;
+        if (live) rn_unpack8(__ldg(reinterpret_cast<const uint4*>(vsrc) + t), val);
+    } else {
+        const bool is_q = (hh < n_q_heads);
+        const int head = is_q ? hh : hh - n_q_heads;
+        const size_t base = ((size_t)row * (is_q ? n_q_heads : n_kv_heads) + head) * head_dim;
+        const __nv_bfloat16* xsrc = src_ld
+            ? q + (size_t)row * src_ld + (is_q ? 0 : 2 * qd) + (size_t)head * head_dim
+            : (is_q ? (const __nv_bfloat16*)q : k) + base;
+        const uint4* x4 = reinterpret_cast<const uint4*>(xsrc);
+        __shared__ float s_warp[32];
+        float xv[8];
+        float ss = 0.f;
+        if (live) {
+            rn_unpack8(__ldg(x4 + t), xv);
+            #pragma unroll
+            for (int j = 0; j < 8; j++) ss = __fmaf_rn(xv[j], xv[j], ss);
+        }
+        ss = rn_warp_sum(ss);
+        if ((t & 31) == 0) s_warp[t >> 5] = ss;
+        __syncthreads();
+        if (t < 32) {
+            float vv = (t < (blockDim.x + 31) / 32) ? s_warp[t] : 0.f;
+            vv = rn_warp_sum(vv);
+            if (t == 0) s_warp[0] = rsqrtf(vv / head_dim + eps);
+        }
+        __syncthreads();
+        const float inv_rms = s_warp[0];
+        float nv[8];
+        if (live) {
+            float wv[8], ov[8];
+            rn_unpack8(__ldg(reinterpret_cast<const uint4*>(is_q ? q_w : k_w) + t), wv);
+            #pragma unroll
+            for (int j = 0; j < 8; j++) ov[j] = xv[j] * inv_rms * wv[j];
+            rn_unpack8(rn_pack8(ov), nv);         // the bf16 the append kernel loads back
+        }
+        if (is_q) {
+            if (!live) return;
+            if constexpr (ROPE) {
+                float ov[8];
+                #pragma unroll
+                for (int m = 0; m < 4; m++) {
+                    const int i = 4 * t + m;
+                    const float freq = __powf(theta, -2.f * (float)i / (float)head_dim);
+                    const float ang = (float)pos * freq, c = __cosf(ang), sn = __sinf(ang);
+                    const float x0 = nv[2 * m], x1 = nv[2 * m + 1];
+                    ov[2 * m]     = x0 * c - x1 * sn;
+                    ov[2 * m + 1] = x0 * sn + x1 * c;
+                }
+                reinterpret_cast<uint4*>((src_ld ? q_out : q) + base)[t] = rn_pack8(ov);
+            } else {
+                reinterpret_cast<uint4*>((src_ld ? q_out : q) + base)[t] = rn_pack8(nv);
+            }
+            return;
+        }
+        is_k = true;
+        kvh = head;
+        #pragma unroll
+        for (int j = 0; j < 8; j++) val[j] = nv[j];
+        if constexpr (ROPE) {
+            if (live) {
+                #pragma unroll
+                for (int m = 0; m < 4; m++) {
+                    const int i = 4 * t + m;
+                    const float freq = __powf(theta, -2.f * (float)i / (float)head_dim);
+                    const float ang = (float)pos * freq, c = __cosf(ang), sn = __sinf(ang);
+                    const float x0 = nv[2 * m], x1 = nv[2 * m + 1];
+                    val[2 * m]     = x0 * c - x1 * sn;
+                    val[2 * m + 1] = x0 * sn + x1 * c;
+                }
+            }
+        }
+    }
+    float amax = 0.f;
+    if (live) {
+        #pragma unroll
+        for (int j = 0; j < 8; j++) amax = fmaxf(amax, fabsf(val[j]));
+    }
+    #pragma unroll
+    for (int m = 16; m > 0; m >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, m));
+    if (!live) return;
+    const float d = amax / 127.0f;
+    const size_t dst = (ctok * n_kv_heads + kvh) * head_dim + (size_t)t * 8;
+    unsigned w[2] = {0u, 0u};
+    #pragma unroll
+    for (int j = 0; j < 8; j++) {
+        const int qi = (amax == 0.f) ? 0 : (int)roundf(val[j] / d);
+        w[j >> 2] |= ((unsigned)qi & 255u) << ((j & 3) * 8);
+    }
+    signed char* pool = is_k ? k_pool : v_pool;
+    *reinterpret_cast<uint2*>(pool + dst) = make_uint2(w[0], w[1]);
+    if (t == 0) (is_k ? k_scale : v_scale)[ctok * n_kv_heads + kvh] = __float2half(d);
+}
+
 #ifndef SPARKINFER_NVRTC_DEVICE_ONLY
 #include "sparkinfer/kernels/fused.h"
 #include <cassert>
@@ -1201,6 +1334,31 @@ bool launch_muse_qknorm_rope_kv_rows(void* q, const void* k, const void* v, cons
     if (do_rope) SI_MUSE_QKN_ROWS(true);
     else         SI_MUSE_QKN_ROWS(false);
 #undef SI_MUSE_QKN_ROWS
+    return true;
+}
+
+bool launch_muse_qknorm_rope_kv_int8_rows(void* q, const void* k, const void* v, const void* q_w,
+                                          const void* k_w, void* k_pool, void* v_pool,
+                                          void* k_scale, void* v_scale, const int* block_table,
+                                          const int* positions, int n_rows, int n_q_heads,
+                                          int n_kv_heads, int head_dim, float theta, float eps,
+                                          bool do_rope, int block_size, int max_blocks_per_seq,
+                                          cudaStream_t stream, int src_ld, void* q_out) {
+    // One thread per 8-value pack, every pack inside one warp; the pool rows take 8-byte stores.
+    if (n_rows < 1 || (head_dim & 7) || (head_dim >> 3) > 32 || !k_scale || !v_scale) return false;
+    if (src_ld && (!q_out || (src_ld & 7))) return false;
+    const dim3 grid(n_q_heads + 2 * n_kv_heads, n_rows);
+#define SI_MUSE_QKN_I8(ROPE_) muse_qknorm_rope_kv_int8_rows_kernel<ROPE_><<<grid, 32, 0, stream>>>( \
+        reinterpret_cast<__nv_bfloat16*>(q), reinterpret_cast<const __nv_bfloat16*>(k), \
+        reinterpret_cast<const __nv_bfloat16*>(v), src_ld, reinterpret_cast<__nv_bfloat16*>(q_out), \
+        reinterpret_cast<const __nv_bfloat16*>(q_w), reinterpret_cast<const __nv_bfloat16*>(k_w), \
+        reinterpret_cast<signed char*>(k_pool), reinterpret_cast<signed char*>(v_pool), \
+        reinterpret_cast<__half*>(k_scale), reinterpret_cast<__half*>(v_scale), \
+        block_table, positions, n_q_heads, n_kv_heads, head_dim, theta, eps, block_size, \
+        max_blocks_per_seq)
+    if (do_rope) SI_MUSE_QKN_I8(true);
+    else         SI_MUSE_QKN_I8(false);
+#undef SI_MUSE_QKN_I8
     return true;
 }
 

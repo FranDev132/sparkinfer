@@ -5038,21 +5038,27 @@ si_q4k_f16_rows_kernel(const __half* __restrict__ X, const unsigned char* __rest
 // range is divided by a power of two first (exact) and the matmul output multiplied back by it
 // (rs); a row inside the range, i.e. every normal one, is staged unscaled.
 constexpr int SI_F16_CH = 8;   // row chunks per staging launch
-template <bool SWIGLU>
+// IL: gate and up interleaved by column in x itself ([rows, 2K]: 2i gate, 2i+1 up), the output
+// of one GEMM over a row-interleaved gate/up operand. Same values, same expression.
+template <bool SWIGLU, bool IL = false>
 __device__ __forceinline__ float si_f16_val(const __nv_bfloat16* x, const __nv_bfloat16* u, size_t i) {
+    if (IL) {
+        const float g = __bfloat162float(x[2 * i]);
+        return g / (1.f + __expf(-g)) * __bfloat162float(x[2 * i + 1]);
+    }
     const float g = __bfloat162float(x[i]);
     if (!SWIGLU) return g;
     return g / (1.f + __expf(-g)) * __bfloat162float(u[i]);
 }
 // Pass 1: the absmax of each (row, chunk).
-template <bool SWIGLU>
+template <bool SWIGLU, bool IL = false>
 __global__ void __launch_bounds__(256) si_f16_amax_kernel(
     const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* __restrict__ u,
     float* __restrict__ part, int K) {
     const int row = blockIdx.x, ch = blockIdx.y, len = K / SI_F16_CH;
     const size_t base = (size_t)row * K + (size_t)ch * len;
     float a = 0.f;
-    for (int k = threadIdx.x; k < len; k += 256) a = fmaxf(a, fabsf(si_f16_val<SWIGLU>(x, u, base + k)));
+    for (int k = threadIdx.x; k < len; k += 256) a = fmaxf(a, fabsf(si_f16_val<SWIGLU, IL>(x, u, base + k)));
     __shared__ float red[8];
     #pragma unroll
     for (int o = 16; o; o >>= 1) a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, o));
@@ -5067,7 +5073,7 @@ __global__ void __launch_bounds__(256) si_f16_amax_kernel(
 }
 // Pass 2: the row's power-of-two scale (1 unless the row would pass fp16's range), and the chunk
 // written as fp16.
-template <bool SWIGLU>
+template <bool SWIGLU, bool IL = false>
 __global__ void __launch_bounds__(256) si_f16_stage_rows_kernel(
     const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* __restrict__ u,
     const float* __restrict__ part, __half* __restrict__ y, float* __restrict__ rs, int K) {
@@ -5080,7 +5086,7 @@ __global__ void __launch_bounds__(256) si_f16_stage_rows_kernel(
     const float isc = 1.f / sc;
     const size_t base = (size_t)row * K + (size_t)ch * len;
     for (int k = threadIdx.x; k < len; k += 256)
-        y[base + k] = __float2half_rn(si_f16_val<SWIGLU>(x, u, base + k) * isc);
+        y[base + k] = __float2half_rn(si_f16_val<SWIGLU, IL>(x, u, base + k) * isc);
     if (ch == 0 && threadIdx.x == 0) rs[row] = sc;
 }
 
@@ -5173,7 +5179,8 @@ bool q4k_f16_rows_enabled() {
 // matmul -- over W, and over W2 into y2 as well when given. The K split comes from the wave rule,
 // but only when the output (both outputs, for a pair) fits the stream's fp32 accumulator.
 static bool si_f16_rows(const void* x, const void* u, const void* W, const void* W2, void* y,
-                        void* y2, bool y_f32, int M, int N, int K, cudaStream_t stream) {
+                        void* y2, bool y_f32, int M, int N, int K, cudaStream_t stream,
+                        bool il = false) {
     if (!q4k_f16_rows_enabled()) return false;
     if (M < 1 || M > SI_AM_MMAX || (K & 255) || K > SI_F16_KMAX || (N % (SI_F16_WARPS * 16)))
         return false;
@@ -5188,7 +5195,10 @@ static bool si_f16_rows(const void* x, const void* u, const void* W, const void*
     const __nv_bfloat16* xb = reinterpret_cast<const __nv_bfloat16*>(x);
     const __nv_bfloat16* ub = reinterpret_cast<const __nv_bfloat16*>(u);
     const dim3 sg(M, SI_F16_CH);
-    if (u) {
+    if (il) {
+        si_f16_amax_kernel<true, true><<<sg, 256, 0, stream>>>(xb, nullptr, part, K);
+        si_f16_stage_rows_kernel<true, true><<<sg, 256, 0, stream>>>(xb, nullptr, part, xs, rs, K);
+    } else if (u) {
         si_f16_amax_kernel<true><<<sg, 256, 0, stream>>>(xb, ub, part, K);
         si_f16_stage_rows_kernel<true><<<sg, 256, 0, stream>>>(xb, ub, part, xs, rs, K);
     } else {
@@ -5243,6 +5253,10 @@ bool launch_mmvq_q4k_f16_rows2(const void* x, const void* W1, const void* W2, vo
 bool launch_q4k_f16_rows_swiglu(const void* gate, const void* up, const void* W, void* y, int M,
                                 int N, int K, cudaStream_t stream) {
     return si_f16_rows(gate, up, W, nullptr, y, nullptr, false, M, N, K, stream);
+}
+bool launch_q4k_f16_rows_swiglu_il(const void* gate_up, const void* W, void* y, int M, int N,
+                                   int K, cudaStream_t stream) {
+    return si_f16_rows(gate_up, nullptr, W, nullptr, y, nullptr, false, M, N, K, stream, true);
 }
 
 // Two narrow bf16 matrices (the GDN alpha and beta, v_heads rows each) over a packed batch, on the

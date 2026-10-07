@@ -474,6 +474,209 @@ __device__ __forceinline__ void fp4_pack(const float* x, unsigned char* out) {
     }
 }
 
+// ---------------------------------------------------------------------------------------------
+// GATE AND UP AS ONE GEMM, SwiGLU AND THE DOWN OPERAND'S QUANTIZE IN ITS EPILOGUE.
+//
+// The FFN ran gate and up as two GEMMs into bf16 [m, ffn] tensors, then swiglu_quant_rows read
+// both back to write the down projection's FP4 A operand: per 4096-row chunk of Muse Glimmer
+// (ffn 19968) that is 327 MB of bf16 written and read again for 41 MB of output. Here B is
+// gate and up interleaved row by row (row 2j = gate j, row 2j+1 = up j, see
+// launch_prefill_nvfp4_interleave_gate_up), so every 64x32 epilogue subtile holds both halves of
+// 16 SwiGLU outputs per row, and this EVT root turns them straight into FP4 + scale.
+//
+// Bit-identical to the three-launch path. The mainloop is BigM's, so each accumulator is the same
+// sum in the same k order. Each value then takes the path the separate GEMMs and
+// swiglu_quant_rows gave it: bf16(alpha * acc) per half (the stock epilogue's beta * C term is
+// zero), SiLU and multiply in float rounded once to bf16, the 16-value amax, ue4m3(amax / 6), and
+// x / qs through the same fp4_pack. The bf16 halves are staged in the collective's D buffer (D
+// itself is void, so nothing else uses it) by their tile coordinates, so the pairing does not
+// depend on how the MMA spreads columns over threads, and the mainloop keeps its stage count.
+template <class EpiTile, int FragmentSize>
+struct SwigluFp4Store {
+    using ElementAux = BF;   // types the collective's D staging, which this node borrows
+    static constexpr int EpiM = size<0>(EpiTile{});
+    static constexpr int EpiN = size<1>(EpiTile{});
+    static constexpr int EpiJ = EpiN / 2;          // SwiGLU outputs per subtile row
+    static_assert(EpiJ % 16 == 0, "a subtile row must cover whole 16-value scale groups");
+    using SfLayout = decltype(sfa_layout(128, 128, 128));
+    struct SharedStorage {};
+    struct Arguments {
+        float alpha_g = 1.f, alpha_u = 1.f;
+        unsigned char* dst = nullptr;           // [m, n/2] FP4, row-major, low nibble first
+        cutlass::float_ue4m3_t* sf = nullptr;   // the down GEMM's SFA
+        SfLayout sf_layout{};
+    };
+    using Params = Arguments;
+
+    template <class PS>
+    static constexpr Params to_underlying_arguments(PS const&, Arguments const& a, void*) { return a; }
+    template <class PS>
+    static bool can_implement(PS const& ps, Arguments const& a) {
+        auto [M, N, K, L] = append<4>(ps, 1);
+        return a.dst && a.sf && N % EpiN == 0;
+    }
+    template <class PS>
+    static size_t get_workspace_size(PS const&, Arguments const&) { return 0; }
+    template <class PS>
+    static cutlass::Status initialize_workspace(PS const&, Arguments const&, void*, cudaStream_t,
+                                                cutlass::CudaHostAdapter* = nullptr) {
+        return cutlass::Status::kSuccess;
+    }
+
+    CUTLASS_HOST_DEVICE SwigluFp4Store() {}
+    CUTLASS_HOST_DEVICE SwigluFp4Store(Params const& p, SharedStorage const&) : params_ptr(&p) {}
+    Params const* params_ptr = nullptr;
+
+    CUTLASS_DEVICE bool is_producer_load_needed() const { return false; }
+    CUTLASS_DEVICE bool is_C_load_needed() const { return false; }
+    template <class... Args>
+    CUTLASS_DEVICE auto get_producer_load_callbacks(
+        cutlass::epilogue::fusion::ProducerLoadArgs<Args...> const&) {
+        return cutlass::epilogue::fusion::EmptyProducerLoadCallbacks{};
+    }
+
+    template <class CTensor, int NT>
+    struct ConsumerStoreCallbacks : cutlass::epilogue::fusion::EmptyConsumerStoreCallbacks {
+        // (CPY,CPY_M,CPY_N,EPI_M,EPI_N) coordinates relative to this thread's first element, which
+        // sits at (om, on) of the whole output (the collective hands its residue, not its origin).
+        CTensor tCcD;
+        Params const* p;
+        int om, on, m0, j0, M, ld, thread_idx;
+        CUTLASS_DEVICE ConsumerStoreCallbacks(CTensor c, Params const* p_, int om_, int on_, int m0_,
+                                              int j0_, int M_, int ld_, int t)
+            : tCcD(c), p(p_), om(om_), on(on_), m0(m0_), j0(j0_), M(M_), ld(ld_), thread_idx(t) {}
+
+        template <class ElementAccumulator, class ElementInput>
+        CUTLASS_DEVICE cutlass::Array<float, FragmentSize>
+        visit(cutlass::Array<ElementAccumulator, FragmentSize> const& acc, int, int, int,
+              cutlass::Array<ElementInput, FragmentSize> const&) {
+            cutlass::Array<float, FragmentSize> r;
+            CUTLASS_PRAGMA_UNROLL
+            for (int i = 0; i < FragmentSize; ++i) r[i] = float(acc[i]);
+            return r;
+        }
+
+        template <class STensor, class SyncFn, class VTensor>
+        CUTLASS_DEVICE void reduce(STensor&& smem_buffer, SyncFn const& sync_fn, int epi_m,
+                                   int epi_n, bool, VTensor visit_results) {
+            __nv_bfloat16* sh = reinterpret_cast<__nv_bfloat16*>(raw_pointer_cast(smem_buffer.data()));
+            Tensor c = tCcD(_, _, _, epi_m, epi_n);
+            CUTLASS_PRAGMA_UNROLL
+            for (int f = 0; f < size(visit_results); ++f) {
+                CUTLASS_PRAGMA_UNROLL
+                for (int i = 0; i < FragmentSize; ++i) {
+                    auto crd = c(f * FragmentSize + i);
+                    const int ms = om + int(get<0>(crd)) - m0 - epi_m * EpiM;
+                    const int ns = on + int(get<1>(crd)) - 2 * j0 - epi_n * EpiN;
+                    const float al = (ns & 1) ? p->alpha_u : p->alpha_g;
+                    sh[ms * EpiN + ns] = __float2bfloat16(al * visit_results(f)[i]);
+                }
+            }
+            sync_fn();
+            // Four lanes per 16-value group, four values a lane; every epilogue thread busy.
+            constexpr int LPG = 4, VPL = 16 / LPG, GPR = EpiJ / 16;
+            static_assert((EpiM * GPR * LPG) % 32 == 0, "whole warps per pass (full-mask shuffle)");
+            const int glane = thread_idx & (LPG - 1);
+            for (int grp = thread_idx / LPG; grp < EpiM * GPR; grp += NT / LPG) {
+                const int rs = grp / GPR, k0 = (grp % GPR) * 16 + VPL * glane;
+                const __nv_bfloat162* s2 =
+                    reinterpret_cast<const __nv_bfloat162*>(sh + rs * EpiN + 2 * k0);
+                const int row = m0 + epi_m * EpiM + rs;
+                const int col = j0 + epi_n * EpiJ + k0;
+                float x[VPL];
+                float a = 0.f;
+                CUTLASS_PRAGMA_UNROLL
+                for (int q = 0; q < VPL; ++q) {
+                    const __nv_bfloat162 gu = s2[q];
+                    const float g = __bfloat162float(gu.x), u = __bfloat162float(gu.y);
+                    x[q] = __bfloat162float(__float2bfloat16(g / (1.f + __expf(-g)) * u));
+                    a = fmaxf(a, fabsf(x[q]));
+                }
+                CUTLASS_PRAGMA_UNROLL
+                for (int d = LPG >> 1; d; d >>= 1) a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, d));
+                cutlass::float_ue4m3_t qs(fmaxf(a * (1.f / 6.f), 0x1p-9f));
+                const float qsf = float(qs);
+                float xq[VPL];
+                CUTLASS_PRAGMA_UNROLL
+                for (int q = 0; q < VPL; ++q) xq[q] = x[q] / qsf;
+                unsigned short packed;
+                fp4_pack<VPL>(xq, reinterpret_cast<unsigned char*>(&packed));
+                if (row < M) {
+                    *reinterpret_cast<unsigned short*>(p->dst + (((size_t)row * ld + col) >> 1)) = packed;
+                    if (glane == 0) {
+                        auto scales = cute::make_tensor(p->sf, p->sf_layout);
+                        scales(row, col, 0) = qs;
+                    }
+                }
+            }
+            sync_fn();   // the next subtile reuses the buffer
+        }
+    };
+
+    template <bool RefSrc, class... Args>
+    CUTLASS_DEVICE auto get_consumer_store_callbacks(
+        cutlass::epilogue::fusion::ConsumerStoreArgs<Args...> const& args) {
+        auto [M, N, K, L] = args.problem_shape_mnkl;
+        auto [m, n, k, l] = args.tile_coord_mnkl;
+        constexpr int NT = decltype(size(args.tiled_copy))::value;
+        const int m0 = int(m) * int(size<0>(args.tile_shape_mnk));
+        const int j0 = int(n) * int(size<1>(args.tile_shape_mnk)) / 2;
+        const int om = int(M) - int(get<0>(args.residue_tCcD));
+        const int on = int(N) - int(get<1>(args.residue_tCcD));
+        return ConsumerStoreCallbacks<decltype(args.tCcD), NT>(
+            args.tCcD, params_ptr, om, on, m0, j0, int(M), int(N) / 2, args.thread_idx);
+    }
+};
+
+template <class TileShape, class Sched = cutlass::gemm::collective::KernelScheduleAuto>
+struct SwigluCfg {
+    using EpiTile = Shape<_64, _32>;
+    using Store = SwigluFp4Store<EpiTile, 4>;
+    using Callbacks = cutlass::epilogue::fusion::Sm90EVT<Store, cutlass::epilogue::fusion::Sm90AccFetch>;
+    using Epilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
+        cutlass::arch::Sm120, cutlass::arch::OpClassBlockScaledTensorOp, TileShape, Cluster,
+        EpiTile, float, float,
+        void, cutlass::layout::RowMajor, 8, void, cutlass::layout::RowMajor, 8,
+        cutlass::epilogue::collective::EpilogueScheduleAuto, Callbacks>::CollectiveOp;
+    using Mainloop = typename cutlass::gemm::collective::CollectiveBuilder<
+        cutlass::arch::Sm120, cutlass::arch::OpClassBlockScaledTensorOp,
+        E4, cutlass::layout::RowMajor, 32, E4, cutlass::layout::ColumnMajor, 32, float,
+        TileShape, Cluster,
+        cutlass::gemm::collective::StageCountAutoCarveout<
+            static_cast<int>(sizeof(typename Epilogue::SharedStorage))>,
+        Sched>::CollectiveOp;
+    using Kernel = cutlass::gemm::kernel::GemmUniversal<
+        Shape<int, int, int, int>, MmaEvictFirstB<Mainloop>, Epilogue, void>;
+    using Gemm = cutlass::gemm::device::GemmUniversalAdapter<Kernel>;
+};
+using SwigluCoop = SwigluCfg<Shape<_256, _128, _128>>;
+using SwigluPP256 = SwigluCfg<Shape<_128, _128, _256>, cutlass::gemm::KernelTmaWarpSpecializedPingpong>;
+using SwigluPP128 = SwigluCfg<Shape<_128, _128, _128>, cutlass::gemm::KernelTmaWarpSpecializedPingpong>;
+
+// Row r of the interleaved operand is row r/2 of gate (r even) or up (r odd), bytes and scales.
+template <class LayoutS, class LayoutD>
+__global__ void interleave_gate_up_kernel(const uint4* __restrict__ g, const uint4* __restrict__ u,
+                                          const cutlass::float_ue4m3_t* __restrict__ gsf,
+                                          const cutlass::float_ue4m3_t* __restrict__ usf,
+                                          uint4* __restrict__ d, cutlass::float_ue4m3_t* dsf,
+                                          int ffn, int k, LayoutS ls, LayoutD ld) {
+    const int row16 = k / 32;                       // uint4 per packed FP4 row
+    const long total = 2L * ffn * row16;
+    const long stride = (long)gridDim.x * blockDim.x;
+    for (long i = (long)blockIdx.x * blockDim.x + threadIdx.x; i < total; i += stride) {
+        const long r = i / row16, c = i % row16;
+        d[i] = ((r & 1) ? u : g)[(r >> 1) * row16 + c];
+    }
+    const long groups = 2L * ffn * (k / 16);
+    auto S_g = cute::make_tensor(gsf, ls);
+    auto S_u = cute::make_tensor(usf, ls);
+    auto D = cute::make_tensor(dsf, ld);
+    for (long i = (long)blockIdx.x * blockDim.x + threadIdx.x; i < groups; i += stride) {
+        const int r = (int)(i / (k / 16)), kk = (int)(i % (k / 16)) * 16;
+        D(r, kk, 0) = ((r & 1) ? S_u : S_g)(r >> 1, kk, 0);
+    }
+}
+
 // V is fixed by the format: one ue4m3 scale per 16 values. The mapping of lanes onto those 16 is
 // not, and it is worth a lot. One lane per value left half of every warp idle (lane < V) and stored
 // 8 bytes per warp -- 63 GB/s, 3.5% of peak. Two values per lane (LPV=8) put every lane live and
@@ -746,6 +949,59 @@ __global__ void swiglu_quant_rows(const __nv_bfloat16* __restrict__ gate,
         #pragma unroll
         for (int p = 0; p < VPL / 2; ++p) dst[(base >> 1) + p] = packed[p];
         if (glane == 0) { auto scales = cute::make_tensor(sf, layout); scales(row, k0, 0) = qs; }
+    }
+}
+
+// swiglu_quant_rows over gate and up interleaved column by column in one [rows, 2*cols] tensor --
+// the output of one GEMM over the row-interleaved gate/up operand (column 2j is gate j, 2j+1 is up
+// j). Each lane owns VPL outputs, so it reads VPL bf16 pairs; the arithmetic, the amax butterfly,
+// the scale and the packing are swiglu_quant_rows' own, so the bytes are the same.
+template <int LPG_, class Layout>
+__global__ void swiglu_il_quant_rows(const __nv_bfloat16* __restrict__ gu,
+                                     unsigned char* dst, cutlass::float_ue4m3_t* sf,
+                                     int rows, int cols, Layout layout) {
+    constexpr int LPG = LPG_, VPL = 16 / LPG, V = 16;
+    const int glane = threadIdx.x & (LPG - 1);
+    const int groups = rows * (cols / V);
+    const int stride = (gridDim.x * blockDim.x) / LPG;
+    for (int grp = (blockIdx.x * blockDim.x + threadIdx.x) / LPG;
+         grp < groups; grp += stride) {
+        const int row = grp / (cols / V), k0 = (grp % (cols / V)) * V;
+        const size_t base = (size_t)row * cols + k0 + VPL * glane;
+        const __nv_bfloat162* p2 =
+            reinterpret_cast<const __nv_bfloat162*>(gu + 2 * ((size_t)row * cols + k0 + VPL * glane));
+        float x[VPL];
+        float a = 0.f;
+        #pragma unroll
+        for (int p = 0; p < VPL; ++p) {
+            const __nv_bfloat162 q = p2[p];
+            const float g = __bfloat162float(q.x), u = __bfloat162float(q.y);
+            x[p] = __bfloat162float(__float2bfloat16(g / (1.f + __expf(-g)) * u));
+            a = fmaxf(a, fabsf(x[p]));
+        }
+        #pragma unroll
+        for (int d = LPG >> 1; d; d >>= 1) a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, d));
+        cutlass::float_ue4m3_t qs(fmaxf(a * (1.f / 6.f), 0x1p-9f));
+        unsigned char packed[VPL / 2];
+        const float qsf = float(qs);
+        float xq[VPL];
+        #pragma unroll
+        for (int p = 0; p < VPL; ++p) xq[p] = x[p] / qsf;
+        fp4_pack<VPL>(xq, packed);
+        #pragma unroll
+        for (int p = 0; p < VPL / 2; ++p) dst[(base >> 1) + p] = packed[p];
+        if (glane == 0) { auto scales = cute::make_tensor(sf, layout); scales(row, k0, 0) = qs; }
+    }
+}
+
+// [rows, 2*cols] interleaved -> gate [rows, cols], up [rows, cols]: a plain copy, for the consumers
+// that read the two halves as separate planes.
+__global__ void deinterleave_gu_kernel(const unsigned* __restrict__ gu, __nv_bfloat16* __restrict__ g,
+                                       __nv_bfloat16* __restrict__ u, long n) {
+    for (long i = (long)blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (long)gridDim.x * blockDim.x) {
+        const unsigned v = gu[i];
+        reinterpret_cast<unsigned short*>(g)[i] = (unsigned short)(v & 0xffffu);
+        reinterpret_cast<unsigned short*>(u)[i] = (unsigned short)(v >> 16);
     }
 }
 
@@ -1240,6 +1496,166 @@ __global__ __launch_bounds__(kNormQuantThreads) void norm_add_norm_quant_exact(
         }
     }
 }
+// launch_muse_sandwich_tail (si_fused, fast-math) with the next projection's FP4 A operand
+// written in the same pass, for the packed decode: x = residual + RMSNorm(branch) * post_w,
+// xn = RMSNorm(x) * next_w, Q8_1(xn), and quant_rows_t's FP4 + scales of xn. The tail kernel's
+// register path, one 8-wide pack per thread of a 1024-thread block, in the instructions it
+// compiles to (fma.rn.ftz square sums, add.ftz butterflies with the second level on every warp,
+// div.approx.ftz + add.ftz + rsqrt.approx.ftz, mul.ftz / fma.rn.ftz for the outputs, and the Q8_1
+// block's div.approx and round-half-away), so x, xn and the Q8_1 blocks are its bytes; the FP4
+// pass is rmsnorm_quant_rows_exact's quantize over the stored xn, a 16-value block per lane pair.
+struct si_q8_blk { __half2 ds; signed char qs[32]; };
+__device__ __forceinline__ float fm_div(float a, float b) {
+    float d; asm("div.approx.ftz.f32 %0, %1, %2;" : "=f"(d) : "f"(a), "f"(b)); return d;
+}
+__device__ __forceinline__ int fm_round_i(float x) {
+    // roundf under --use_fast_math: trunc(x + copysign(0.5, x)) with the add rounded to zero
+    float h, t; int r;
+    asm("copysign.f32 %0, %1, %2;" : "=f"(h) : "f"(x), "f"(0.5f));
+    asm("add.rz.ftz.f32 %0, %1, %2;" : "=f"(t) : "f"(x), "f"(h));
+    asm("cvt.rzi.f32.f32 %0, %1;" : "=f"(t) : "f"(t));
+    asm("cvt.rzi.ftz.s32.f32 %0, %1;" : "=r"(r) : "f"(t));
+    return r;
+}
+template <class Layout>
+__global__ __launch_bounds__(1024) void muse_tail_fp4_exact(
+        const __nv_bfloat16* __restrict__ residual, const __nv_bfloat16* __restrict__ branch,
+        const __nv_bfloat16* __restrict__ post_w, const __nv_bfloat16* __restrict__ next_w,
+        __nv_bfloat16* __restrict__ out_x, __nv_bfloat16* __restrict__ out_xn,
+        si_q8_blk* __restrict__ out_q8, unsigned char* __restrict__ dst,
+        cutlass::float_ue4m3_t* __restrict__ sf, int cols, float post_eps, float eps,
+        Layout layout) {
+    const int row = blockIdx.x;
+    const size_t base = (size_t)row * cols;
+    const int npack = cols >> 3;
+    const int p = threadIdx.x;
+    const bool live = p < npack;
+    __shared__ float s_warp[32], s_warp2[32];
+    auto unpack8 = [](const uint4& q, float* o) {
+        const __nv_bfloat16* h = reinterpret_cast<const __nv_bfloat16*>(&q);
+        #pragma unroll
+        for (int j = 0; j < 8; j++) o[j] = __bfloat162float(h[j]);
+    };
+    float bv[8], rv[8], pv[8], nv[8];
+    if (live) {
+        unpack8(__ldg(reinterpret_cast<const uint4*>(branch + base) + p), bv);
+        unpack8(__ldg(reinterpret_cast<const uint4*>(residual + base) + p), rv);
+        unpack8(__ldg(reinterpret_cast<const uint4*>(post_w) + p), pv);
+        unpack8(__ldg(reinterpret_cast<const uint4*>(next_w) + p), nv);
+    }
+    float ss = 0.f;
+    if (live) {
+        #pragma unroll
+        for (int j = 0; j < 8; j++) ss = fm_fma(bv[j], bv[j], ss);
+    }
+    ss = fm_warp_sum(ss);
+    if ((p & 31) == 0) s_warp[p >> 5] = ss;
+    __syncthreads();
+    float inv1;
+    {
+        float v = s_warp[p & 31];
+        v = fm_warp_sum(v);
+        float r = fm_add(fm_div(v, (float)cols), post_eps);
+        asm("rsqrt.approx.ftz.f32 %0, %1;" : "=f"(inv1) : "f"(r));
+    }
+    float xv[8];
+    float ss2 = 0.f;
+    if (live) {
+        uint4 o;
+        __nv_bfloat16* ob = reinterpret_cast<__nv_bfloat16*>(&o);
+        #pragma unroll
+        for (int j = 0; j < 8; j++) {
+            ob[j] = __float2bfloat16(fm_fma(fm_mul(bv[j], inv1), pv[j], rv[j]));
+            xv[j] = __bfloat162float(ob[j]);
+            ss2 = fm_fma(xv[j], xv[j], ss2);
+        }
+        reinterpret_cast<uint4*>(out_x + base)[p] = o;
+    }
+    ss2 = fm_warp_sum(ss2);
+    if ((p & 31) == 0) s_warp2[p >> 5] = ss2;
+    __syncthreads();
+    float inv2;
+    {
+        float v = s_warp2[p & 31];
+        v = fm_warp_sum(v);
+        float r = fm_add(fm_div(v, (float)cols), eps);
+        asm("rsqrt.approx.ftz.f32 %0, %1;" : "=f"(inv2) : "f"(r));
+    }
+    float q[8];
+    float a = 0.f;
+    if (live) {
+        uint4 o;
+        __nv_bfloat16* ob = reinterpret_cast<__nv_bfloat16*>(&o);
+        #pragma unroll
+        for (int j = 0; j < 8; j++) {
+            ob[j] = __float2bfloat16(fm_mul(fm_mul(xv[j], inv2), nv[j]));
+            q[j] = __bfloat162float(ob[j]);
+        }
+        reinterpret_cast<uint4*>(out_xn + base)[p] = o;
+        #pragma unroll
+        for (int i = 0; i < 4; i++) a = fmaxf(a, fmaxf(fabsf(q[2 * i]), fabsf(q[2 * i + 1])));
+    }
+    // Q8_1 block b of 32 values is lanes 4b..4b+3 (the launcher requires whole warps live).
+    if (out_q8 && live) {
+        const int b = p >> 2, r = p & 3;
+        auto fmax_ftz = [](float x, float y) {
+            float r; asm("max.ftz.f32 %0, %1, %2;" : "=f"(r) : "f"(x), "f"(y)); return r;
+        };
+        auto fabs_ftz = [](float x) { float r; asm("abs.ftz.f32 %0, %1;" : "=f"(r) : "f"(x)); return r; };
+        float amax = 0.f;
+        #pragma unroll
+        for (int j = 0; j < 8; j++) amax = fmax_ftz(amax, fabs_ftz(q[j]));
+        amax = fmax_ftz(amax, __shfl_xor_sync(0xffffffffu, amax, 1));
+        amax = fmax_ftz(amax, __shfl_xor_sync(0xffffffffu, amax, 2));
+        const float d = fm_div(amax, 127.0f);
+        si_q8_blk* ob = out_q8 + (size_t)row * (cols >> 5) + b;
+        int sacc = 0;
+        unsigned w[2] = {0u, 0u};
+        #pragma unroll
+        for (int j = 0; j < 8; j++) {
+            const int qi = (amax == 0.0f) ? 0 : fm_round_i(fm_div(q[j], d));
+            w[j >> 2] |= ((unsigned)qi & 255u) << ((j & 3) * 8);
+            sacc += qi;
+        }
+        unsigned* qw = reinterpret_cast<unsigned*>(ob->qs + r * 8);
+        qw[0] = w[0];
+        qw[1] = w[1];
+        sacc += __shfl_xor_sync(0xffffffffu, sacc, 1);
+        sacc += __shfl_xor_sync(0xffffffffu, sacc, 2);
+        if (r == 0) ob->ds = __floats2half2_rn(d, fm_mul(d, (float)sacc));
+    }
+    // FP4: a pack and its pair are one 16-value scale block (npack is even).
+    a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, 1));
+    if (live) {
+        cutlass::float_ue4m3_t qs(fmaxf(a * (1.f / 6.f), 0x1p-9f));
+        const float qsf = float(qs);
+        unsigned char packed[4];
+        float xq[8];
+        #pragma unroll
+        for (int i = 0; i < 8; i++) xq[i] = q[i] / qsf;
+        fp4_pack<8>(xq, packed);
+        *reinterpret_cast<unsigned int*>(dst + ((base + (size_t)p * 8) >> 1)) =
+            *reinterpret_cast<const unsigned int*>(packed);
+        if ((p & 1) == 0) { auto scales = cute::make_tensor(sf, layout); scales(row, p * 8, 0) = qs; }
+    }
+}
+bool launch_muse_tail_fp4_exact(const void* residual, const void* branch, const void* post_w,
+                                const void* next_w, void* out_x, void* out_xn, void* out_q8,
+                                void* dst_fp4, void* dst_sf, int rows, int rows_op, int cols,
+                                float post_eps, float eps, cudaStream_t st) {
+    const int npack = cols >> 3;
+    if (!residual || !branch || !post_w || !next_w || !out_x || !out_xn || !dst_fp4 || !dst_sf ||
+        rows < 1 || rows > rows_op || (cols & 31) || npack > 1024 || (npack & 31) ||
+        !prefill_nvfp4_supported(rows_op, 128, cols))
+        return false;
+    auto l = sfa_layout(rows_op, 128, cols);
+    muse_tail_fp4_exact<<<rows, 1024, 0, st>>>(
+        (const __nv_bfloat16*)residual, (const __nv_bfloat16*)branch,
+        (const __nv_bfloat16*)post_w, (const __nv_bfloat16*)next_w, (__nv_bfloat16*)out_x,
+        (__nv_bfloat16*)out_xn, (si_q8_blk*)out_q8, (unsigned char*)dst_fp4,
+        (cutlass::float_ue4m3_t*)dst_sf, cols, post_eps, eps, l);
+    return cudaPeekAtLastError() == cudaSuccess;
+}
 bool launch_prefill_nvfp4_quant_a(const void* s, void* d, void* sf, int m, int k, cudaStream_t st) {
     if (!s || !d || !sf || !prefill_nvfp4_supported(m,128,k)) return false;
     auto l = sfa_layout(m,128,k);
@@ -1332,6 +1748,95 @@ bool launch_prefill_nvfp4_swiglu_quant_a(const void* g, const void* u, void* d, 
         swiglu_quant_rows<2><<<blocks,256,0,st>>>((const __nv_bfloat16*)g,(const __nv_bfloat16*)u,
                                             (unsigned char*)d,(cutlass::float_ue4m3_t*)sf,m,k,l);
     return cudaPeekAtLastError() == cudaSuccess;
+}
+bool launch_prefill_nvfp4_swiglu_il_quant_a(const void* gu, void* d, void* sf, int m, int k,
+                                            cudaStream_t st) {
+    if (!gu || !d || !sf || !prefill_nvfp4_supported(m,128,k)) return false;
+    auto l = sfa_layout(m,128,k);
+    const int lpg = (m > 0 && m <= kQuantNarrowLaneMaxRows) ? 8 : 2;
+    int blocks = (m * (k / 16) * lpg + 255) / 256; if (blocks > 4096) blocks = 4096;
+    if (lpg == 8)
+        swiglu_il_quant_rows<8><<<blocks,256,0,st>>>((const __nv_bfloat16*)gu, (unsigned char*)d,
+                                                     (cutlass::float_ue4m3_t*)sf, m, k, l);
+    else
+        swiglu_il_quant_rows<2><<<blocks,256,0,st>>>((const __nv_bfloat16*)gu, (unsigned char*)d,
+                                                     (cutlass::float_ue4m3_t*)sf, m, k, l);
+    return cudaPeekAtLastError() == cudaSuccess;
+}
+bool launch_bf16_deinterleave_gate_up(const void* gu, void* g, void* u, int m, int k,
+                                      cudaStream_t st) {
+    if (!gu || !g || !u) return false;
+    const long n = (long)m * k;
+    int blocks = (int)((n + 255) / 256); if (blocks > 4096) blocks = 4096;
+    deinterleave_gu_kernel<<<blocks,256,0,st>>>((const unsigned*)gu, (__nv_bfloat16*)g,
+                                                (__nv_bfloat16*)u, n);
+    return cudaPeekAtLastError() == cudaSuccess;
+}
+bool launch_prefill_nvfp4_interleave_gate_up(const void* g, const void* gsf, const void* u,
+                                             const void* usf, void* d, void* dsf, int ffn, int k,
+                                             cudaStream_t st) {
+    if (!g || !gsf || !u || !usf || !d || !dsf || !prefill_nvfp4_supported(128, 2 * ffn, k))
+        return false;
+    interleave_gate_up_kernel<<<2048, 256, 0, st>>>(
+        (const uint4*)g, (const uint4*)u, (const cutlass::float_ue4m3_t*)gsf,
+        (const cutlass::float_ue4m3_t*)usf, (uint4*)d, (cutlass::float_ue4m3_t*)dsf, ffn, k,
+        sfb_layout(128, ffn, k), sfb_layout(128, 2 * ffn, k));
+    return cudaPeekAtLastError() == cudaSuccess;
+}
+namespace {
+template <class C>
+bool run_gate_up_swiglu(const void* a, const void* sa, const void* b_gu, const void* sb_gu,
+                        void* d_fp4, void* d_sf, int m, int ffn, int k, float alpha_g,
+                        float alpha_u, void* ws, cudaStream_t st) {
+    const int n = 2 * ffn;
+    auto as = cutlass::make_cute_packed_stride(typename C::Kernel::StrideA{}, {m, k, 1});
+    auto bs = cutlass::make_cute_packed_stride(typename C::Kernel::StrideB{}, {n, k, 1});
+    typename C::Store::Arguments sa_args{alpha_g, alpha_u, static_cast<unsigned char*>(d_fp4),
+                                         static_cast<cutlass::float_ue4m3_t*>(d_sf),
+                                         sfa_layout(m, 128, ffn)};
+    typename C::Gemm::Arguments ar{
+        cutlass::gemm::GemmUniversalMode::kGemm, shape(m, n, k),
+        {static_cast<const cutlass::float_e2m1_t*>(a), as,
+         static_cast<const cutlass::float_e2m1_t*>(b_gu), bs,
+         static_cast<const cutlass::float_ue4m3_t*>(sa), sfa_layout(m, n, k),
+         static_cast<const cutlass::float_ue4m3_t*>(sb_gu), sfb_layout(m, n, k)},
+        {{{}, sa_args}, nullptr, {}, nullptr, {}}};
+    typename C::Gemm gemm;
+    return gemm.can_implement(ar) == cutlass::Status::kSuccess &&
+           C::Gemm::get_workspace_size(ar) == 0 &&
+           gemm.initialize(ar, ws, st) == cutlass::Status::kSuccess &&
+           gemm.run(st, nullptr, g_gemm_pdl) == cutlass::Status::kSuccess;
+}
+} // namespace
+// The tile follows m: at <= 256 rows the GEMM streams the weights and the 128x128x256 pingpong
+// overlaps one warp group's epilogue with the other's mainloop (98.7 us against 108.1 for gate +
+// up + the SwiGLU quantize at Muse's shape, 128 rows); from 2048 rows it is compute-bound and the
+// cooperative 256x128 tile wins (1663 against 1812 at 4096). SPARKINFER_GU_SWIGLU_CFG forces one:
+// 0 cooperative 256x128x128, 1 pingpong 128x128x256, 2 pingpong 128x128x128.
+bool launch_prefill_nvfp4_gate_up_swiglu(const void* a, const void* sa, const void* b_gu,
+                                         const void* sb_gu, void* d_fp4, void* d_sf, int m,
+                                         int ffn, int k, float alpha_g, float alpha_u, void* ws,
+                                         cudaStream_t st) {
+    if (!a || !sa || !b_gu || !sb_gu || !d_fp4 || !d_sf || !prefill_nvfp4_supported(m, 2 * ffn, k))
+        return false;
+    static const int cfg_env = [] {
+        const char* e = getenv("SPARKINFER_GU_SWIGLU_CFG");
+        return e ? atoi(e) : -1;
+    }();
+    const int cfg = cfg_env >= 0 ? cfg_env : (m <= 256 ? 1 : 0);
+    if (cfg == 1) return run_gate_up_swiglu<SwigluPP256>(a, sa, b_gu, sb_gu, d_fp4, d_sf, m, ffn, k, alpha_g, alpha_u, ws, st);
+    if (cfg == 2) return run_gate_up_swiglu<SwigluPP128>(a, sa, b_gu, sb_gu, d_fp4, d_sf, m, ffn, k, alpha_g, alpha_u, ws, st);
+    return run_gate_up_swiglu<SwigluCoop>(a, sa, b_gu, sb_gu, d_fp4, d_sf, m, ffn, k, alpha_g, alpha_u, ws, st);
+}
+bool launch_prefill_nvfp4_gate_up_swiglu_pdl(const void* a, const void* sa, const void* b_gu,
+                                             const void* sb_gu, void* d_fp4, void* d_sf, int m,
+                                             int ffn, int k, float alpha_g, float alpha_u,
+                                             void* ws, cudaStream_t st) {
+    g_gemm_pdl = true;
+    const bool ok = launch_prefill_nvfp4_gate_up_swiglu(a, sa, b_gu, sb_gu, d_fp4, d_sf, m, ffn, k,
+                                                        alpha_g, alpha_u, ws, st);
+    g_gemm_pdl = false;
+    return ok;
 }
 bool launch_prefill_nvfp4_quant_b(const void* s, void* d, void* sf, int n, int k, cudaStream_t st) {
     if (!s || !d || !sf || !prefill_nvfp4_supported(128,n,k)) return false;

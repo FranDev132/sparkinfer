@@ -95,6 +95,12 @@ struct Qwen35LayerWeights {
     // unsupported shapes continue to use the GGUF-native pointers above.
     const void* gate_fp4 = nullptr; const void* gate_fp4_sf = nullptr;
     const void* up_fp4 = nullptr;   const void* up_fp4_sf = nullptr;
+    // Muse: gate and up held as ONE [2*ffn, H] operand, rows interleaved (2j gate j, 2j+1 up j),
+    // so a single GEMM covers both and its epilogue can form SwiGLU. When set, gate_fp4/gate_fp4_sf
+    // and up_fp4/up_fp4_sf all point at that operand: they still say "this layer has FP4 gate/up"
+    // to every presence test, but they are NOT separate [ffn, H] operands, and the two consumers
+    // (the batched prefill FFN and packed_gate_up_nvfp4) branch on this flag.
+    bool gu_interleaved = false;
     // 1/weight_global_scale for checkpoint-native NVFP4 B operands. Muse's
     // from-bf16 quant_b copies leave this at 1 (global already folded into UE4M3).
     float gate_fp4_alpha = 1.f, up_fp4_alpha = 1.f, down_fp4_alpha = 1.f;
