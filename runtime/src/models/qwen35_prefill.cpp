@@ -508,6 +508,12 @@ VerifyGraphCache& verify_eager_cache() {
     static thread_local VerifyGraphCache cache;
     return cache;
 }
+// The scratch batched prefill holds across calls (prefill_batched_run, "---- scratch ----").
+struct PrefillKeptArenas { Arena a, a8, am, aw; };
+PrefillKeptArenas& prefill_kept_arenas() {
+    static thread_local PrefillKeptArenas k;
+    return k;
+}
 } // namespace
 
 void dflash_release_verify_cache() {
@@ -534,6 +540,28 @@ bool prefill_release_ternary_fp4_keep() {
     cudaDeviceSynchronize();   // a pass in flight may still be reading the legs
     bc.release();
     fprintf(stderr, "[prefill-bonsai] kept NVFP4 legs released: the VRAM is needed\n");
+    return true;
+}
+
+// Gives back the scratch batched prefill keeps between passes, and the kernel-level scratch a pass
+// grew, for a caller that cannot get its own memory. The next pass allocates them again; the
+// whole-prefill graph that recorded them sees the arena generations move and is not replayed.
+// Returns whether anything was held.
+static bool prefill_release_kept_scratch() {
+    PrefillKeptArenas& k = prefill_kept_arenas();
+    const size_t held = k.a.total() + k.a8.total() + k.am.total() + k.aw.total();
+    if (!held) return false;
+    kernels::prefill_scratch_release();
+    k.a.free_all();
+    k.a8.free_all();
+    k.am.free_all();
+    k.aw.free_all();
+    static bool said = false;
+    if (!said) {
+        said = true;
+        fprintf(stderr, "[prefill] kept scratch released (%zu MB): a verify needs its arena\n",
+                held >> 20);
+    }
     return true;
 }
 
@@ -850,8 +878,9 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
         return (size_t)(v > 0 ? v : 2048) << 20;
     }();
     static const bool arena_dbg = getenv("SPARKINFER_PREFILL_ARENA_DEBUG") != nullptr;
-    static thread_local Arena keep_a, keep_a8, keep_am, keep_aw;   // held across calls
-    Arena once_a, once_a8, once_am, once_aw;                       // per-call otherwise
+    PrefillKeptArenas& kept = prefill_kept_arenas();   // held across calls
+    Arena &keep_a = kept.a, &keep_a8 = kept.a8, &keep_am = kept.am, &keep_aw = kept.aw;
+    Arena once_a, once_a8, once_am, once_aw;           // per-call otherwise
     if (arena_reuse) { keep_a.rewind(); keep_a8.rewind(); keep_am.rewind(); keep_aw.rewind(); }
     Arena& a = arena_reuse ? keep_a : once_a;
 
@@ -6183,6 +6212,24 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
     bf16* rec_a = any_linear ? a.alloc<bf16>((size_t)c.n_layers * NA * vh) : nullptr;
     bf16* rec_b = any_linear ? a.alloc<bf16>((size_t)c.n_layers * NA * vh) : nullptr;
     if (!a.ok) {
+        // The prompts' batched passes keep up to 2 GB of scratch for the next prompt, and a
+        // verify that cannot get its arena declines: a packed decode then steps every row on its
+        // own, eagerly once the per-row graphs cannot be captured either. Qwen3.8 at c=32 leaves
+        // its prompt passes holding ~1.1 GB with ~40 MB free, and the whole decode ran that way
+        // (1,105 tok/s against 1,670 in the runs where the arena fit). That scratch is a cache the
+        // next pass regrows: give it back and build this arena once more. Nothing above has
+        // launched work, so running the call again from the top is the same call.
+        static thread_local bool regrow = false;
+        if (!regrow && prefill_release_kept_scratch()) {
+            // The failed cudaMalloc is still the thread's last error, and CUTLASS reads that back
+            // after its first launch: the retry's first GEMM would report failure.
+            cudaGetLastError();
+            regrow = true;
+            const int r = dflash_verify_short_run(s, token_ids, n, start_pos, capture_layers,
+                                                  n_capture, capture_dst, out_argmax, capture_only);
+            regrow = false;
+            return r;
+        }
         // Name the size. "allocation failed" alone reads as a bug; on a full card it is the card
         // being full, and the prefill path's own fallback message already reports it that way.
         size_t vfree = 0, vtot = 0;
