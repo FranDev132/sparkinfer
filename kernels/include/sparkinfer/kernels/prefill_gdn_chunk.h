@@ -44,14 +44,16 @@ namespace kernels {
 // qh_block: v-head -> q/k-head broadcast convention; see launch_qwen36_gdn_ar's own comment
 // (fused.h). Must match whatever the decode-path GDN kernel uses for the same checkpoint.
 // slot: which of the per-slot workspaces the scan uses (0..3), so scans on different streams at
-// once each get their own.
+// once each get their own. prep_done (optional) is recorded on `stream` between the first prep
+// kernel and its scan.
 bool launch_prefill_gdn_chunk(const void* q, const void* k, const void* v,
                               const void* alpha, const void* beta,
                               const void* dt, const void* a,
                               float* state, void* out,
                               int n_tokens, int q_heads, int v_heads, int head_dim,
                               bool qh_block, cudaStream_t stream = nullptr,
-                              bool carry_in = false, int slot = 0);
+                              bool carry_in = false, int slot = 0,
+                              cudaEvent_t prep_done = nullptr);
 
 }  // namespace kernels
 }  // namespace sparkinfer

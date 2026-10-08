@@ -1206,7 +1206,7 @@ bool launch_prefill_gdn_chunk(const void* q, const void* k, const void* v,
                               float* state, void* out,
                               int n_tokens, int q_heads, int v_heads, int head_dim,
                               bool qh_block, cudaStream_t stream,
-                              bool carry_in, int slot) {
+                              bool carry_in, int slot, cudaEvent_t prep_done) {
     constexpr int C = 32, HD = 128, PREP_THREADS = 256;
     // State columns per scan block. JC_S is the shape every context used before; JC_B halves the
     // grid — see use_big below for why that is the whole point at long context.
@@ -1372,6 +1372,10 @@ bool launch_prefill_gdn_chunk(const void* q, const void* k, const void* v,
         pf_gdnc_prep_kernel<C, HD><<<gprep, PREP_THREADS, sm_prep, stream>>>(
             qb, kb, vb, ab, bb, db, aa, g_buf, w_buf, u_buf, m_buf,
             len, q_heads, v_heads, qh_block, prep_warp_inv);
+        if (prep_done) {
+            cudaEventRecord(prep_done, stream);
+            prep_done = nullptr;
+        }
         if (use_mma) {
             auto go = [&](auto wpc_tag) {
                 constexpr int W = decltype(wpc_tag)::value;

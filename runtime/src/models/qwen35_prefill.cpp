@@ -2551,17 +2551,21 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
     }();
     // A ternary leg's NVFP4 operand: the kept copy where BonsaiFp4Cache holds it (d and sf then
     // point there), else converted into the scratch d and sf already point at.
-    auto fp4_leg = [&](const void* W, int rows, int k, void** d, void** sf) -> bool {
+    auto fp4_leg = [&](const void* W, int rows, int k, void** d, void** sf,
+                       cudaStream_t ls = nullptr) -> bool {
         if (const BonsaiFp4Cache::Leg* kept = bonsai_fp4_cache().find(W, rows, k)) {
             *d = kept->d;
             *sf = kept->sf;
             return true;
         }
-        return kernels::launch_ptq1_rows_nvfp4(W, *d, nullptr, rows, k, st, *sf);
+        return kernels::launch_ptq1_rows_nvfp4(W, *d, nullptr, rows, k, ls ? ls : st, *sf);
     };
     // One leg on tfp4_act's operand: C = A @ W^T (resid: C += it). False, before writing C, only
     // where the leg's shape does not fit; the caller then runs its int8 legs.
-    auto tfp4_gemm = [&](const void* W, int n_out, bf16* C, bool resid) -> bool {
+    // gs: the stream it runs on (st when null).
+    auto tfp4_gemm = [&, st0 = st](const void* W, int n_out, bf16* C, bool resid,
+                                   cudaStream_t gs = nullptr) -> bool {
+        const cudaStream_t st = gs ? gs : st0;
         const int K = f4_K;
         void *wd, *wr, *wl, *ad, *ar, *al;
         if (!f4_A || !W || (n_out % 128) ||
@@ -2569,7 +2573,7 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
             (N8 < N && (size_t)8 * n_out > maxw))
             return false;
         const float alpha = kernels::ptq1_nvfp4_alpha();
-        fp4_leg(W, n_out, K, &wd, &wl);
+        fp4_leg(W, n_out, K, &wd, &wl, st);
         const size_t a_main = fp4_parts(A_i8, N8, K, &ad, &ar, &al, false);
         kernels::launch_prefill_nvfp4_gemm_fill(ad, al, wd, wl, C, N8, n_out, K, nullptr, st,
                                                 alpha, resid ? C : nullptr);
@@ -2622,7 +2626,8 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
     bool xn_fp8_ready = false;
     auto gdn_qkv_z = [&](const bf16* A, const Qwen35LayerWeights& w, bool norm_deferred,
                          bool* z_pending = nullptr, const Qwen35LayerWeights* gt = nullptr,
-                         const BonsaiShadowRs* grs = nullptr, bool* z_tern = nullptr) {
+                         const BonsaiShadowRs* grs = nullptr, bool* z_tern = nullptr,
+                         bool* z_fp4 = nullptr) {
         // Checkpoint-native NVFP4: quantize xn to FP4 ONCE (both projections read it) and run two
         // block-scaled GEMMs straight off the packed nibbles. A_i8/sx are not touched, so the int8
         // activation memo stays valid for whatever runs next in the layer.
@@ -2721,11 +2726,14 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                 // Declined: the folded arms below redo A_i8 (trotq cleared the memo).
             }
             // Past the fused GEMM's M limit: both legs on the FP4 tensor cores, z on st as well
-            // (*z_pending stays false, so the caller does not launch it again).
+            // (*z_pending stays false, so the caller does not launch it again) -- or, with z_fp4,
+            // qkv alone, the caller running z on the side stream (*z_fp4 set).
             if (gt && (tproj_mask & 8) && !norm_deferred && gt->wqkv_type == kPtq1GgmlType &&
                 gt->wqkv_gate_type == kPtq1GgmlType && tfp4_act(A, s.bonsai_sign_hidden, H) &&
-                tfp4_gemm(gt->wqkv, lqkv, b8, false) && tfp4_gemm(gt->wqkv_gate, lvdim, lz, false))
-                return;
+                tfp4_gemm(gt->wqkv, lqkv, b8, false)) {
+                if (z_fp4) { *z_fp4 = true; return; }
+                if (tfp4_gemm(gt->wqkv_gate, lvdim, lz, false)) return;
+            }
             if (z_pending && use_i8 && w.wqkv_rs && w.wqkv_gate_rs &&
                 w.wqkv_gate_type == w.wqkv_type &&
                 kernels::pf_dense_gemm_qi8_supported(w.wqkv_type)) {
@@ -2945,19 +2953,35 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
             const int gdn_overlap_mode =
                 gdn_overlap_env_mode >= 0 ? gdn_overlap_env_mode : (N > 128 ? 2 : 1);
             const bool gdn_overlap_env = gdn_overlap_mode > 0;
-            static cudaEvent_t gdn_ev[4] = {};                 // fork, alpha/beta, qkv, z
+            static cudaEvent_t gdn_ev[5] = {};   // fork, alpha/beta, qkv, z, prep
+            auto gdn_events = [&] {
+                for (auto& e : gdn_ev)
+                    if (!e && cudaEventCreateWithFlags(&e, cudaEventDisableTiming) != cudaSuccess)
+                        return false;
+                return true;
+            };
             const bool gdn_ov = gdn_overlap_env && s.stream_k && s.stream_k != st && !moe &&
                 qb_dense_pass && qb_fires && use_i8 && !attn_norm_deferred &&
                 w.ssm_alpha_type == 0 && w.ssm_beta_type == 0 && w.wqkv_rs && w.wqkv_gate_rs &&
                 w.wqkv_gate_type == w.wqkv_type &&
                 kernels::pf_dense_gemm_qi8_supported(w.wqkv_type) && a_i8_fits(N, H) &&
-                [&] {
-                    for (auto& e : gdn_ev)
-                        if (!e && cudaEventCreateWithFlags(&e, cudaEventDisableTiming) != cudaSuccess)
-                            return false;
-                    return true;
-                }();
+                gdn_events();
+            // Ternary-Bonsai-2's long prompt (past the fused GEMM's M limit) runs qkv and z as FP4
+            // legs (gdn_qkv_z's tfp4 arm). Of the chain only the scan leaves the device idle -- one
+            // wave of 96 blocks -- while the conv and the prep fill it. So z's leg (its conversion
+            // into W_i8, after the qkv GEMM that reads W_i8, and its GEMM) waits on sk for the prep
+            // and runs beside the scan, and alpha/beta run on sk ahead of it, joined after the conv
+            // since the prep is their first reader. Nothing on st writes A_i8 or W_i8 until the
+            // gated norm, after the z join. One prompt, no checkpoints, no decode rows: the path
+            // whose conv and scan are the two launches below.
+            const bool gdn_tov = !gdn_ov && gdn_overlap_env && s.stream_k && s.stream_k != st &&
+                !moe && !multi && s.ckpt_n == 0 && R == 0 &&
+                tl && trs && (tproj_mask & 8) && !attn_norm_deferred &&
+                tl->wqkv_type == kPtq1GgmlType && tl->wqkv_gate_type == kPtq1GgmlType &&
+                s.bonsai_sign_hidden && w.ssm_alpha_type == 0 && w.ssm_beta_type == 0 &&
+                tfp4_takes(H, lqkv) && tfp4_takes(H, lvdim) && gdn_events();
             bool z_pending = false;    // z is running on the side stream; join before the gated norm
+            bool z_defer = false;      // z's leg goes on sk once the scan's prep is queued (gdn_tov)
             if (gdn_ov) {
                 cudaStream_t sk = s.stream_k;
                 const bool ab_mma = !moe && (N > bf16_minctx || dense_bf16_mma);
@@ -2989,6 +3013,21 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                 pf_cu(cudaStreamWaitEvent(st, gdn_ev[1], 0), "gdn alpha/beta join");
                 if (z_on_st)
                     proj_fused(xn, w.wqkv_gate, w.wqkv_gate_type, w.wqkv_gate_rs, lz, lvdim, H);
+            } else if (gdn_tov) {
+                cudaStream_t sk = s.stream_k;
+                pf_cu(cudaEventRecord(gdn_ev[0], st), "gdn fork");
+                pf_cu(cudaStreamWaitEvent(sk, gdn_ev[0], 0), "gdn fork wait");
+                // The pair, or where it declines (split-K rows) the two GEMMs proj() runs.
+                if (!kernels::launch_prefill_gemm_skinny_pair(xn, w.ssm_alpha, w.ssm_beta, la, lb,
+                                                              N, vh, H, sk)) {
+                    const bool ab_mma = N > bf16_minctx || dense_bf16_mma;
+                    kernels::launch_prefill_gemm(xn, w.ssm_alpha, la, N, vh, H, sk, ab_mma);
+                    kernels::launch_prefill_gemm(xn, w.ssm_beta,  lb, N, vh, H, sk, ab_mma);
+                }
+                pf_cu(cudaEventRecord(gdn_ev[1], sk), "gdn alpha/beta done");
+                gdn_qkv_z(xn, w, attn_norm_deferred, nullptr, tl, trs, nullptr,
+                          gdn_overlap_mode >= 2 ? &z_defer : nullptr);
+                if (z_defer) pf_cu(cudaEventRecord(gdn_ev[2], st), "gdn qkv done");
             } else {
                 gdn_qkv_z(xn, w, attn_norm_deferred, nullptr, tl, trs);   // qkv + z gate (fp8: fused)
                 // bf16 alpha/beta both reach launch_prefill_gemm_skinny through proj(); past its
@@ -3161,13 +3200,27 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                 kernels::launch_prefill_gdn_conv(b8 + (size_t)R * lqkv, w.ssm_conv, conv_state,
                     gq + lqr, gk + lqr, gv + (size_t)R * lvdim,
                     N - R, c.linear_q_heads, vh, c.linear_head_dim, c.linear_conv_kernel, eps, st, cconv);
+                if (gdn_tov) pf_cu(cudaStreamWaitEvent(st, gdn_ev[1], 0), "gdn alpha/beta join");
                 float* layer_state = s.lin_state + (size_t)gdn_state_slot(c, L) * vh * c.linear_head_dim * c.linear_head_dim;
                 // A pass that does not start at position 0 continues the recurrence already in `state`
                 // (the state reset above runs only for pos0 == 0); the scan must load it, not zero it.
                 kernels::launch_prefill_gdn_scan(gq + lqr, gk + lqr, gv + (size_t)R * lvdim,
                     la + (size_t)R * vh, lb + (size_t)R * vh, w.ssm_dt, w.ssm_a,
                     layer_state, att + (size_t)R * lvdim, N - R, c.linear_q_heads, vh,
-                    c.linear_head_dim, c.gdn_qh_block, st, /*carry_in=*/pos0 != 0);
+                    c.linear_head_dim, c.gdn_qh_block, st, /*carry_in=*/pos0 != 0, 0,
+                    z_defer ? gdn_ev[4] : nullptr);
+                if (z_defer) {
+                    // z's leg: converted into the W_i8 the qkv GEMM read, so after it, and queued
+                    // behind the prep so its blocks take the SMs the scan leaves. tfp4_takes(H,
+                    // lvdim) held, so the leg cannot decline.
+                    cudaStream_t sk = s.stream_k;
+                    pf_cu(cudaStreamWaitEvent(sk, gdn_ev[2], 0), "gdn qkv wait");
+                    pf_cu(cudaStreamWaitEvent(sk, gdn_ev[4], 0), "gdn prep wait");
+                    z_pending = tfp4_gemm(tl->wqkv_gate, lvdim, lz, false, sk);
+                    if (z_pending) pf_cu(cudaEventRecord(gdn_ev[3], sk), "gdn z done");
+                    else
+                        proj_fused(xn, w.wqkv_gate, w.wqkv_gate_type, w.wqkv_gate_rs, lz, lvdim, H);
+                }
             }
             if (z_pending) pf_cu(cudaStreamWaitEvent(st, gdn_ev[3], 0), "gdn z join");
             // Qwen3.8's out_proj is a checkpoint FP8 weight, and proj_fp8_native reads the gated
@@ -3272,6 +3325,7 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
             // Set when q|gate|k|v came out of ONE GEMM and q/k/v were left in that packed buffer
             // instead of being copied to tight arrays (see the Muse arm below).
             bool qkv_packed = false;
+            bool tq_raw = false;   // q and the gate are read from the raw [q|gate] rows (b8)
             // Long-ctx: optionally keep Q/K/V/O on int8 (no GDN recurrence here).
             const bool restore_i8 = use_i8;
             if (use_i8_attn) use_i8 = true;
@@ -3467,7 +3521,22 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                     proj_fused(xn, w.wk, w.wk_type, w.wk_rs, kf, kvdim, H);
                     proj_fused(xn, w.wv, w.wv_type, w.wv_rs, vf, kvdim, H);
                 }
-                kernels::launch_prefill_split_q_gate(b8, qb, qg, N, c.n_q_heads, c.head_dim, st);
+                // Ternary-Bonsai-2's long prompt needs neither half as a tight array: the int8
+                // QK-norm reads Q's heads out of the raw [q|gate] rows and writes qb, and the gate
+                // is read there by the o leg's rotation it folds into (tgate below, certain here).
+                // SPARKINFER_PREFILL_QGATE_RAW=0 keeps the split (A/B in ONE binary).
+                static const bool qgate_raw_env = [] {
+                    const char* e = getenv("SPARKINFER_PREFILL_QGATE_RAW");
+                    return !(e && e[0] == '0');
+                }();
+                tq_raw = qgate_raw_env && kv8 && R == 0 && wide == 2 * qdim && tnorm_fold_env &&
+                    tl && trs && trs->wo && (tproj_mask & 2) && tl->wo_type == kPtq1GgmlType &&
+                    s.bonsai_sign_out &&
+                    !(attn_nvfp4 && (attn_fp4_mask & 2) && w.wo_fp4 && w.wo_fp4_sf && fp4_attn_a &&
+                      fp4_attn_as && fp4_attn_ws) &&
+                    N > kernels::pf_dense_gemm_qi8_max_m() && tfp4_takes(qdim, H);
+                if (!tq_raw)
+                    kernels::launch_prefill_split_q_gate(b8, qb, qg, N, c.n_q_heads, c.head_dim, st);
             }
             if (c.muse_glimmer) {
                 // QK-norm + NORMAL (consecutive-pair, LLAMA_ROPE_TYPE_NORM) RoPE on SWA layers /
@@ -3607,7 +3676,8 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                         kernels::launch_prefill_qknorm_rope_kv_int8(qb + o * qdim, kf + o * kvdim,
                             vf + o * kvdim, w.q_norm, w.k_norm, kpool, vpool, kscale, vscale, bt,
                             len, c.n_q_heads, c.n_kv_heads, c.head_dim, rope_dim, rope_theta, eps,
-                            bs, mbs, st, sp0, mrope_win, c.mrope_sec_h, c.mrope_sec_w);
+                            bs, mbs, st, sp0, mrope_win, c.mrope_sec_h, c.mrope_sec_w,
+                            tq_raw ? b8 + o * wide : nullptr, wide, 2 * c.head_dim);
                         if (!kernels::launch_prefill_attn_int8_paged(qb + o * qdim, kpool, vpool,
                                 kscale, vscale, bt, att + o * qdim, len, c.n_q_heads, c.n_kv_heads,
                                 c.head_dim, bs, mbs, attn_scale, win_blocks, st, sp0)) {
@@ -3622,7 +3692,10 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
             // With q|gate|k|v left packed, the gate is a column slice of that buffer rather than
             // a tight [N, qdim] array; its three consumers take the pitch instead of a copy.
             const bf16* gate_src = qkv_packed ? (const bf16*)(fp4_qkv + qdim) : (const bf16*)qg;
-            const int gate_ld = qkv_packed ? qkvg_n : 0;
+            int gate_ld = qkv_packed ? qkvg_n : 0;
+            // tq_raw: head h's gate at h * 2 * head_dim + head_dim of its raw [q|gate] row.
+            const int gate_hs = tq_raw ? 2 * c.head_dim : 0;
+            if (tq_raw) { gate_src = b8 + c.head_dim; gate_ld = 2 * qdim; }
             // Muse: the gated attention output feeds exactly one consumer -- the o projection's
             // row-quantize -- so fold the gate into that quantize's load phase. `att` is then never
             // written back as bf16 and never re-read, and one launch per layer goes away.
@@ -3690,10 +3763,20 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                 tfp4_act_fold(att, s.bonsai_sign_out, qdim, [&](void* d, void* l) {
                     return kernels::launch_ptq1_gate_rotq_rows_nvfp4(
                         att, gate_src, gate_ld, static_cast<const signed char*>(s.bonsai_sign_out),
-                        d, N, qdim, s.bonsai_block, st, l);
+                        d, N, qdim, s.bonsai_block, st, l, gate_hs);
                 })) {
                 tgate_done = tfp4_gemm(tl->wo, H, x, true);
                 gate_fused = tgate_done;   // never false, tfp4_takes having held
+            }
+            // Never, tq_raw having required the arm above: the rest read a gate with a row pitch
+            // only, so gather the heads into qg for them.
+            if (!gate_fused && !wo_fp4_done && tq_raw) {
+                pf_cu(cudaMemcpy2DAsync(qg, (size_t)c.head_dim * sizeof(bf16), gate_src,
+                                        (size_t)gate_hs * sizeof(bf16),
+                                        (size_t)c.head_dim * sizeof(bf16), (size_t)N * c.n_q_heads,
+                                        cudaMemcpyDeviceToDevice, st), "gate gather");
+                gate_src = qg;
+                gate_ld = 0;
             }
             // If the fused quantize ran but the GEMM declined, `att` is still raw -- gate it here.
             if (!gate_fused && !wo_fp4_done) {

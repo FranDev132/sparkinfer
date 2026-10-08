@@ -94,7 +94,8 @@ void launch_prefill_gdn_scan(const void* q, const void* k, const void* v,
                              float* state, void* out,
                              int n_tokens, int q_heads, int v_heads, int head_dim,
                              bool qh_block = false, cudaStream_t stream = nullptr,
-                             bool carry_in = false, int slot = 0);
+                             bool carry_in = false, int slot = 0,
+                             cudaEvent_t prep_done = nullptr);
 
 // DFlash short-block variants. They start from the live decode state but leave it untouched,
 // writing a complete post-token checkpoint for every candidate row. checkpoint[t] uses the same
@@ -192,7 +193,10 @@ void launch_prefill_qknorm_rope_kv_int8(
     int rotary_dim, float theta, float eps, int block_size, int max_blocks_per_seq,
     cudaStream_t stream = nullptr,
     int pos0 = 0,
-    const int* mrope_pos = nullptr, int mrope_sec_h = 0, int mrope_sec_w = 0);
+    const int* mrope_pos = nullptr, int mrope_sec_h = 0, int mrope_sec_w = 0,
+    // Optional: Q's heads read from q_in (row pitch q_ld, head h at h * q_hs, q_ld == n_q_heads *
+    // q_hs) -- e.g. the raw [q|gate] projection -- with the normed, rotated heads written to q.
+    const void* q_in = nullptr, int q_ld = 0, int q_hs = 0);
 
 // Muse Glimmer bf16-KV counterpart: QK-norm + NORMAL (consecutive-pair, LLAMA_ROPE_TYPE_NORM)
 // RoPE when rotary_dim>0 (SWA layers), or NoPE when rotary_dim==0 (global layers) + bf16 KV

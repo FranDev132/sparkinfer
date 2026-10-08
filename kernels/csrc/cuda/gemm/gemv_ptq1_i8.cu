@@ -1112,7 +1112,8 @@ ptq1_rows_i8_kernel(const unsigned char* __restrict__ w, signed char* __restrict
 //               one warp's 128 values here -- the square sum in that kernel's lane order (lane l
 //               takes l, l + 32, l + 64, l + 96), then bf16(x * inv * w * silu(z)).
 //   kRotGate    x the attention output, u its gate (row pitch u_ld): pf_mul_sigmoid_kernel's
-//               bf16(x * sigmoid(g)).
+//               bf16(x * sigmoid(g)). u_hs > 0: u is head-interleaved, the gate of 256-wide head
+//               h starting at h * u_hs in its row (the raw [q|gate] projection, gate at +256).
 // Every one is in the kernel it replaces' expression and order, in a TU with the same flags
 // (si_gemm and si_fused both build with --use_fast_math), so the rotated values are its own.
 template <int NS, int MODE = kRotPlain, bool FP4 = false>
@@ -1123,7 +1124,8 @@ ptq1_rotq_rows_i8_kernel(const __nv_bfloat16* __restrict__ x, const signed char*
                          const __nv_bfloat16* __restrict__ u = nullptr,
                          unsigned char* __restrict__ sfl = nullptr,
                          const __nv_bfloat16* __restrict__ nw = nullptr, float eps = 0.f,
-                         int u_ld = 0, __nv_bfloat16* __restrict__ out_norm = nullptr) {
+                         int u_ld = 0, __nv_bfloat16* __restrict__ out_norm = nullptr,
+                         int u_hs = 0) {
     __shared__ float sh[kSpan];
     __shared__ float sred[8];
     const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
@@ -1205,7 +1207,8 @@ ptq1_rotq_rows_i8_kernel(const __nv_bfloat16* __restrict__ x, const signed char*
                                                 __bfloat162float(wh[j]) * (z / (1.f + __expf(-z))));
                     }
                 } else {   // kRotGate
-                    const uint2 gp = *reinterpret_cast<const uint2*>(ur + e0);
+                    const int ge = u_hs ? (e0 >> 8) * u_hs + (e0 & 255) : e0;
+                    const uint2 gp = *reinterpret_cast<const uint2*>(ur + ge);
                     const __nv_bfloat16* gh = reinterpret_cast<const __nv_bfloat16*>(&gp);
 #pragma unroll
                     for (int j = 0; j < 4; j++)
@@ -1635,17 +1638,17 @@ template <int MODE>
 bool rotq_rows_nvfp4_fused(const __nv_bfloat16* x, const __nv_bfloat16* u, int u_ld,
                            const __nv_bfloat16* nw, float eps, __nv_bfloat16* out_norm,
                            const signed char* sign, void* q, int rows, int k, int block,
-                           cudaStream_t st, void* sf_cutlass) {
+                           cudaStream_t st, void* sf_cutlass, int u_hs = 0) {
     if (rows <= 0 || block != kSpan || k % kSpan != 0 || k > 8 * kSpan || !sf_cutlass) return false;
     if (!sf_cutlass_clear(sf_cutlass, rows, k, st)) return false;
     auto* qq = static_cast<signed char*>(q);
     auto* sfl = static_cast<unsigned char*>(sf_cutlass);
     if (k <= 5 * kSpan)
         ptq1_rotq_rows_i8_kernel<5, MODE, true><<<rows, 256, 0, st>>>(
-            x, sign, qq, nullptr, nullptr, rows, k, u, sfl, nw, eps, u_ld, out_norm);
+            x, sign, qq, nullptr, nullptr, rows, k, u, sfl, nw, eps, u_ld, out_norm, u_hs);
     else
         ptq1_rotq_rows_i8_kernel<8, MODE, true><<<rows, 256, 0, st>>>(
-            x, sign, qq, nullptr, nullptr, rows, k, u, sfl, nw, eps, u_ld, out_norm);
+            x, sign, qq, nullptr, nullptr, rows, k, u, sfl, nw, eps, u_ld, out_norm, u_hs);
     return true;
 }
 
@@ -1672,12 +1675,12 @@ bool launch_ptq1_gnorm_rotq_rows_nvfp4(const void* x_bf16, const void* z_bf16,
 
 bool launch_ptq1_gate_rotq_rows_nvfp4(const void* x_bf16, const void* gate_bf16, int gate_ld,
                                       const signed char* sign, void* q, int rows, int k,
-                                      int block, cudaStream_t st, void* sf_cutlass) {
+                                      int block, cudaStream_t st, void* sf_cutlass, int gate_hs) {
     if (!gate_bf16) return false;
     return rotq_rows_nvfp4_fused<kRotGate>(static_cast<const __nv_bfloat16*>(x_bf16),
                                            static_cast<const __nv_bfloat16*>(gate_bf16), gate_ld,
                                            nullptr, 0.f, nullptr, sign, q, rows, k, block, st,
-                                           sf_cutlass);
+                                           sf_cutlass, gate_hs);
 }
 
 bool launch_ptq1_rotq_rows_i8(const void* x_bf16, const signed char* sign, signed char* q,

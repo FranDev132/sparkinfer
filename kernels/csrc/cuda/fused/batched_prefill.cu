@@ -1693,13 +1693,123 @@ __global__ void __launch_bounds__(128) pf_qknorm_ropenorm_kv_warp_kernel(
     }
 }
 
-// head_dim 128 takes the warp-per-head form above; SPARKINFER_QKNORM_WARP=0 keeps the block form.
+// head_dim 128 (and 256 for the int8 KV) takes the warp-per-head form above;
+// SPARKINFER_QKNORM_WARP=0 keeps the block form.
 static bool qknorm_warp_on() {
     static const bool on = [] {
         const char* e = getenv("SPARKINFER_QKNORM_WARP");
         return !(e && e[0] == '0');
     }();
     return on;
+}
+
+// pf_qknorm_rope_kv_int8_kernel for head_dim 256, one WARP per (token, head) instead of one
+// 256-thread block -- the same move as pf_qknorm_ropenorm_kv_warp_kernel above. Lane l holds dims
+// l + 32e, so element e is thread 32e+l of the block form: each per-warp butterfly is one
+// per-element butterfly here, and the block form's zero-padded combine of its eight warp sums
+// is ((w0 + w4) + (w2 + w6)) + ((w1 + w5) + (w3 + w7)). RoPE pairs dim t with t + rotary_dim/2,
+// element e with e + rotary_dim/64 of the same lane, and every per-element expression is the
+// block form's -- so the bytes are identical. rotary_dim must be a multiple of 64.
+// q_in (optional): Q's heads are read from there instead -- row pitch q_ld, head h at h * q_hs,
+// i.e. straight out of the raw [q|gate] projection -- and q receives the result, compact.
+template <bool MROPE>
+__global__ void __launch_bounds__(256) pf_qknorm_rope_kv_int8_warp_kernel(
+    __nv_bfloat16* __restrict__ q, __nv_bfloat16* __restrict__ k, const __nv_bfloat16* __restrict__ v,
+    const __nv_bfloat16* __restrict__ q_w, const __nv_bfloat16* __restrict__ k_w,
+    signed char* __restrict__ k_pool, signed char* __restrict__ v_pool,
+    __half* __restrict__ k_scale, __half* __restrict__ v_scale,
+    const int* __restrict__ block_table,
+    int n_q_heads, int n_kv_heads, int head_dim, int rotary_dim, float theta, float eps,
+    int block_size, int pos0, const int* __restrict__ mrope_pos, int mrope_sec_h, int mrope_sec_w,
+    const __nv_bfloat16* __restrict__ q_in, int q_ld, int q_hs) {
+    constexpr int HD = 256, E = HD / 32;   // head_dim == HD; the norm divides by it as the block form does
+    const int tok = blockIdx.x;
+    const int unit = blockIdx.y * 8 + (threadIdx.x >> 5);
+    const int lane = threadIdx.x & 31;
+    if (unit >= n_q_heads + 2 * n_kv_heads) return;
+    const int rhalf = rotary_dim >> 1, re = rhalf >> 5;   // rotated elements per half
+    const int pos = pos0 + tok;
+    const int blk = pos / block_size, within = pos % block_size;
+    const int phys = block_table[blk];
+    const size_t ctok = (size_t)phys * block_size + within;
+    const bool is_q = unit < n_q_heads;
+    const bool is_k = !is_q && unit < n_q_heads + n_kv_heads;
+    float val[E];
+    if (is_q || is_k) {
+        const int hh = is_q ? unit : (unit - n_q_heads);
+        const size_t base = ((size_t)tok * (is_q ? n_q_heads : n_kv_heads) + hh) * HD;
+        __nv_bfloat16* src = is_q ? q : k;
+        const __nv_bfloat16* rd = (is_q && q_in) ? q_in + (size_t)tok * q_ld + (size_t)hh * q_hs
+                                                 : src + base;
+        const __nv_bfloat16* nrm = is_q ? q_w : k_w;
+        float xv[E], ws[E];
+        #pragma unroll
+        for (int e = 0; e < E; e++) {
+            xv[e] = pf_to_f(rd[32 * e + lane]);
+            float ss = xv[e] * xv[e];
+            #pragma unroll
+            for (int m = 16; m > 0; m >>= 1) ss += __shfl_xor_sync(0xffffffff, ss, m);
+            ws[e] = ss;
+        }
+        const float vv = ((ws[0] + ws[4]) + (ws[2] + ws[6])) + ((ws[1] + ws[5]) + (ws[3] + ws[7]));
+        const float inv = rsqrtf(vv / head_dim + eps);
+        float h[E];
+        #pragma unroll
+        for (int e = 0; e < E; e++)
+            h[e] = pf_to_f(__float2bfloat16(xv[e] * inv * pf_to_f(nrm[32 * e + lane])));
+        if (is_q) {
+            // The block form rotates in place, rounding both halves, then writes the head.
+            #pragma unroll
+            for (int e = 0; e < E; e++) {
+                if (e < re) {
+                    const int t = 32 * e + lane;
+                    const float freq = __powf(theta, -2.f * (float)t / (float)rotary_dim);
+                    const int rp = MROPE ? mrope_pos[(size_t)tok * 3 + pf_mrope_axis(t, mrope_sec_h, mrope_sec_w)]
+                                         : pos;
+                    const float ang = (float)rp * freq, c = __cosf(ang), sn = __sinf(ang);
+                    const float x0 = h[e], x1 = h[e + re];
+                    h[e]      = pf_to_f(__float2bfloat16(x0 * c - x1 * sn));
+                    h[e + re] = pf_to_f(__float2bfloat16(x1 * c + x0 * sn));
+                }
+            }
+            #pragma unroll
+            for (int e = 0; e < E; e++) src[base + 32 * e + lane] = __float2bfloat16(h[e]);
+            return;
+        }
+        #pragma unroll
+        for (int e = 0; e < E; e++) {
+            val[e] = h[e];
+            if (e < 2 * re) {
+                const int t = 32 * e + lane;
+                const int i = (t < rhalf) ? t : (t - rhalf);
+                const int ei = (e < re) ? e : (e - re);
+                const float freq = __powf(theta, -2.f * (float)i / (float)rotary_dim);
+                const int rp = MROPE ? mrope_pos[(size_t)tok * 3 + pf_mrope_axis(i, mrope_sec_h, mrope_sec_w)]
+                                     : pos;
+                const float ang = (float)rp * freq, c = __cosf(ang), sn = __sinf(ang);
+                const float x0 = h[ei], x1 = h[ei + re];
+                val[e] = (t < rhalf) ? (x0 * c - x1 * sn) : (x1 * c + x0 * sn);
+            }
+        }
+    } else {
+        const int hh = unit - n_q_heads - n_kv_heads;
+        const size_t base = ((size_t)tok * n_kv_heads + hh) * HD;
+        #pragma unroll
+        for (int e = 0; e < E; e++) val[e] = pf_to_f(v[base + 32 * e + lane]);
+    }
+    const int hh = is_k ? (unit - n_q_heads) : (unit - n_q_heads - n_kv_heads);
+    float amax = 0.f;
+    #pragma unroll
+    for (int e = 0; e < E; e++) amax = fmaxf(amax, fabsf(val[e]));
+    #pragma unroll
+    for (int m = 16; m > 0; m >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, m));
+    const float d = amax / 127.0f;
+    signed char* pool = is_k ? k_pool : v_pool;
+    const size_t dst = (ctok * n_kv_heads + hh) * HD;
+    #pragma unroll
+    for (int e = 0; e < E; e++)
+        pool[dst + 32 * e + lane] = (signed char)((amax == 0.f) ? 0 : (int)roundf(val[e] / d));
+    if (lane == 0) (is_k ? k_scale : v_scale)[ctok * n_kv_heads + hh] = __float2half(d);
 }
 
 // ============================================================================
@@ -2241,7 +2351,7 @@ void launch_prefill_gdn_scan(const void* q, const void* k, const void* v,
                              const void* alpha, const void* beta, const void* dt, const void* a,
                              float* state, void* out, int n_tokens, int q_heads, int v_heads,
                              int head_dim, bool qh_block, cudaStream_t stream,
-                             bool carry_in, int slot) {
+                             bool carry_in, int slot, cudaEvent_t prep_done) {
     static const bool state_bf16 = [] {
         const char* e = getenv("SPARKINFER_GDN_STATE_BF16");
         return e && e[0] == '1';
@@ -2250,7 +2360,7 @@ void launch_prefill_gdn_scan(const void* q, const void* k, const void* v,
     // the sequential scan below when disabled (SPARKINFER_PREFILL_GDN_CHUNK=0) or shape-unsupported.
     if (launch_prefill_gdn_chunk(q, k, v, alpha, beta, dt, a, state, out,
                                  n_tokens, q_heads, v_heads, head_dim, qh_block, stream,
-                                 carry_in, slot)) return;
+                                 carry_in, slot, prep_done)) return;
     constexpr int COLS = 4;
     dim3 grid(v_heads, (head_dim + COLS - 1) / COLS);
     auto qb = reinterpret_cast<const __nv_bfloat16*>(q);
@@ -2478,7 +2588,35 @@ void launch_prefill_qknorm_rope_kv_int8(
     signed char* k_pool, signed char* v_pool, void* k_scale, void* v_scale,
     const int* block_table, int n_tokens, int n_q_heads, int n_kv_heads, int head_dim,
     int rotary_dim, float theta, float eps, int block_size, int max_blocks_per_seq,
-    cudaStream_t stream, int pos0, const int* mrope_pos, int mrope_sec_h, int mrope_sec_w) {
+    cudaStream_t stream, int pos0, const int* mrope_pos, int mrope_sec_h, int mrope_sec_w,
+    const void* q_in, int q_ld, int q_hs) {
+    if (head_dim == 256 && rotary_dim > 0 && (rotary_dim & 63) == 0 && rotary_dim <= 256 &&
+        qknorm_warp_on()) {
+        dim3 g(n_tokens, (n_q_heads + 2 * n_kv_heads + 7) / 8);
+        if (mrope_pos)
+            pf_qknorm_rope_kv_int8_warp_kernel<true><<<g, 256, 0, stream>>>(
+                reinterpret_cast<__nv_bfloat16*>(q), reinterpret_cast<__nv_bfloat16*>(k),
+                reinterpret_cast<const __nv_bfloat16*>(v), reinterpret_cast<const __nv_bfloat16*>(q_w),
+                reinterpret_cast<const __nv_bfloat16*>(k_w), k_pool, v_pool,
+                reinterpret_cast<__half*>(k_scale), reinterpret_cast<__half*>(v_scale),
+                block_table, n_q_heads, n_kv_heads, head_dim, rotary_dim, theta, eps, block_size,
+                pos0, mrope_pos, mrope_sec_h, mrope_sec_w,
+                reinterpret_cast<const __nv_bfloat16*>(q_in), q_ld, q_hs);
+        else
+            pf_qknorm_rope_kv_int8_warp_kernel<false><<<g, 256, 0, stream>>>(
+                reinterpret_cast<__nv_bfloat16*>(q), reinterpret_cast<__nv_bfloat16*>(k),
+                reinterpret_cast<const __nv_bfloat16*>(v), reinterpret_cast<const __nv_bfloat16*>(q_w),
+                reinterpret_cast<const __nv_bfloat16*>(k_w), k_pool, v_pool,
+                reinterpret_cast<__half*>(k_scale), reinterpret_cast<__half*>(v_scale),
+                block_table, n_q_heads, n_kv_heads, head_dim, rotary_dim, theta, eps, block_size,
+                pos0, nullptr, 0, 0, reinterpret_cast<const __nv_bfloat16*>(q_in), q_ld, q_hs);
+        return;
+    }
+    // The block form works in place: gather Q's heads into q first (uniform head stride).
+    if (q_in)
+        cudaMemcpy2DAsync(q, (size_t)head_dim * sizeof(__nv_bfloat16), q_in,
+                          (size_t)q_hs * sizeof(__nv_bfloat16), (size_t)head_dim * sizeof(__nv_bfloat16),
+                          (size_t)n_tokens * n_q_heads, cudaMemcpyDeviceToDevice, stream);
     dim3 grid(n_tokens, n_q_heads + 2 * n_kv_heads);   // token on grid.x
     const size_t shmem = (size_t)head_dim * sizeof(float);
     // Dispatched on a TEMPLATE parameter, not a runtime branch: with mrope_pos null the compiler

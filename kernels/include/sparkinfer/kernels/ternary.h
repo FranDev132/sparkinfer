@@ -199,9 +199,11 @@ bool launch_ptq1_gnorm_rotq_rows_nvfp4(const void* x_bf16, const void* z_bf16,
                                        const void* weight_bf16, float eps, int head_dim,
                                        const signed char* sign, void* q, int rows, int k,
                                        int block, cudaStream_t stream, void* sf_cutlass);
+// gate_hs > 0: the gate is head-interleaved, 256-wide head h's gate at h * gate_hs in its row.
 bool launch_ptq1_gate_rotq_rows_nvfp4(const void* x_bf16, const void* gate_bf16, int gate_ld,
                                       const signed char* sign, void* q, int rows, int k,
-                                      int block, cudaStream_t stream, void* sf_cutlass);
+                                      int block, cudaStream_t stream, void* sf_cutlass,
+                                      int gate_hs = 0);
 bool launch_ptq1_rotq_rows_i8(const void* x_bf16, const signed char* sign, signed char* q,
                               float* scale, signed char* qp, int rows, int k, int block,
                               cudaStream_t stream);
