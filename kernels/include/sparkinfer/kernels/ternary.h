@@ -182,6 +182,26 @@ bool launch_ptq1_rotq_rows_nvfp4(const void* x_bf16, const void* up_bf16, const 
                                  cudaStream_t stream = nullptr, void* sf_cutlass = nullptr);
 bool launch_ptq1_rows_i8(const void* w_ptq1, signed char* q, float* scale, int rows, int k,
                          cudaStream_t stream);
+// launch_ptq1_rotq_rows_nvfp4 (CUTLASS-layout scales only) with the kernel that produced the row
+// folded in, so its bf16 output is never written and read back; each computes that kernel's own
+// values, so the operand is the bytes the two passes wrote. norm: rmsnorm_kernel(x, weight)
+// (out_norm, when set, still receives its bf16 row); gnorm: pf_gated_norm_kernel(x, z, weight)
+// per head_dim-wide head; gate: pf_mul_sigmoid_kernel(x, gate), gate's rows gate_ld apart (0: k).
+// K up to 8 spans. False, launching nothing, where they do not apply.
+// launch_ptq1_rows_nvfp4 for an FFN's gate and up into the one [2 * rows, k] operand the gate|up
+// GEMM reads (row 2j gate row j, row 2j + 1 up row j), CUTLASS-layout scales only.
+bool launch_ptq1_rows_nvfp4_gate_up(const void* gate_ptq1, const void* up_ptq1, void* q, int rows,
+                                    int k, cudaStream_t stream, void* sf_cutlass);
+bool launch_ptq1_norm_rotq_rows_nvfp4(const void* x_bf16, const void* weight_bf16, float eps,
+                                      void* out_norm, const signed char* sign, void* q, int rows,
+                                      int k, int block, cudaStream_t stream, void* sf_cutlass);
+bool launch_ptq1_gnorm_rotq_rows_nvfp4(const void* x_bf16, const void* z_bf16,
+                                       const void* weight_bf16, float eps, int head_dim,
+                                       const signed char* sign, void* q, int rows, int k,
+                                       int block, cudaStream_t stream, void* sf_cutlass);
+bool launch_ptq1_gate_rotq_rows_nvfp4(const void* x_bf16, const void* gate_bf16, int gate_ld,
+                                      const signed char* sign, void* q, int rows, int k,
+                                      int block, cudaStream_t stream, void* sf_cutlass);
 bool launch_ptq1_rotq_rows_i8(const void* x_bf16, const signed char* sign, signed char* q,
                               float* scale, signed char* qp, int rows, int k, int block,
                               cudaStream_t stream);

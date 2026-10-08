@@ -699,6 +699,164 @@ using SwigluCoop = SwigluCfg<Shape<_256, _128, _128>>;
 using SwigluPP256 = SwigluCfg<Shape<_128, _128, _256>, cutlass::gemm::KernelTmaWarpSpecializedPingpong>;
 using SwigluPP128 = SwigluCfg<Shape<_128, _128, _128>, cutlass::gemm::KernelTmaWarpSpecializedPingpong>;
 
+// SiLU(g) * u formed as Ternary-Bonsai-2's FFN rotation forms it (ptq1_rotq_rows_i8_kernel's
+// SWIGLU mode, in a --use_fast_math translation unit; this one builds without it): the
+// flush-to-zero multiplies, ex2.approx and div.approx nvcc emits there for g / (1 + exp(-g)) * u,
+// so the product is that kernel's to the bit.
+__device__ __forceinline__ float swiglu_ftz(float g, float u) {
+    float t, e, d, s, h;
+    asm("mul.ftz.f32 %0, %1, 0fBFB8AA3B;" : "=f"(t) : "f"(g));
+    asm("ex2.approx.ftz.f32 %0, %1;" : "=f"(e) : "f"(t));
+    asm("add.ftz.f32 %0, %1, 0f3F800000;" : "=f"(d) : "f"(e));
+    asm("div.approx.ftz.f32 %0, %1, %2;" : "=f"(s) : "f"(g), "f"(d));
+    asm("mul.ftz.f32 %0, %1, %2;" : "=f"(h) : "f"(s), "f"(u));
+    return h;
+}
+
+// SwigluFp4Store's pairing with a bf16 output: h = bf16(silu(g) * u) into a [m, n/2] row-major
+// tensor, for a consumer that still has to see h before its quantize -- Ternary-Bonsai-2's down
+// leg rotates it first, across 1024 columns no epilogue subtile holds. One bf16 plane written
+// instead of the gate and up planes, and one read back by the rotation instead of two. The halves
+// are bf16(alpha * acc), as the plain GEMM's epilogue rounds them.
+template <class EpiTile, int FragmentSize>
+struct SwigluBf16Store {
+    using ElementAux = BF;   // types the collective's D staging, which this node borrows
+    static constexpr int EpiM = size<0>(EpiTile{});
+    static constexpr int EpiN = size<1>(EpiTile{});
+    static constexpr int EpiJ = EpiN / 2;          // SwiGLU outputs per subtile row
+    static constexpr int VPT = 4;                  // outputs a thread stores at once (8 bytes)
+    static_assert(EpiJ % VPT == 0, "whole stores per subtile row");
+    struct SharedStorage {};
+    struct Arguments {
+        float alpha_g = 1.f, alpha_u = 1.f;
+        __nv_bfloat16* dst = nullptr;              // [m, n/2] bf16, row-major
+    };
+    using Params = Arguments;
+
+    template <class PS>
+    static constexpr Params to_underlying_arguments(PS const&, Arguments const& a, void*) { return a; }
+    template <class PS>
+    static bool can_implement(PS const& ps, Arguments const& a) {
+        auto [M, N, K, L] = append<4>(ps, 1);
+        return a.dst && N % EpiN == 0;
+    }
+    template <class PS>
+    static size_t get_workspace_size(PS const&, Arguments const&) { return 0; }
+    template <class PS>
+    static cutlass::Status initialize_workspace(PS const&, Arguments const&, void*, cudaStream_t,
+                                                cutlass::CudaHostAdapter* = nullptr) {
+        return cutlass::Status::kSuccess;
+    }
+
+    CUTLASS_HOST_DEVICE SwigluBf16Store() {}
+    CUTLASS_HOST_DEVICE SwigluBf16Store(Params const& p, SharedStorage const&) : params_ptr(&p) {}
+    Params const* params_ptr = nullptr;
+
+    CUTLASS_DEVICE bool is_producer_load_needed() const { return false; }
+    CUTLASS_DEVICE bool is_C_load_needed() const { return false; }
+    template <class... Args>
+    CUTLASS_DEVICE auto get_producer_load_callbacks(
+        cutlass::epilogue::fusion::ProducerLoadArgs<Args...> const&) {
+        return cutlass::epilogue::fusion::EmptyProducerLoadCallbacks{};
+    }
+
+    template <class CTensor, int NT>
+    struct ConsumerStoreCallbacks : cutlass::epilogue::fusion::EmptyConsumerStoreCallbacks {
+        CTensor tCcD;
+        Params const* p;
+        int om, on, m0, j0, M, ld, thread_idx;
+        CUTLASS_DEVICE ConsumerStoreCallbacks(CTensor c, Params const* p_, int om_, int on_, int m0_,
+                                              int j0_, int M_, int ld_, int t)
+            : tCcD(c), p(p_), om(om_), on(on_), m0(m0_), j0(j0_), M(M_), ld(ld_), thread_idx(t) {}
+
+        template <class ElementAccumulator, class ElementInput>
+        CUTLASS_DEVICE cutlass::Array<float, FragmentSize>
+        visit(cutlass::Array<ElementAccumulator, FragmentSize> const& acc, int, int, int,
+              cutlass::Array<ElementInput, FragmentSize> const&) {
+            cutlass::Array<float, FragmentSize> r;
+            CUTLASS_PRAGMA_UNROLL
+            for (int i = 0; i < FragmentSize; ++i) r[i] = float(acc[i]);
+            return r;
+        }
+
+        template <class STensor, class SyncFn, class VTensor>
+        CUTLASS_DEVICE void reduce(STensor&& smem_buffer, SyncFn const& sync_fn, int epi_m,
+                                   int epi_n, bool, VTensor visit_results) {
+            __nv_bfloat16* sh = reinterpret_cast<__nv_bfloat16*>(raw_pointer_cast(smem_buffer.data()));
+            Tensor c = tCcD(_, _, _, epi_m, epi_n);
+            CUTLASS_PRAGMA_UNROLL
+            for (int f = 0; f < size(visit_results); ++f) {
+                CUTLASS_PRAGMA_UNROLL
+                for (int i = 0; i < FragmentSize; ++i) {
+                    auto crd = c(f * FragmentSize + i);
+                    const int ms = om + int(get<0>(crd)) - m0 - epi_m * EpiM;
+                    const int ns = on + int(get<1>(crd)) - 2 * j0 - epi_n * EpiN;
+                    const float al = (ns & 1) ? p->alpha_u : p->alpha_g;
+                    sh[ms * EpiN + ns] = __float2bfloat16(al * visit_results(f)[i]);
+                }
+            }
+            sync_fn();
+            constexpr int SPR = EpiJ / VPT;            // stores per subtile row
+            for (int i = thread_idx; i < EpiM * SPR; i += NT) {
+                const int rs = i / SPR, k0 = (i % SPR) * VPT;
+                const __nv_bfloat162* s2 =
+                    reinterpret_cast<const __nv_bfloat162*>(sh + rs * EpiN + 2 * k0);
+                const int row = m0 + epi_m * EpiM + rs;
+                const int col = j0 + epi_n * EpiJ + k0;
+                __nv_bfloat16 o[VPT];
+                CUTLASS_PRAGMA_UNROLL
+                for (int q = 0; q < VPT; ++q) {
+                    const __nv_bfloat162 gu = s2[q];
+                    o[q] = __float2bfloat16(
+                        swiglu_ftz(__bfloat162float(gu.x), __bfloat162float(gu.y)));
+                }
+                if (row < M)
+                    *reinterpret_cast<uint2*>(p->dst + (size_t)row * ld + col) =
+                        *reinterpret_cast<const uint2*>(o);
+            }
+            sync_fn();   // the next subtile reuses the buffer
+        }
+    };
+
+    template <bool RefSrc, class... Args>
+    CUTLASS_DEVICE auto get_consumer_store_callbacks(
+        cutlass::epilogue::fusion::ConsumerStoreArgs<Args...> const& args) {
+        auto [M, N, K, L] = args.problem_shape_mnkl;
+        auto [m, n, k, l] = args.tile_coord_mnkl;
+        constexpr int NT = decltype(size(args.tiled_copy))::value;
+        const int m0 = int(m) * int(size<0>(args.tile_shape_mnk));
+        const int j0 = int(n) * int(size<1>(args.tile_shape_mnk)) / 2;
+        const int om = int(M) - int(get<0>(args.residue_tCcD));
+        const int on = int(N) - int(get<1>(args.residue_tCcD));
+        return ConsumerStoreCallbacks<decltype(args.tCcD), NT>(
+            args.tCcD, params_ptr, om, on, m0, j0, int(M), int(N) / 2, args.thread_idx);
+    }
+};
+
+template <class TileShape, class Sched = cutlass::gemm::collective::KernelScheduleAuto>
+struct SwigluBf16Cfg {
+    using EpiTile = Shape<_64, _32>;
+    using Store = SwigluBf16Store<EpiTile, 4>;
+    using Callbacks = cutlass::epilogue::fusion::Sm90EVT<Store, cutlass::epilogue::fusion::Sm90AccFetch>;
+    using Epilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
+        cutlass::arch::Sm120, cutlass::arch::OpClassBlockScaledTensorOp, TileShape, Cluster,
+        EpiTile, float, float,
+        void, cutlass::layout::RowMajor, 8, void, cutlass::layout::RowMajor, 8,
+        cutlass::epilogue::collective::EpilogueScheduleAuto, Callbacks>::CollectiveOp;
+    using Mainloop = typename cutlass::gemm::collective::CollectiveBuilder<
+        cutlass::arch::Sm120, cutlass::arch::OpClassBlockScaledTensorOp,
+        E4, cutlass::layout::RowMajor, 32, E4, cutlass::layout::ColumnMajor, 32, float,
+        TileShape, Cluster,
+        cutlass::gemm::collective::StageCountAutoCarveout<
+            static_cast<int>(sizeof(typename Epilogue::SharedStorage))>,
+        Sched>::CollectiveOp;
+    using Kernel = cutlass::gemm::kernel::GemmUniversal<
+        Shape<int, int, int, int>, MmaEvictFirstB<Mainloop>, Epilogue, void>;
+    using Gemm = cutlass::gemm::device::GemmUniversalAdapter<Kernel>;
+};
+using SwigluBf16Coop = SwigluBf16Cfg<Shape<_256, _128, _128>>;
+using SwigluBf16PP256 = SwigluBf16Cfg<Shape<_128, _128, _256>, cutlass::gemm::KernelTmaWarpSpecializedPingpong>;
+
 // Row r of the interleaved operand is row r/2 of gate (r even) or up (r odd), bytes and scales.
 template <class LayoutS, class LayoutD>
 __global__ void interleave_gate_up_kernel(const uint4* __restrict__ g, const uint4* __restrict__ u,
@@ -1898,6 +2056,47 @@ bool launch_prefill_nvfp4_gate_up_swiglu_pdl(const void* a, const void* sa, cons
                                                         alpha_g, alpha_u, ws, st);
     g_gemm_pdl = false;
     return ok;
+}
+namespace {
+template <class C>
+bool run_gate_up_swiglu_bf16(const void* a, const void* sa, const void* b_gu, const void* sb_gu,
+                             void* h, int m, int ffn, int k, float alpha_g, float alpha_u,
+                             cudaStream_t st) {
+    const int n = 2 * ffn;
+    auto as = cutlass::make_cute_packed_stride(typename C::Kernel::StrideA{}, {m, k, 1});
+    auto bs = cutlass::make_cute_packed_stride(typename C::Kernel::StrideB{}, {n, k, 1});
+    typename C::Store::Arguments sa_args{alpha_g, alpha_u, static_cast<__nv_bfloat16*>(h)};
+    typename C::Gemm::Arguments ar{
+        cutlass::gemm::GemmUniversalMode::kGemm, shape(m, n, k),
+        {static_cast<const cutlass::float_e2m1_t*>(a), as,
+         static_cast<const cutlass::float_e2m1_t*>(b_gu), bs,
+         static_cast<const cutlass::float_ue4m3_t*>(sa), sfa_layout(m, n, k),
+         static_cast<const cutlass::float_ue4m3_t*>(sb_gu), sfb_layout(m, n, k)},
+        {{{}, sa_args}, nullptr, {}, nullptr, {}}};
+    typename C::Gemm gemm;
+    return gemm.can_implement(ar) == cutlass::Status::kSuccess &&
+           C::Gemm::get_workspace_size(ar) == 0 &&
+           gemm.initialize(ar, nullptr, st) == cutlass::Status::kSuccess &&
+           gemm.run(st, nullptr, g_gemm_pdl) == cutlass::Status::kSuccess;
+}
+} // namespace
+// Same tile rule as launch_prefill_nvfp4_gate_up_swiglu (SPARKINFER_GU_SWIGLU_CFG: 0 cooperative,
+// 1 pingpong 128x128x256).
+bool launch_prefill_nvfp4_gate_up_swiglu_bf16(const void* a, const void* sa, const void* b_gu,
+                                              const void* sb_gu, void* h, int m, int ffn, int k,
+                                              float alpha_g, float alpha_u, cudaStream_t st) {
+    if (!a || !sa || !b_gu || !sb_gu || !h || !prefill_nvfp4_supported(m, 2 * ffn, k))
+        return false;
+    static const int cfg_env = [] {
+        const char* e = getenv("SPARKINFER_GU_SWIGLU_CFG");
+        return e ? atoi(e) : -1;
+    }();
+    const int cfg = cfg_env >= 0 ? cfg_env : (m <= 256 ? 1 : 0);
+    if (cfg == 1)
+        return run_gate_up_swiglu_bf16<SwigluBf16PP256>(a, sa, b_gu, sb_gu, h, m, ffn, k, alpha_g,
+                                                        alpha_u, st);
+    return run_gate_up_swiglu_bf16<SwigluBf16Coop>(a, sa, b_gu, sb_gu, h, m, ffn, k, alpha_g,
+                                                   alpha_u, st);
 }
 bool launch_prefill_nvfp4_quant_b(const void* s, void* d, void* sf, int n, int k, cudaStream_t st) {
     if (!s || !d || !sf || !prefill_nvfp4_supported(128,n,k)) return false;

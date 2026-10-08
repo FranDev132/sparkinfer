@@ -99,7 +99,8 @@ __device__ __forceinline__ void ld4_bf16(const __nv_bfloat16* p, float v[4]) {
 //               row's square sum is formed in the 640-thread kernel's own order: virtual thread v
 //               owns elements 8v..8v+7, virtual warps fold with the same xor tree, and so do their
 //               partials.
-enum : int { kRotPlain = 0, kRotSwiglu = 1, kRotGnorm = 2, kRotGate = 3, kRotAddNorm = 4 };
+//   kRotNorm    x through rmsnorm_kernel with weight nw (prefill rows only, below).
+enum : int { kRotPlain = 0, kRotSwiglu = 1, kRotGnorm = 2, kRotGate = 3, kRotAddNorm = 4, kRotNorm = 5 };
 struct i8_blk_q8_1 { __half2 ds; signed char qs[32]; };
 template <int MODE>
 __global__ void __launch_bounds__(256)
@@ -1098,39 +1099,121 @@ ptq1_rows_i8_kernel(const unsigned char* __restrict__ w, signed char* __restrict
 // whole row to int8 with one scale -- d = amax/127, q = round(v/d), the per-row quantizer's rule
 // -- writing the row-major copy and, when asked, the k-tiled [k/32][row][32] copy the fused GEMM
 // stages from. One CTA per row; the row stays in registers between the two passes.
-// SWIGLU: x is the gate and u the up projection; the row rotated is SwiGLU's output rounded to
-// bf16 exactly as launch_prefill_swiglu_quant_i8 forms it, bf16(g / (1 + exp(-g)) * u), which is
-// also what the decode shadow's down reads (launch_ptq1_swiglu_rotq_bf16).
-template <int NS, bool SWIGLU = false, bool FP4 = false>
+// MODE, the row rotated (the kernel it replaces never writes its bf16 output, which out_norm can
+// still receive):
+//   kRotPlain   x itself.
+//   kRotSwiglu  x the gate, u the up projection: SwiGLU's output rounded to bf16 exactly as
+//               launch_prefill_swiglu_quant_i8 forms it, bf16(g / (1 + exp(-g)) * u), which is also
+//               what the decode shadow's down reads (launch_ptq1_swiglu_rotq_bf16).
+//   kRotNorm    x through rmsnorm_kernel with weight nw: the row's square sum formed in that
+//               kernel's order (256 threads, thread t's 8-value packs t, t + 256, ..., then its two
+//               xor trees), and bf16(x * inv_rms * w).
+//   kRotGnorm   x the GDN output, u its z gate: pf_gated_norm_kernel per 128-wide v head, which is
+//               one warp's 128 values here -- the square sum in that kernel's lane order (lane l
+//               takes l, l + 32, l + 64, l + 96), then bf16(x * inv * w * silu(z)).
+//   kRotGate    x the attention output, u its gate (row pitch u_ld): pf_mul_sigmoid_kernel's
+//               bf16(x * sigmoid(g)).
+// Every one is in the kernel it replaces' expression and order, in a TU with the same flags
+// (si_gemm and si_fused both build with --use_fast_math), so the rotated values are its own.
+template <int NS, int MODE = kRotPlain, bool FP4 = false>
 __global__ void __launch_bounds__(256)
 ptq1_rotq_rows_i8_kernel(const __nv_bfloat16* __restrict__ x, const signed char* __restrict__ sign,
                          signed char* __restrict__ q, float* __restrict__ scale,
                          signed char* __restrict__ qp, int rows, int k,
                          const __nv_bfloat16* __restrict__ u = nullptr,
-                         unsigned char* __restrict__ sfl = nullptr) {
+                         unsigned char* __restrict__ sfl = nullptr,
+                         const __nv_bfloat16* __restrict__ nw = nullptr, float eps = 0.f,
+                         int u_ld = 0, __nv_bfloat16* __restrict__ out_norm = nullptr) {
     __shared__ float sh[kSpan];
     __shared__ float sred[8];
     const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
     const int row = blockIdx.x;
     const int ns = k / kSpan;
+    const __nv_bfloat16* xr = x + (size_t)row * k;
+    const __nv_bfloat16* ur = u ? u + (size_t)row * (u_ld ? u_ld : k) : nullptr;
+    float inv_rms = 0.f;
+    if constexpr (MODE == kRotNorm) {
+        const uint4* x4 = reinterpret_cast<const uint4*>(xr);
+        float ss = 0.f;
+        for (int p = t; p < (k >> 3); p += 256) {
+            const uint4 pk = __ldg(x4 + p);
+            const __nv_bfloat16* hp = reinterpret_cast<const __nv_bfloat16*>(&pk);
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                const float xv = __bfloat162float(hp[j]);
+                ss = __fmaf_rn(xv, xv, ss);
+            }
+        }
+#pragma unroll
+        for (int m = 16; m > 0; m >>= 1) ss += __shfl_xor_sync(0xffffffffu, ss, m);
+        if (lane == 0) sred[warp] = ss;
+        __syncthreads();
+        if (t < 32) {
+            float r = t < 8 ? sred[t] : 0.f;
+#pragma unroll
+            for (int m = 16; m > 0; m >>= 1) r += __shfl_xor_sync(0xffffffffu, r, m);
+            if (t == 0) sred[0] = rsqrtf(r / k + eps);
+        }
+        __syncthreads();
+        inv_rms = sred[0];
+        __syncthreads();   // sred holds the row amax below
+    }
     float v[NS][4];
     float am = 0.f;
 #pragma unroll
     for (int sp = 0; sp < NS; ++sp) {
         if (sp < ns) {
             const int e0 = sp * kSpan + t * 4;
-            uint2 raw = *reinterpret_cast<const uint2*>(x + (size_t)row * k + e0);
-            if constexpr (SWIGLU) {
-                const uint2 ur = *reinterpret_cast<const uint2*>(u + (size_t)row * k + e0);
-                const __nv_bfloat16* gh = reinterpret_cast<const __nv_bfloat16*>(&raw);
-                const __nv_bfloat16* uh = reinterpret_cast<const __nv_bfloat16*>(&ur);
+            uint2 raw = *reinterpret_cast<const uint2*>(xr + e0);
+            if constexpr (MODE != kRotPlain) {
+                const __nv_bfloat16* xh = reinterpret_cast<const __nv_bfloat16*>(&raw);
                 __nv_bfloat16 o[4];
+                if constexpr (MODE == kRotSwiglu) {
+                    const uint2 up = *reinterpret_cast<const uint2*>(ur + e0);
+                    const __nv_bfloat16* uh = reinterpret_cast<const __nv_bfloat16*>(&up);
 #pragma unroll
-                for (int j = 0; j < 4; j++) {
-                    const float g = __bfloat162float(gh[j]);
-                    o[j] = __float2bfloat16(g / (1.f + __expf(-g)) * __bfloat162float(uh[j]));
+                    for (int j = 0; j < 4; j++) {
+                        const float g = __bfloat162float(xh[j]);
+                        o[j] = __float2bfloat16(g / (1.f + __expf(-g)) * __bfloat162float(uh[j]));
+                    }
+                } else if constexpr (MODE == kRotNorm) {
+                    const uint2 wp = *reinterpret_cast<const uint2*>(nw + e0);
+                    const __nv_bfloat16* wh = reinterpret_cast<const __nv_bfloat16*>(&wp);
+#pragma unroll
+                    for (int j = 0; j < 4; j++)
+                        o[j] = __float2bfloat16(__bfloat162float(xh[j]) * inv_rms *
+                                                __bfloat162float(wh[j]));
+                } else if constexpr (MODE == kRotGnorm) {
+                    const __nv_bfloat16* hx = xr + sp * kSpan + warp * kBlk;   // this warp's head
+                    float ss = 0.f;
+#pragma unroll
+                    for (int r = 0; r < kBlk / 32; r++) {
+                        const float xv = __bfloat162float(hx[lane + 32 * r]);
+                        ss += xv * xv;
+                    }
+#pragma unroll
+                    for (int m = 16; m > 0; m >>= 1) ss += __shfl_xor_sync(0xffffffffu, ss, m);
+                    const float inv = rsqrtf(ss / kBlk + eps);
+                    const uint2 zp = *reinterpret_cast<const uint2*>(ur + e0);
+                    const uint2 wp = *reinterpret_cast<const uint2*>(nw + lane * 4);
+                    const __nv_bfloat16* zh = reinterpret_cast<const __nv_bfloat16*>(&zp);
+                    const __nv_bfloat16* wh = reinterpret_cast<const __nv_bfloat16*>(&wp);
+#pragma unroll
+                    for (int j = 0; j < 4; j++) {
+                        const float z = __bfloat162float(zh[j]);
+                        o[j] = __float2bfloat16(__bfloat162float(xh[j]) * inv *
+                                                __bfloat162float(wh[j]) * (z / (1.f + __expf(-z))));
+                    }
+                } else {   // kRotGate
+                    const uint2 gp = *reinterpret_cast<const uint2*>(ur + e0);
+                    const __nv_bfloat16* gh = reinterpret_cast<const __nv_bfloat16*>(&gp);
+#pragma unroll
+                    for (int j = 0; j < 4; j++)
+                        o[j] = __float2bfloat16(__bfloat162float(xh[j]) *
+                                                (1.f / (1.f + __expf(-__bfloat162float(gh[j])))));
                 }
                 raw = *reinterpret_cast<const uint2*>(o);
+                if (out_norm) *reinterpret_cast<uint2*>(out_norm + (size_t)row * k + e0) = raw;
             }
             const __nv_bfloat162 a = *reinterpret_cast<const __nv_bfloat162*>(&raw.x);
             const __nv_bfloat162 b = *reinterpret_cast<const __nv_bfloat162*>(&raw.y);
@@ -1252,11 +1335,12 @@ template <int WPC>
 __global__ void __launch_bounds__(WPC * 32)
 ptq1_rows_nvfp4_kernel(const unsigned char* __restrict__ w, unsigned char* __restrict__ q,
                        unsigned char* __restrict__ sf, int rows, int nblk,
-                       unsigned char* __restrict__ sfl) {
+                       unsigned char* __restrict__ sfl, int omul = 1, int oadd = 0) {
     extern __shared__ uint4 srow[];
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int row = blockIdx.x * WPC + warp;
     if (row >= rows) return;
+    const int orow = row * omul + oadd;   // the row it lands in (2r, 2r + 1: gate|up interleaved)
     const unsigned char* wr = w + (size_t)row * nblk * kBlkBytes;
     const int cb = min(nblk, kRowsChunk);
     signed char* buf = reinterpret_cast<signed char*>(srow) + (size_t)warp * cb * kBlk;
@@ -1286,9 +1370,9 @@ ptq1_rows_nvfp4_kernel(const unsigned char* __restrict__ w, unsigned char* __res
                 const unsigned nib = tr == 0 ? 0u : (code | (tr < 0 ? 8u : 0u));
                 o[j >> 3] |= nib << (4 * (j & 7));
             }
-            *reinterpret_cast<uint2*>(q + (size_t)row * nblk * (kBlk / 2) + g * 8) = make_uint2(o[0], o[1]);
-            if (sfl) sfl[sf_cutlass_off(row, g, ng)] = sfb;
-            else sf[(size_t)row * ng + g] = sfb;
+            *reinterpret_cast<uint2*>(q + (size_t)orow * nblk * (kBlk / 2) + g * 8) = make_uint2(o[0], o[1]);
+            if (sfl) sfl[sf_cutlass_off(orow, g, ng)] = sfb;
+            else sf[(size_t)orow * ng + g] = sfb;
         }
     }
 }
@@ -1320,6 +1404,31 @@ bool launch_ptq1_rows_nvfp4(const void* w_ptq1, void* q, void* sf_rowmajor, int 
     const int nblk = k / kBlk;
     const size_t smem = (size_t)4 * (nblk < kRowsChunk ? nblk : kRowsChunk) * kBlk;
     ptq1_rows_nvfp4_kernel<4><<<(rows + 3) / 4, 128, smem, st>>>(w, qq, sf, rows, nblk, sfl);
+    return true;
+}
+// Gate and up of one FFN as the single [2 * rows, k] operand the gate|up GEMM reads, row 2j gate
+// row j and row 2j + 1 up row j (launch_prefill_nvfp4_interleave_gate_up's layout): each written
+// where launch_ptq1_rows_nvfp4 writes it, two rows apart.
+bool launch_ptq1_rows_nvfp4_gate_up(const void* gate_ptq1, const void* up_ptq1, void* q, int rows,
+                                    int k, cudaStream_t st, void* sf_cutlass) {
+    if (!gate_ptq1 || !up_ptq1 || !sf_cutlass || rows <= 0 || k <= 0 || k % kBlk != 0 ||
+        k > 96 * 1024)
+        return false;
+    if (!sf_cutlass_clear(sf_cutlass, 2 * rows, k, st)) return false;
+    static bool attr = false;
+    if (!attr) {
+        cudaFuncSetAttribute(ptq1_rows_nvfp4_kernel<4>,
+                             cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024);
+        attr = true;
+    }
+    const int nblk = k / kBlk;
+    const size_t smem = (size_t)4 * (nblk < kRowsChunk ? nblk : kRowsChunk) * kBlk;
+    auto* qq = static_cast<unsigned char*>(q);
+    auto* sfl = static_cast<unsigned char*>(sf_cutlass);
+    ptq1_rows_nvfp4_kernel<4><<<(rows + 3) / 4, 128, smem, st>>>(
+        static_cast<const unsigned char*>(gate_ptq1), qq, nullptr, rows, nblk, sfl, 2, 0);
+    ptq1_rows_nvfp4_kernel<4><<<(rows + 3) / 4, 128, smem, st>>>(
+        static_cast<const unsigned char*>(up_ptq1), qq, nullptr, rows, nblk, sfl, 2, 1);
     return true;
 }
 float ptq1_nvfp4_alpha() { return 1.f / kFp4WScale; }
@@ -1510,13 +1619,65 @@ bool launch_ptq1_rotq_rows_nvfp4(const void* x_bf16, const void* up_bf16, const 
         else
             ptq1_rotq_rows_i8_kernel<17, true, true><<<rows, 256, 0, st>>>(x, sign, qq, nullptr, sf, rows, k, u, sfl);
     } else {
-        if (k > 8 * kSpan) return false;
         if (k <= 5 * kSpan)
             ptq1_rotq_rows_i8_kernel<5, false, true><<<rows, 256, 0, st>>>(x, sign, qq, nullptr, sf, rows, k, nullptr, sfl);
-        else
+        else if (k <= 8 * kSpan)
             ptq1_rotq_rows_i8_kernel<8, false, true><<<rows, 256, 0, st>>>(x, sign, qq, nullptr, sf, rows, k, nullptr, sfl);
+        else   // SwiGLU's output already formed (launch_prefill_nvfp4_gate_up_swiglu_bf16)
+            ptq1_rotq_rows_i8_kernel<17, false, true><<<rows, 256, 0, st>>>(x, sign, qq, nullptr, sf, rows, k, nullptr, sfl);
     }
     return true;
+}
+
+// launch_ptq1_rotq_rows_nvfp4 with the kernel that produced its input folded in (see the MODE
+// list above ptq1_rotq_rows_i8_kernel): that kernel's bf16 row is never written and read back.
+template <int MODE>
+bool rotq_rows_nvfp4_fused(const __nv_bfloat16* x, const __nv_bfloat16* u, int u_ld,
+                           const __nv_bfloat16* nw, float eps, __nv_bfloat16* out_norm,
+                           const signed char* sign, void* q, int rows, int k, int block,
+                           cudaStream_t st, void* sf_cutlass) {
+    if (rows <= 0 || block != kSpan || k % kSpan != 0 || k > 8 * kSpan || !sf_cutlass) return false;
+    if (!sf_cutlass_clear(sf_cutlass, rows, k, st)) return false;
+    auto* qq = static_cast<signed char*>(q);
+    auto* sfl = static_cast<unsigned char*>(sf_cutlass);
+    if (k <= 5 * kSpan)
+        ptq1_rotq_rows_i8_kernel<5, MODE, true><<<rows, 256, 0, st>>>(
+            x, sign, qq, nullptr, nullptr, rows, k, u, sfl, nw, eps, u_ld, out_norm);
+    else
+        ptq1_rotq_rows_i8_kernel<8, MODE, true><<<rows, 256, 0, st>>>(
+            x, sign, qq, nullptr, nullptr, rows, k, u, sfl, nw, eps, u_ld, out_norm);
+    return true;
+}
+
+bool launch_ptq1_norm_rotq_rows_nvfp4(const void* x_bf16, const void* weight_bf16, float eps,
+                                      void* out_norm, const signed char* sign, void* q, int rows,
+                                      int k, int block, cudaStream_t st, void* sf_cutlass) {
+    if (!weight_bf16) return false;
+    return rotq_rows_nvfp4_fused<kRotNorm>(static_cast<const __nv_bfloat16*>(x_bf16), nullptr, 0,
+                                           static_cast<const __nv_bfloat16*>(weight_bf16), eps,
+                                           static_cast<__nv_bfloat16*>(out_norm), sign, q, rows,
+                                           k, block, st, sf_cutlass);
+}
+
+bool launch_ptq1_gnorm_rotq_rows_nvfp4(const void* x_bf16, const void* z_bf16,
+                                       const void* weight_bf16, float eps, int head_dim,
+                                       const signed char* sign, void* q, int rows, int k,
+                                       int block, cudaStream_t st, void* sf_cutlass) {
+    if (!z_bf16 || !weight_bf16 || head_dim != kBlk) return false;
+    return rotq_rows_nvfp4_fused<kRotGnorm>(static_cast<const __nv_bfloat16*>(x_bf16),
+                                            static_cast<const __nv_bfloat16*>(z_bf16), 0,
+                                            static_cast<const __nv_bfloat16*>(weight_bf16), eps,
+                                            nullptr, sign, q, rows, k, block, st, sf_cutlass);
+}
+
+bool launch_ptq1_gate_rotq_rows_nvfp4(const void* x_bf16, const void* gate_bf16, int gate_ld,
+                                      const signed char* sign, void* q, int rows, int k,
+                                      int block, cudaStream_t st, void* sf_cutlass) {
+    if (!gate_bf16) return false;
+    return rotq_rows_nvfp4_fused<kRotGate>(static_cast<const __nv_bfloat16*>(x_bf16),
+                                           static_cast<const __nv_bfloat16*>(gate_bf16), gate_ld,
+                                           nullptr, 0.f, nullptr, sign, q, rows, k, block, st,
+                                           sf_cutlass);
 }
 
 bool launch_ptq1_rotq_rows_i8(const void* x_bf16, const signed char* sign, signed char* q,

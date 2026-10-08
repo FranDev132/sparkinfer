@@ -74,6 +74,12 @@ bool launch_prefill_nvfp4_interleave_gate_up(const void* gate_fp4, const void* g
 // One GEMM over the interleaved operand whose epilogue writes SwiGLU(gate*alpha_g, up*alpha_u)
 // as the down projection's FP4 A operand (d_fp4 [m, ffn], d_sf its SFA), byte-identical to the
 // two launch_prefill_nvfp4_gemm calls + launch_prefill_nvfp4_swiglu_quant_a. Needs no workspace.
+// launch_prefill_nvfp4_gate_up_swiglu with a bf16 output: h = bf16(silu(g) * u) as Ternary-Bonsai-2's
+// FFN rotation forms it from the two bf16 planes (the same values, one plane written), [m, ffn].
+bool launch_prefill_nvfp4_gate_up_swiglu_bf16(const void* a_fp4, const void* sfa,
+                                              const void* b_gu_fp4, const void* sfb_gu, void* h_bf16,
+                                              int m, int ffn, int k, float alpha_g, float alpha_u,
+                                              cudaStream_t stream);
 bool launch_prefill_nvfp4_gate_up_swiglu(const void* a_fp4, const void* sfa,
                                          const void* b_gu_fp4, const void* sfb_gu,
                                          void* d_fp4, void* d_sf, int m, int ffn, int k,
