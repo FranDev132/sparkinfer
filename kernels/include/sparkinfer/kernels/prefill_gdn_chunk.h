@@ -20,6 +20,20 @@
 namespace sparkinfer {
 namespace kernels {
 
+// The GDN conv's v channels computed where they are read -- the chunked scan's prep, which
+// builds U0 from them -- instead of written by launch_prefill_gdn_conv and read back: the same
+// taps, SiLU and bf16 rounding per element (pf_gdn_conv_tile_kernel's), so U0 is unchanged.
+// Pointers cover the WHOLE pass, not a slice.
+struct GdnVFold {
+    const void* qkv = nullptr;        // the pass's raw [n_tokens, qkv_dim] projection
+    const void* conv_w = nullptr;     // [qkv_dim][conv_kernel] taps
+    const void* conv_prev = nullptr;  // the window before the pass, [conv_kernel-1][qkv_dim], or null
+    void* conv_state = nullptr;       // receives the pass's last conv_kernel-1 raw rows (v channels)
+    void* v = nullptr;                // [n_tokens, v_dim], written only where the chunked scan declines
+    int qkv_dim = 0, conv_kernel = 0;
+    int v_off = 0;                    // first v channel within a qkv row (2 * q_heads * head_dim)
+};
+
 // Launch the chunk-parallel Gated-DeltaNet prefill scan. Signature mirrors
 // `launch_prefill_gdn_scan` (#398) so it drops in as a one-line guard at the top of that
 // launcher, ahead of the sequential scan:
@@ -45,7 +59,8 @@ namespace kernels {
 // (fused.h). Must match whatever the decode-path GDN kernel uses for the same checkpoint.
 // slot: which of the per-slot workspaces the scan uses (0..3), so scans on different streams at
 // once each get their own. prep_done (optional) is recorded on `stream` between the first prep
-// kernel and its scan.
+// kernel and its scan. scan_trigger: the scan lets a programmatic launch after it start at once
+// (it must not read the scan's output before its own grid-dependency wait).
 bool launch_prefill_gdn_chunk(const void* q, const void* k, const void* v,
                               const void* alpha, const void* beta,
                               const void* dt, const void* a,
@@ -53,7 +68,8 @@ bool launch_prefill_gdn_chunk(const void* q, const void* k, const void* v,
                               int n_tokens, int q_heads, int v_heads, int head_dim,
                               bool qh_block, cudaStream_t stream = nullptr,
                               bool carry_in = false, int slot = 0,
-                              cudaEvent_t prep_done = nullptr);
+                              cudaEvent_t prep_done = nullptr,
+                              const GdnVFold* vfold = nullptr, bool scan_trigger = false);
 
 }  // namespace kernels
 }  // namespace sparkinfer

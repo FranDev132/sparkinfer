@@ -696,11 +696,12 @@ __global__ void pf_gdn_conv_tile_kernel(const __nv_bfloat16* __restrict__ qkv,
                                         __nv_bfloat16* __restrict__ v,
                                         int n_tokens, int q_heads, int v_heads,
                                         int head_dim, int qkv_dim, int conv_kernel, float eps,
-                                        const __nv_bfloat16* __restrict__ conv_prev) {
+                                        const __nv_bfloat16* __restrict__ conv_prev,
+                                        int blk_base) {
     const int q_dim = q_heads * head_dim;
     const int v_dim = v_heads * head_dim;
     const int tok0 = blockIdx.x * PF_CONV_TT;
-    const int blk = blockIdx.y;                    // output head
+    const int blk = blockIdx.y + blk_base;         // output head (blk_base: a launch over some heads)
     const int t   = threadIdx.x;                   // channel within head
     int d; __nv_bfloat16* out; int out_dim; int hh; bool do_norm;
     if (blk < q_heads)            { hh = blk;                d = hh * head_dim + t;               out = q; out_dim = q_dim; do_norm = true;  }
@@ -2295,40 +2296,71 @@ void launch_prefill_mul_sigmoid(void* attn, const void* gate, int n_tokens, int 
         dim, gate_ld);
 }
 
+static int gdn_conv_seq() {   // SPARKINFER_PREFILL_GDN_CONV_SEQ=1 restores the token-loop kernel
+    static const int v = [] {
+        const char* e = getenv("SPARKINFER_PREFILL_GDN_CONV_SEQ");
+        return (e && e[0] == '1') ? 1 : 0;
+    }();
+    return v;
+}
+static int gdn_conv_tile() {  // SPARKINFER_PREFILL_GDN_CONV_TILE=0 restores the token-parallel kernel
+    static const int v = [] {
+        const char* e = getenv("SPARKINFER_PREFILL_GDN_CONV_TILE");
+        return (e && e[0] == '0') ? 0 : 1;
+    }();
+    return v;
+}
+// Eight tokens per block, not sixteen: each block walks its tokens one after another (three
+// barriers per token for the q/k L2 norm), so at prefill's short prompts the walk, not the
+// 1.1x window re-read, is what the kernel waits on. Every token's taps, SiLU and norm are
+// unchanged, so the output is too. Measured prefill pp at 128 and 512: +0.4% each.
+// SPARKINFER_PREFILL_GDN_CONV_TT=16 restores sixteen (A/B).
+static int gdn_conv_tt() {
+    static const int v = [] {
+        const char* e = getenv("SPARKINFER_PREFILL_GDN_CONV_TT");
+        return (e && atoi(e) == 16) ? 16 : 8;
+    }();
+    return v;
+}
+// The tiled conv over heads [blk_base, blk_base + nblk) (q heads, then k, then v). False where
+// the tiled kernel is off.
+static bool gdn_conv_tile_heads(const void* qkv, const void* conv_w, void* conv_state, void* q,
+                                void* k, void* v, int n_tokens, int q_heads, int v_heads,
+                                int head_dim, int conv_kernel, float eps, cudaStream_t stream,
+                                const void* conv_prev, int blk_base, int nblk) {
+    if (gdn_conv_seq() || !gdn_conv_tile() || conv_kernel > 8) return false;
+    const int qkv_dim = 2 * q_heads * head_dim + v_heads * head_dim;
+    const int tt = gdn_conv_tt();
+    auto conv = tt == 16 ? pf_gdn_conv_tile_kernel<16> : pf_gdn_conv_tile_kernel<8>;
+    dim3 grid((n_tokens + tt - 1) / tt, nblk);
+    conv<<<grid, head_dim, 0, stream>>>(
+        reinterpret_cast<const __nv_bfloat16*>(qkv), reinterpret_cast<const __nv_bfloat16*>(conv_w),
+        reinterpret_cast<__nv_bfloat16*>(conv_state), reinterpret_cast<__nv_bfloat16*>(q),
+        reinterpret_cast<__nv_bfloat16*>(k), reinterpret_cast<__nv_bfloat16*>(v),
+        n_tokens, q_heads, v_heads, head_dim, qkv_dim, conv_kernel, eps,
+        reinterpret_cast<const __nv_bfloat16*>(conv_prev), blk_base);
+    return true;
+}
+
+bool launch_prefill_gdn_conv_qk(const void* qkv, const void* conv_w, void* conv_state,
+                                void* q, void* k, int n_tokens, int q_heads, int v_heads,
+                                int head_dim, int conv_kernel, float eps, cudaStream_t stream,
+                                const void* conv_prev) {
+    return gdn_conv_tile_heads(qkv, conv_w, conv_state, q, k, nullptr, n_tokens, q_heads,
+                               v_heads, head_dim, conv_kernel, eps, stream, conv_prev, 0,
+                               2 * q_heads);
+}
+
 void launch_prefill_gdn_conv(const void* qkv, const void* conv_w, void* conv_state,
                              void* q, void* k, void* v, int n_tokens, int q_heads, int v_heads,
                              int head_dim, int conv_kernel, float eps, cudaStream_t stream,
                              const void* conv_prev) {
     const int qkv_dim = 2 * q_heads * head_dim + v_heads * head_dim;
     const int blocks = 2 * q_heads + v_heads;
-    static int seq = [] {   // SPARKINFER_PREFILL_GDN_CONV_SEQ=1 restores the token-loop kernel
-        const char* e = getenv("SPARKINFER_PREFILL_GDN_CONV_SEQ");
-        return (e && e[0] == '1') ? 1 : 0;
-    }();
-    static int tile = [] {  // SPARKINFER_PREFILL_GDN_CONV_TILE=0 restores the token-parallel kernel
-        const char* e = getenv("SPARKINFER_PREFILL_GDN_CONV_TILE");
-        return (e && e[0] == '0') ? 0 : 1;
-    }();
-    // Eight tokens per block, not sixteen: each block walks its tokens one after another (three
-    // barriers per token for the q/k L2 norm), so at prefill's short prompts the walk, not the
-    // 1.1x window re-read, is what the kernel waits on. Every token's taps, SiLU and norm are
-    // unchanged, so the output is too. Measured prefill pp at 128 and 512: +0.4% each.
-    // SPARKINFER_PREFILL_GDN_CONV_TT=16 restores sixteen (A/B).
-    static const int conv_tt = [] {
-        const char* e = getenv("SPARKINFER_PREFILL_GDN_CONV_TT");
-        return (e && atoi(e) == 16) ? 16 : 8;
-    }();
-    if (!seq && tile && conv_kernel <= 8) {
-        auto conv = conv_tt == 16 ? pf_gdn_conv_tile_kernel<16> : pf_gdn_conv_tile_kernel<8>;
-        dim3 grid((n_tokens + conv_tt - 1) / conv_tt, blocks);
-        conv<<<grid, head_dim, 0, stream>>>(
-            reinterpret_cast<const __nv_bfloat16*>(qkv), reinterpret_cast<const __nv_bfloat16*>(conv_w),
-            reinterpret_cast<__nv_bfloat16*>(conv_state), reinterpret_cast<__nv_bfloat16*>(q),
-            reinterpret_cast<__nv_bfloat16*>(k), reinterpret_cast<__nv_bfloat16*>(v),
-            n_tokens, q_heads, v_heads, head_dim, qkv_dim, conv_kernel, eps,
-            reinterpret_cast<const __nv_bfloat16*>(conv_prev));
+    const int seq = gdn_conv_seq();
+    if (gdn_conv_tile_heads(qkv, conv_w, conv_state, q, k, v, n_tokens, q_heads, v_heads,
+                            head_dim, conv_kernel, eps, stream, conv_prev, 0, blocks))
         return;
-    }
     if (!seq) {
         dim3 grid(n_tokens, blocks);
         pf_gdn_conv_par_kernel<<<grid, head_dim, 0, stream>>>(
@@ -2351,7 +2383,8 @@ void launch_prefill_gdn_scan(const void* q, const void* k, const void* v,
                              const void* alpha, const void* beta, const void* dt, const void* a,
                              float* state, void* out, int n_tokens, int q_heads, int v_heads,
                              int head_dim, bool qh_block, cudaStream_t stream,
-                             bool carry_in, int slot, cudaEvent_t prep_done) {
+                             bool carry_in, int slot, cudaEvent_t prep_done,
+                             const GdnVFold* vfold, bool scan_trigger) {
     static const bool state_bf16 = [] {
         const char* e = getenv("SPARKINFER_GDN_STATE_BF16");
         return e && e[0] == '1';
@@ -2360,7 +2393,13 @@ void launch_prefill_gdn_scan(const void* q, const void* k, const void* v,
     // the sequential scan below when disabled (SPARKINFER_PREFILL_GDN_CHUNK=0) or shape-unsupported.
     if (launch_prefill_gdn_chunk(q, k, v, alpha, beta, dt, a, state, out,
                                  n_tokens, q_heads, v_heads, head_dim, qh_block, stream,
-                                 carry_in, slot, prep_done)) return;
+                                 carry_in, slot, prep_done, vfold, scan_trigger)) return;
+    // The sequential scan reads v: where the conv left the v channels to the chunked scan, run
+    // them now (the v heads of the same tiled conv -- launch_prefill_gdn_conv_qk ran the rest).
+    if (vfold && vfold->qkv)
+        gdn_conv_tile_heads(vfold->qkv, vfold->conv_w, vfold->conv_state, nullptr, nullptr,
+                            vfold->v, n_tokens, q_heads, v_heads, head_dim, vfold->conv_kernel,
+                            0.f, stream, vfold->conv_prev, 2 * q_heads, v_heads);
     constexpr int COLS = 4;
     dim3 grid(v_heads, (head_dim + COLS - 1) / COLS);
     auto qb = reinterpret_cast<const __nv_bfloat16*>(q);

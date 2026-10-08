@@ -126,7 +126,7 @@ template <int BLOCK, int VEC, int SLOTS>
 __global__ __launch_bounds__(BLOCK) void pf_gate_quant_rows_kernel(
         const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* __restrict__ gate,
         signed char* __restrict__ q, float* __restrict__ scale, int rows, int cols,
-        signed char* __restrict__ qp, int gate_ld) {
+        signed char* __restrict__ qp, int gate_ld, int gate_hs) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
     // Lets a programmatically launched consumer (the o GEMM, see launch_prefill_gemm_qi8_dense's
     // QM_PDL) start its weight fetch now; it waits on this grid before reading q/scale/qp.
@@ -146,7 +146,9 @@ __global__ __launch_bounds__(BLOCK) void pf_gate_quant_rows_kernel(
         if (c < cols) {
             __nv_bfloat16 xv[VEC], gv[VEC];
             *reinterpret_cast<uint4*>(xv) = *reinterpret_cast<const uint4*>(&x[base + c]);
-            *reinterpret_cast<uint4*>(gv) = *reinterpret_cast<const uint4*>(&gate[gbase + c]);
+            // gate_hs: the gate is head-interleaved (256-wide head h at h * gate_hs in its row).
+            const int gc = gate_hs ? (c >> 8) * gate_hs + (c & 255) : c;
+            *reinterpret_cast<uint4*>(gv) = *reinterpret_cast<const uint4*>(&gate[gbase + gc]);
             #pragma unroll
             for (int v = 0; v < VEC; v++) {
                 const float g = qr_to_f(gv[v]);
@@ -251,7 +253,7 @@ __global__ __launch_bounds__(BLOCK) void pf_quant_rows_q80_kernel(
 
 bool launch_prefill_gate_quant_rows_i8(const void* x, const void* gate, signed char* q, float* scale,
                                        int rows, int cols, cudaStream_t stream,
-                                       signed char* qp, int gate_ld) {
+                                       signed char* qp, int gate_ld, int gate_hs) {
     constexpr int BLOCK = 256, VEC = 8;
     // The k-tiled copy is only defined on whole 32-column groups; K into the dense GEMM is always a
     // whole number of 256-value super-blocks, so this only ever declines shapes it never serves.
@@ -264,9 +266,9 @@ bool launch_prefill_gate_quant_rows_i8(const void* x, const void* gate, signed c
     auto xb = reinterpret_cast<const __nv_bfloat16*>(x);
     auto gb = reinterpret_cast<const __nv_bfloat16*>(gate);
     const int vecs = cols / VEC;
-    if (vecs <= BLOCK * 1)      pf_gate_quant_rows_kernel<BLOCK, VEC, 1><<<rows, BLOCK, 0, stream>>>(xb, gb, q, scale, rows, cols, qp, gate_ld);
-    else if (vecs <= BLOCK * 2) pf_gate_quant_rows_kernel<BLOCK, VEC, 2><<<rows, BLOCK, 0, stream>>>(xb, gb, q, scale, rows, cols, qp, gate_ld);
-    else if (vecs <= BLOCK * 4) pf_gate_quant_rows_kernel<BLOCK, VEC, 4><<<rows, BLOCK, 0, stream>>>(xb, gb, q, scale, rows, cols, qp, gate_ld);
+    if (vecs <= BLOCK * 1)      pf_gate_quant_rows_kernel<BLOCK, VEC, 1><<<rows, BLOCK, 0, stream>>>(xb, gb, q, scale, rows, cols, qp, gate_ld, gate_hs);
+    else if (vecs <= BLOCK * 2) pf_gate_quant_rows_kernel<BLOCK, VEC, 2><<<rows, BLOCK, 0, stream>>>(xb, gb, q, scale, rows, cols, qp, gate_ld, gate_hs);
+    else if (vecs <= BLOCK * 4) pf_gate_quant_rows_kernel<BLOCK, VEC, 4><<<rows, BLOCK, 0, stream>>>(xb, gb, q, scale, rows, cols, qp, gate_ld, gate_hs);
     else return false;
     return true;
 }

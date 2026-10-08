@@ -1,6 +1,8 @@
 #pragma once
 #include <cuda_runtime.h>
 
+#include "sparkinfer/kernels/prefill_gdn_chunk.h"
+
 // Batched prompt-prefill kernels for the Qwen3.5 dense-hybrid (Qwythos) model.
 //
 // The decode path processes a prompt one token at a time (forward_token), so every
@@ -95,7 +97,15 @@ void launch_prefill_gdn_scan(const void* q, const void* k, const void* v,
                              int n_tokens, int q_heads, int v_heads, int head_dim,
                              bool qh_block = false, cudaStream_t stream = nullptr,
                              bool carry_in = false, int slot = 0,
-                             cudaEvent_t prep_done = nullptr);
+                             cudaEvent_t prep_done = nullptr,
+                             const GdnVFold* vfold = nullptr, bool scan_trigger = false);
+
+// launch_prefill_gdn_conv for the q and k heads only (vfold: the v channels are left to the
+// chunked scan's prep, see GdnVFold). False, launching nothing, where the tiled conv is off.
+bool launch_prefill_gdn_conv_qk(const void* qkv, const void* conv_w, void* conv_state,
+                                void* q, void* k, int n_tokens, int q_heads, int v_heads,
+                                int head_dim, int conv_kernel, float eps, cudaStream_t stream,
+                                const void* conv_prev);
 
 // DFlash short-block variants. They start from the live decode state but leave it untouched,
 // writing a complete post-token checkpoint for every candidate row. checkpoint[t] uses the same

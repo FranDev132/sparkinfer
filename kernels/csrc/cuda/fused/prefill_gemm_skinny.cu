@@ -137,7 +137,9 @@ __global__ __launch_bounds__(WARPS * 32) void pf_gemm_skinny_kernel(
 // to C1 -- NE is a multiple of 16, so no 16x16 tile straddles the two. Every output element gets
 // the same A and W fragments in the same K order through the same wmma chain as
 // pf_gemm_skinny_kernel<BT, NE, ...> gives it, so both outputs are bit-identical.
-template <int BT, int NE, int KT, int WARPS>
+// TAILWAIT: launched programmatic (pdl_tail); the last block waits for the kernel ahead before it
+// exits, which keeps the grid alive until that kernel is done. No value changes.
+template <int BT, int NE, int KT, int WARPS, bool TAILWAIT = false>
 __global__ __launch_bounds__(WARPS * 32) void pf_gemm_skinny_pair_kernel(
         const __nv_bfloat16* __restrict__ A, const __nv_bfloat16* __restrict__ W0,
         const __nv_bfloat16* __restrict__ W1, __nv_bfloat16* __restrict__ C0,
@@ -209,6 +211,10 @@ __global__ __launch_bounds__(WARPS * 32) void pf_gemm_skinny_pair_kernel(
             if (gm < M && gn < n_out) Cm[(size_t)gm * n_out + gn] = __float2bfloat16(sC[r][c]);
         }
     }
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+    if constexpr (TAILWAIT)
+        if (blockIdx.x == gridDim.x - 1 && tid == 0) asm volatile("griddepcontrol.wait;" ::: "memory");
+#endif
 }
 
 // Same cp.async staging, K partitioned across blockIdx.y so M=128 (4 row-tiles)
@@ -387,7 +393,8 @@ bool launch_prefill_gemm_skinny(const void* A, const void* W, void* C,
 }
 
 bool launch_prefill_gemm_skinny_pair(const void* A, const void* W0, const void* W1, void* C0,
-                                     void* C1, int M, int N, int K, cudaStream_t stream) {
+                                     void* C1, int M, int N, int K, cudaStream_t stream,
+                                     bool pdl_tail) {
     constexpr int KT = 64, BT = 32;
     static const int enabled = [] {
         const char* e = getenv("SPARKINFER_PREFILL_GEMM_SKINNY");
@@ -415,12 +422,37 @@ bool launch_prefill_gemm_skinny_pair(const void* A, const void* W0, const void* 
     auto w1 = reinterpret_cast<const __nv_bfloat16*>(W1);
     auto c0 = reinterpret_cast<__nv_bfloat16*>(C0);
     auto c1 = reinterpret_cast<__nv_bfloat16*>(C1);
+    // Programmatic launches need sm_90; below that pdl_tail is a plain launch.
+    static const bool pdl_ok = [] {
+        int dev = 0, major = 0;
+        cudaGetDevice(&dev);
+        return cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) == cudaSuccess &&
+               major >= 9;
+    }();
+    auto go = [&](auto kern, int warps) {
+        if (!(pdl_tail && pdl_ok)) {
+            kern<<<mtiles, warps * 32, 0, stream>>>(a, w0, w1, c0, c1, M, N, K);
+            return;
+        }
+        cudaLaunchConfig_t cfg = {};
+        cfg.gridDim = dim3(mtiles);
+        cfg.blockDim = dim3(warps * 32);
+        cfg.stream = stream;
+        cudaLaunchAttribute la{};
+        la.id = cudaLaunchAttributeProgrammaticStreamSerialization;
+        la.val.programmaticStreamSerializationAllowed = 1;
+        cfg.attrs = &la;
+        cfg.numAttrs = 1;
+        cudaLaunchKernelEx(&cfg, kern, a, w0, w1, c0, c1, M, N, K);
+    };
     if (N <= 32) {
         constexpr int W_ = (BT / 16) * (64 / 16);
-        pf_gemm_skinny_pair_kernel<BT, 32, KT, W_><<<mtiles, W_ * 32, 0, stream>>>(a, w0, w1, c0, c1, M, N, K);
+        if (pdl_tail && pdl_ok) go(pf_gemm_skinny_pair_kernel<BT, 32, KT, W_, true>, W_);
+        else                    go(pf_gemm_skinny_pair_kernel<BT, 32, KT, W_>, W_);
     } else {
         constexpr int W_ = (BT / 16) * (96 / 16);
-        pf_gemm_skinny_pair_kernel<BT, 48, KT, W_><<<mtiles, W_ * 32, 0, stream>>>(a, w0, w1, c0, c1, M, N, K);
+        if (pdl_tail && pdl_ok) go(pf_gemm_skinny_pair_kernel<BT, 48, KT, W_, true>, W_);
+        else                    go(pf_gemm_skinny_pair_kernel<BT, 48, KT, W_>, W_);
     }
     return true;
 }

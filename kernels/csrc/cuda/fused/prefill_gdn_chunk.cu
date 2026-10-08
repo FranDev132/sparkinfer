@@ -83,6 +83,18 @@ namespace {
 __device__ __forceinline__ float gc_to_f(__nv_bfloat16 x) { return __bfloat162float(x); }
 __device__ __forceinline__ float gc_sigmoid(float x) { return 1.f / (1.f + __expf(-x)); }
 __device__ __forceinline__ float gc_softplus(float x) { return x > 20.f ? x : __logf(1.f + __expf(x)); }
+// GdnVFold's conv width: the taps a v channel's walk holds in registers.
+constexpr int kGdncVfK = 4;
+// pf_silu (batched_prefill.cu, same --use_fast_math flags): the conv's activation, spelled the same.
+__device__ __forceinline__ float gc_silu(float x) { return x / (1.f + __expf(-x)); }
+// pf_conv_tap: a raw qkv value at pass row src, the window before the pass where src < 0.
+__device__ __forceinline__ float gc_conv_tap(const __nv_bfloat16* __restrict__ qkv,
+                                             const __nv_bfloat16* __restrict__ conv_prev,
+                                             int src, int d, int qkv_dim, int conv_kernel) {
+    if (src >= 0)   return gc_to_f(qkv[(size_t)src * qkv_dim + d]);
+    if (!conv_prev) return 0.f;
+    return gc_to_f(conv_prev[(size_t)(src + conv_kernel - 1) * qkv_dim + d]);
+}
 
 // Shared-memory row padding (in elements) to break the power-of-two bank stride.
 constexpr int PAD = 8;
@@ -98,7 +110,9 @@ constexpr int PAD = 8;
 // Rows past the end of a short final chunk get b = 0 and log-gate 0, which makes W^, U0 and M
 // vanish there, so the scan kernel needs no tail special-casing beyond bounds-checking its writes.
 // ---------------------------------------------------------------------------
-template <int C, int HD>
+// VFOLD: V comes from the raw projection (GdnVFold) -- its own instantiation, so the other is the
+// kernel it always was.
+template <int C, int HD, bool VFOLD = false>
 __global__ void pf_gdnc_prep_kernel(const __nv_bfloat16* __restrict__ q,
                                     const __nv_bfloat16* __restrict__ k,
                                     const __nv_bfloat16* __restrict__ v,
@@ -111,7 +125,7 @@ __global__ void pf_gdnc_prep_kernel(const __nv_bfloat16* __restrict__ q,
                                     __nv_bfloat16* __restrict__ u_buf,
                                     float* __restrict__ m_buf,
                                     int n_tokens, int q_heads, int v_heads, bool qh_block,
-                                    bool warp_inv) {
+                                    bool warp_inv, GdnVFold vf, int row0, int n_pass) {
     extern __shared__ char s_raw[];
     __nv_bfloat16* s_k = reinterpret_cast<__nv_bfloat16*>(s_raw);              // [C][HD+PAD]
     __nv_bfloat16* s_x = s_k + (size_t)C * (HD + PAD);                         // [C][HD+PAD] q then v
@@ -210,10 +224,32 @@ __global__ void pf_gdnc_prep_kernel(const __nv_bfloat16* __restrict__ q,
     // Q's last reader was the tile above, so V can start streaming into s_x now, behind the
     // triangular solve and W^ (which read only s_A, s_k and the gates); it is waited on just
     // before U0. Rows past len are zeroed there instead (cp.async cannot predicate).
-    for (int e8 = tid; e8 < (C * HD) / 8; e8 += nthr) {
-        const int i = e8 / (HD / 8), d = (e8 - i * (HD / 8)) * 8;
-        if (i < len)
-            __pipeline_memcpy_async(s_x + i * (HD + PAD) + d, v + (size_t)(t0 + i) * v_dim + h * HD + d, 16);
+    // GdnVFold: the raw v columns stream in instead (same bytes, rows t0.. of the raw projection),
+    // with the K-1 rows before the chunk held in registers; the conv is applied before U0.
+    constexpr int VK = kGdncVfK;
+    const int vf_col = tid % HD, vf_part = tid / HD;
+    const int vf_dch = vf.v_off + h * HD + vf_col;
+    float vf_halo[VK - 1];
+    if constexpr (VFOLD) {
+        const auto* raw = static_cast<const __nv_bfloat16*>(vf.qkv);
+        for (int e8 = tid; e8 < (C * HD) / 8; e8 += nthr) {
+            const int i = e8 / (HD / 8), d = (e8 - i * (HD / 8)) * 8;
+            if (i < len)
+                __pipeline_memcpy_async(s_x + i * (HD + PAD) + d,
+                                        raw + (size_t)(row0 + t0 + i) * vf.qkv_dim + vf.v_off + h * HD + d, 16);
+        }
+        #pragma unroll
+        for (int c = 0; c < VK - 1; c++)
+            vf_halo[c] = (vf_part == 0)
+                ? gc_conv_tap(raw, static_cast<const __nv_bfloat16*>(vf.conv_prev),
+                              row0 + t0 - (VK - 1) + c, vf_dch, vf.qkv_dim, VK)
+                : 0.f;
+    } else {
+        for (int e8 = tid; e8 < (C * HD) / 8; e8 += nthr) {
+            const int i = e8 / (HD / 8), d = (e8 - i * (HD / 8)) * 8;
+            if (i < len)
+                __pipeline_memcpy_async(s_x + i * (HD + PAD) + d, v + (size_t)(t0 + i) * v_dim + h * HD + d, 16);
+        }
     }
     __pipeline_commit();
 
@@ -323,7 +359,50 @@ __global__ void pf_gdnc_prep_kernel(const __nv_bfloat16* __restrict__ q,
 
     // ---- V (in flight since the A/M tile) in the Q tile, then U0 = T . (b_m v_m) ----
     __pipeline_wait_prior(0);
-    if (len < C)
+    if constexpr (VFOLD) {
+        // pf_gdn_conv_tile_kernel's walk over one channel -- its taps in its order, SiLU, bf16 --
+        // over half the chunk's rows, read from the raw rows before any are overwritten.
+        const auto* raw = static_cast<const __nv_bfloat16*>(vf.qkv);
+        const auto* prev = static_cast<const __nv_bfloat16*>(vf.conv_prev);
+        constexpr int K = VK;
+        const int r0 = vf_part * (C / 2);
+        __syncthreads();                                   // every raw row has landed
+        float w[K], hist[K - 1], cur[C / 2];
+        #pragma unroll
+        for (int c = 0; c < K; c++)
+            w[c] = gc_to_f(static_cast<const __nv_bfloat16*>(vf.conv_w)[(size_t)vf_dch * K + c]);
+        #pragma unroll
+        for (int c = 0; c < K - 1; c++)
+            hist[c] = (vf_part == 0) ? vf_halo[c]
+                    : gc_to_f(s_x[(r0 - (K - 1) + c) * (HD + PAD) + vf_col]);
+        #pragma unroll
+        for (int tt = 0; tt < C / 2; tt++)
+            cur[tt] = (r0 + tt < len) ? gc_to_f(s_x[(r0 + tt) * (HD + PAD) + vf_col]) : 0.f;
+        __syncthreads();                                   // the raw rows are read; v replaces them
+        #pragma unroll
+        for (int tt = 0; tt < C / 2; tt++) {
+            float y = 0.f;
+            #pragma unroll
+            for (int c = 0; c < K - 1; c++) y += w[c] * hist[c];
+            y += w[K - 1] * cur[tt];
+            #pragma unroll
+            for (int c = 0; c < K - 2; c++) hist[c] = hist[c + 1];
+            hist[K - 2] = cur[tt];
+            s_x[(r0 + tt) * (HD + PAD) + vf_col] =
+                __float2bfloat16((r0 + tt < len) ? gc_silu(y) : 0.f);
+        }
+        // The conv window the decode reads, for the v channels, from the chunk holding the pass's
+        // last row (launch_prefill_gdn_conv_qk leaves these to this kernel).
+        if (vf.conv_state && vf_part == 0 && row0 + t0 + len == n_pass) {
+            #pragma unroll
+            for (int c = 0; c < K - 1; c++) {
+                const int src = n_pass - 1 - (K - 2 - c);
+                static_cast<__nv_bfloat16*>(vf.conv_state)[(size_t)c * vf.qkv_dim + vf_dch] =
+                    __float2bfloat16(gc_conv_tap(raw, prev, src, vf_dch, vf.qkv_dim, K));
+            }
+        }
+    }
+    if (len < C && !VFOLD)
         for (int e8 = tid; e8 < (C * HD) / 8; e8 += nthr) {
             const int i = e8 / (HD / 8), d = (e8 - i * (HD / 8)) * 8;
             if (i >= len) *reinterpret_cast<uint4*>(s_x + i * (HD + PAD) + d) = make_uint4(0u, 0u, 0u, 0u);
@@ -864,7 +943,9 @@ struct GmLayout {
     static_assert(STAGE % 16 == 0 && OFF_M % 16 == 0 && OFF_U % 16 == 0 && OFF_G % 16 == 0, "16B");
 };
 
-template <int WPC>
+// TRIG: the launch after this one is programmatic and may start at once (scan_trigger in
+// launch_prefill_gdn_chunk): nothing it reads is written here.
+template <int WPC, bool TRIG = false>
 __global__ __launch_bounds__(WPC * 32, 1)
 void pf_gdnc_scan_mma_kernel(const __nv_bfloat16* __restrict__ q,
                              const __nv_bfloat16* __restrict__ k,
@@ -880,6 +961,9 @@ void pf_gdnc_scan_mma_kernel(const __nv_bfloat16* __restrict__ q,
     constexpr int C = L::C, HD = L::HD, CW = L::CW, NCOL = L::NCOL;
     constexpr int NTHR = WPC * 32;
     extern __shared__ __align__(16) char s_raw[];
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+    if constexpr (TRIG) asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+#endif
 
     const int h = blockIdx.x;
     const int j0 = blockIdx.y * NCOL;
@@ -1189,9 +1273,13 @@ bool gdnc_scan_mma_smem_ok(int dev) {
     static int cfg[kMaxDevices] = {0};
     if (dev < 0 || dev >= kMaxDevices) return false;
     if (!cfg[dev]) {
-        const cudaError_t ce = cudaFuncSetAttribute(pf_gdnc_scan_mma_kernel<WPC>,
-                                                    cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                                    GmLayout<WPC>::SMEM);
+        cudaError_t ce = cudaFuncSetAttribute(pf_gdnc_scan_mma_kernel<WPC>,
+                                              cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                              GmLayout<WPC>::SMEM);
+        if (ce == cudaSuccess)
+            ce = cudaFuncSetAttribute(pf_gdnc_scan_mma_kernel<WPC, true>,
+                                      cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                      GmLayout<WPC>::SMEM);
         if (ce != cudaSuccess) cudaGetLastError();
         cfg[dev] = ce == cudaSuccess ? 1 : 2;
     }
@@ -1206,8 +1294,12 @@ bool launch_prefill_gdn_chunk(const void* q, const void* k, const void* v,
                               float* state, void* out,
                               int n_tokens, int q_heads, int v_heads, int head_dim,
                               bool qh_block, cudaStream_t stream,
-                              bool carry_in, int slot, cudaEvent_t prep_done) {
+                              bool carry_in, int slot, cudaEvent_t prep_done,
+                              const GdnVFold* vfold, bool scan_trigger) {
     constexpr int C = 32, HD = 128, PREP_THREADS = 256;
+    // The fold is written for the four-tap conv every GDN checkpoint here has (kGdncVfK).
+    const GdnVFold vf = (vfold && vfold->qkv && vfold->conv_w && vfold->conv_kernel == kGdncVfK)
+                            ? *vfold : GdnVFold{};
     // State columns per scan block. JC_S is the shape every context used before; JC_B halves the
     // grid — see use_big below for why that is the whole point at long context.
     constexpr int JC_S = 32, JC_B = 64, JC_T = 16;
@@ -1281,6 +1373,10 @@ bool launch_prefill_gdn_chunk(const void* q, const void* k, const void* v,
             pf_gdnc_prep_kernel<C, HD>,
             cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sm_prep);
         if (ce_prep != cudaSuccess && sm_prep > 48u * 1024u) return false;
+        const cudaError_t ce_vf = cudaFuncSetAttribute(
+            pf_gdnc_prep_kernel<C, HD, true>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sm_prep);
+        if (ce_vf != cudaSuccess && sm_prep > 48u * 1024u) return false;
         cfg[dev] = 1;
     }
     if (!gdnc_scan_smem_ok<C, HD, JC_S>(dev)) return false;
@@ -1353,7 +1449,7 @@ bool launch_prefill_gdn_chunk(const void* q, const void* k, const void* v,
     auto run_slice = [&](const __nv_bfloat16* qb, const __nv_bfloat16* kb,
                          const __nv_bfloat16* vb, const __nv_bfloat16* ab,
                          const __nv_bfloat16* bb, __nv_bfloat16* ob,
-                         int len, int carry) -> bool {
+                         int len, int carry, int row0) -> bool {
         const int n_chunks = (len + C - 1) / C;
         const size_t n_g = (size_t)len * v_heads;
         const size_t n_w = (size_t)len * v_heads * HD;
@@ -1369,9 +1465,14 @@ bool launch_prefill_gdn_chunk(const void* q, const void* k, const void* v,
         auto* w_buf = reinterpret_cast<__nv_bfloat16*>(base + off_w);
         auto* u_buf = reinterpret_cast<__nv_bfloat16*>(base + off_u);
         dim3 gprep(n_chunks, v_heads);
-        pf_gdnc_prep_kernel<C, HD><<<gprep, PREP_THREADS, sm_prep, stream>>>(
-            qb, kb, vb, ab, bb, db, aa, g_buf, w_buf, u_buf, m_buf,
-            len, q_heads, v_heads, qh_block, prep_warp_inv);
+        if (vf.qkv)
+            pf_gdnc_prep_kernel<C, HD, true><<<gprep, PREP_THREADS, sm_prep, stream>>>(
+                qb, kb, vb, ab, bb, db, aa, g_buf, w_buf, u_buf, m_buf,
+                len, q_heads, v_heads, qh_block, prep_warp_inv, vf, row0, n_tokens);
+        else
+            pf_gdnc_prep_kernel<C, HD><<<gprep, PREP_THREADS, sm_prep, stream>>>(
+                qb, kb, vb, ab, bb, db, aa, g_buf, w_buf, u_buf, m_buf,
+                len, q_heads, v_heads, qh_block, prep_warp_inv, vf, row0, n_tokens);
         if (prep_done) {
             cudaEventRecord(prep_done, stream);
             prep_done = nullptr;
@@ -1379,8 +1480,13 @@ bool launch_prefill_gdn_chunk(const void* q, const void* k, const void* v,
         if (use_mma) {
             auto go = [&](auto wpc_tag) {
                 constexpr int W = decltype(wpc_tag)::value;
-                pf_gdnc_scan_mma_kernel<W>
-                    <<<dim3(v_heads, HD / GmLayout<W>::NCOL), W * 32, GmLayout<W>::SMEM, stream>>>(
+                const dim3 grid(v_heads, HD / GmLayout<W>::NCOL);
+                if (scan_trigger)
+                    pf_gdnc_scan_mma_kernel<W, true><<<grid, W * 32, GmLayout<W>::SMEM, stream>>>(
+                        qb, kb, g_buf, w_buf, u_buf, m_buf, state, ob,
+                        len, q_heads, v_heads, n_chunks, qh_block, carry);
+                else
+                    pf_gdnc_scan_mma_kernel<W><<<grid, W * 32, GmLayout<W>::SMEM, stream>>>(
                         qb, kb, g_buf, w_buf, u_buf, m_buf, state, ob,
                         len, q_heads, v_heads, n_chunks, qh_block, carry);
             };
@@ -1434,7 +1540,7 @@ bool launch_prefill_gdn_chunk(const void* q, const void* k, const void* v,
     // and allocates; each doubling cuts the launch count in half.
     const size_t total = gdnc_workspace_bytes(n_tokens, v_heads, C, HD);
     if (ws_reserve(total, slot))
-        return run_slice(qb, kb, vb, ab, bb, ob, n_tokens, carry_in ? 1 : 0);
+        return run_slice(qb, kb, vb, ab, bb, ob, n_tokens, carry_in ? 1 : 0, 0);
     cudaGetLastError();   // clear the failed grow so later peek/getinfo are clean
 
     int seg = 0;
@@ -1462,7 +1568,7 @@ bool launch_prefill_gdn_chunk(const void* q, const void* k, const void* v,
         const int len = (int)((off + seg < (size_t)n_tokens) ? seg : (size_t)n_tokens - off);
         if (!run_slice(qb + off * q_dim, kb + off * q_dim, vb + off * v_dim,
                        ab + off * v_heads, bb + off * v_heads, ob + off * v_dim,
-                       len, (off || carry_in) ? 1 : 0))
+                       len, (off || carry_in) ? 1 : 0, (int)off))
             return false;
     }
     return true;

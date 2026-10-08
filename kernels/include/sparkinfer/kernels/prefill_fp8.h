@@ -46,7 +46,16 @@ void launch_prefill_gemm_fp8(const void* A, const void* W,
                              const void* sw_bf16 = nullptr,
                              // C holds the residual: C = bf16(C + bf16(A@W^T)), launch_prefill_add's
                              // rounding, so the projection needs no scratch output and no add pass.
-                             bool resid = false);
+                             bool resid = false,
+                             // Launched programmatic behind a kernel that lets it start at once
+                             // (launch_prefill_gdn_chunk's scan_trigger): its blocks run beside that
+                             // kernel, and the last one waits for it before exiting, so the launch
+                             // after this one sees both complete. Nothing read here may be written
+                             // by that kernel. Ignored off the long-prompt tiles (plain launch).
+                             bool pdl_tail = false,
+                             // Lets a programmatic launch right after this one start at once (it
+                             // must not read C before its own grid-dependency wait).
+                             bool trig_head = false);
 
 // Split-K variant for the scored M=128 GDN projections (40-64 tiles on a 170-SM 5090).
 // `partials` is M*N fp32. Returns false when the shape already fills the device (caller

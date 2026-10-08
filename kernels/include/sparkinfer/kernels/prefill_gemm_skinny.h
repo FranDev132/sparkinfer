@@ -40,8 +40,12 @@ bool launch_prefill_gemm_skinny(const void* A, const void* W, void* C,
 // to launch_prefill_gemm_skinny on its own. False -- nothing launched -- wherever that launcher
 // would split K (short prompts) or not run; the caller then makes its two launches.
 //   SPARKINFER_PREFILL_SKINNY_PAIR  (default 1)  0 keeps two launches (A/B).
+// pdl_tail: launched programmatic behind a kernel that lets it start at once (A must already be
+// complete); the last block waits for that kernel before it exits, so the launch after this one
+// sees both complete.
 bool launch_prefill_gemm_skinny_pair(const void* A, const void* W0, const void* W1, void* C0,
-                                     void* C1, int M, int N, int K, cudaStream_t stream = nullptr);
+                                     void* C1, int M, int N, int K, cudaStream_t stream = nullptr,
+                                     bool pdl_tail = false);
 
 }  // namespace kernels
 }  // namespace sparkinfer

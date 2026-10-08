@@ -333,13 +333,20 @@ __device__ __forceinline__ int fp8_swz4(int k, int row) {
     return (((k >> 4) ^ ((row >> 1) & 3)) << 4) | (k & 15);
 }
 
-template <int GRP, int WMW = 2, int WNW = 2, bool MTAIL = true, int ST = FP8_W64_ST>
+// TAILWAIT: launched programmatic (pdl_tail); the last block waits for the kernel ahead before
+// it exits, which keeps the grid alive until that kernel is done. TRIG: a programmatic launch
+// after this one may start at once (trig_head). No value changes.
+template <int GRP, int WMW = 2, int WNW = 2, bool MTAIL = true, int ST = FP8_W64_ST,
+          bool TAILWAIT = false, bool TRIG = false>
 __global__ __launch_bounds__(32 * WMW * WNW, WMW * WNW == 4 ? 2 : 1) void pf_gemm_fp8_w64_kernel(
         const __nv_fp8_e4m3* __restrict__ A, const __nv_fp8_e4m3* __restrict__ W,
         const float* __restrict__ sx, const float* __restrict__ sw,
         __nv_bfloat16* __restrict__ C, int M, int N, int K,
         const __nv_bfloat16* __restrict__ swb, int resid) {
     extern __shared__ __align__(16) unsigned char fp8_w64_smem[];
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+    if constexpr (TRIG) asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+#endif
     constexpr int BMB = 64 * WMW, BNB = 64 * WNW, NT = 32 * WMW * WNW;
     auto As = reinterpret_cast<__nv_fp8_e4m3 (*)[BMB][FP8_BK]>(fp8_w64_smem);
     auto Bs = reinterpret_cast<__nv_fp8_e4m3 (*)[BNB][FP8_BK]>(fp8_w64_smem + ST * BMB * FP8_BK);
@@ -481,6 +488,41 @@ __global__ __launch_bounds__(32 * WMW * WNW, WMW * WNW == 4 ? 2 : 1) void pf_gem
             }
         }
     }
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+    if constexpr (TAILWAIT)
+        if (blockIdx.x == gridDim.x - 1 && tid == 0) asm volatile("griddepcontrol.wait;" ::: "memory");
+#endif
+}
+
+// A w64 launch, programmatic and with the TAILWAIT form when `pdl` (see pdl_tail).
+template <int GRP, int WMW, int WNW, bool MTAIL>
+void fp8_w64_launch(bool pdl, bool trig, int blocks, size_t smem, cudaStream_t stream,
+                    const __nv_fp8_e4m3* A, const __nv_fp8_e4m3* W, const float* sx,
+                    const float* sw, __nv_bfloat16* C, int M, int N, int K,
+                    const __nv_bfloat16* swb, int rs) {
+    constexpr int NT = 32 * WMW * WNW;
+    if (trig && !pdl) {
+        pf_gemm_fp8_w64_kernel<GRP, WMW, WNW, MTAIL, FP8_W64_ST, false, true>
+            <<<blocks, NT, smem, stream>>>(A, W, sx, sw, C, M, N, K, swb, rs);
+        return;
+    }
+    if (!pdl) {
+        pf_gemm_fp8_w64_kernel<GRP, WMW, WNW, MTAIL><<<blocks, NT, smem, stream>>>(
+            A, W, sx, sw, C, M, N, K, swb, rs);
+        return;
+    }
+    cudaLaunchConfig_t cfg = {};
+    cfg.gridDim = dim3(blocks);
+    cfg.blockDim = dim3(NT);
+    cfg.dynamicSmemBytes = smem;
+    cfg.stream = stream;
+    cudaLaunchAttribute la{};
+    la.id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    la.val.programmaticStreamSerializationAllowed = 1;
+    cfg.attrs = &la;
+    cfg.numAttrs = 1;
+    cudaLaunchKernelEx(&cfg, pf_gemm_fp8_w64_kernel<GRP, WMW, WNW, MTAIL, FP8_W64_ST, true>,
+                       A, W, sx, sw, C, M, N, K, swb, rs);
 }
 } // namespace
 
@@ -833,8 +875,17 @@ static inline int fp8_tile_bk(bool narrow) { return narrow ? fp8_narrow_bk() : F
 void launch_prefill_gemm_fp8(const void* A, const void* W,
                              const float* sx, const float* sw, void* C,
                              int M, int N, int K, cudaStream_t stream, const void* sw_bf16,
-                             bool resid) {
+                             bool resid, bool pdl_tail, bool trig_head) {
     const __nv_bfloat16* swb = reinterpret_cast<const __nv_bfloat16*>(sw_bf16);
+    // Programmatic launches need sm_90; below that pdl_tail is a plain launch.
+    static const bool pdl_ok = [] {
+        int dev = 0, major = 0;
+        cudaGetDevice(&dev);
+        return cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) == cudaSuccess &&
+               major >= 9;
+    }();
+    const bool pdl = pdl_tail && pdl_ok;
+    const bool trig = trig_head && pdl_ok;
     const int rs = resid ? 1 : 0;
     const bool narrow = M >= FP8_NARROW_MIN_M && M <= FP8_NARROW_BM && fp8_narrow_m();
     const int bm = narrow ? FP8_NARROW_BM : FP8_BM;
@@ -876,16 +927,28 @@ void launch_prefill_gemm_fp8(const void* A, const void* W,
                                             (int)smem) == cudaSuccess &&
                        cudaFuncSetAttribute(pf_gemm_fp8_w64_kernel<4, 2, 4, true>,
                                             cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                            (int)smem) == cudaSuccess &&
+                       cudaFuncSetAttribute(pf_gemm_fp8_w64_kernel<4, 2, 4, false, FP8_W64_ST, true>,
+                                            cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                            (int)smem) == cudaSuccess &&
+                       cudaFuncSetAttribute(pf_gemm_fp8_w64_kernel<4, 2, 4, true, FP8_W64_ST, true>,
+                                            cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                            (int)smem) == cudaSuccess &&
+                       cudaFuncSetAttribute(pf_gemm_fp8_w64_kernel<4, 2, 4, false, FP8_W64_ST, false, true>,
+                                            cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                            (int)smem) == cudaSuccess &&
+                       cudaFuncSetAttribute(pf_gemm_fp8_w64_kernel<4, 2, 4, true, FP8_W64_ST, false, true>,
+                                            cudaFuncAttributeMaxDynamicSharedMemorySize,
                                             (int)smem) == cudaSuccess;
             }();
             if (ok) {
                 const int blocks = tm * (N / (2 * FP8_BN));
                 if (mtail)
-                    pf_gemm_fp8_w64_kernel<4, 2, 4, true><<<blocks, 256, smem, stream>>>(
-                        Ae, We, sx, sw, Cb, M, N, K, swb, rs);
+                    fp8_w64_launch<4, 2, 4, true>(pdl, trig, blocks, smem, stream, Ae, We, sx, sw, Cb,
+                                                  M, N, K, swb, rs);
                 else
-                    pf_gemm_fp8_w64_kernel<4, 2, 4, false><<<blocks, 256, smem, stream>>>(
-                        Ae, We, sx, sw, Cb, M, N, K, swb, rs);
+                    fp8_w64_launch<4, 2, 4, false>(pdl, trig, blocks, smem, stream, Ae, We, sx, sw, Cb,
+                                                   M, N, K, swb, rs);
                 return;
             }
         }
@@ -895,16 +958,24 @@ void launch_prefill_gemm_fp8(const void* A, const void* W,
                                  cudaFuncAttributePreferredSharedMemoryCarveout, 100);
             cudaFuncSetAttribute(pf_gemm_fp8_w64_kernel<8, 2, 2, true>,
                                  cudaFuncAttributePreferredSharedMemoryCarveout, 100);
+            cudaFuncSetAttribute(pf_gemm_fp8_w64_kernel<8, 2, 2, false, FP8_W64_ST, true>,
+                                 cudaFuncAttributePreferredSharedMemoryCarveout, 100);
+            cudaFuncSetAttribute(pf_gemm_fp8_w64_kernel<8, 2, 2, true, FP8_W64_ST, true>,
+                                 cudaFuncAttributePreferredSharedMemoryCarveout, 100);
+            cudaFuncSetAttribute(pf_gemm_fp8_w64_kernel<8, 2, 2, false, FP8_W64_ST, false, true>,
+                                 cudaFuncAttributePreferredSharedMemoryCarveout, 100);
+            cudaFuncSetAttribute(pf_gemm_fp8_w64_kernel<8, 2, 2, true, FP8_W64_ST, false, true>,
+                                 cudaFuncAttributePreferredSharedMemoryCarveout, 100);
             return true;
         }();
         (void)attr;
         const int blocks = tm * (N / FP8_BN);
         if (mtail)
-            pf_gemm_fp8_w64_kernel<8, 2, 2, true><<<blocks, 128, smem, stream>>>(
-                Ae, We, sx, sw, Cb, M, N, K, swb, rs);
+            fp8_w64_launch<8, 2, 2, true>(pdl, trig, blocks, smem, stream, Ae, We, sx, sw, Cb, M, N, K,
+                                          swb, rs);
         else
-            pf_gemm_fp8_w64_kernel<8, 2, 2, false><<<blocks, 128, smem, stream>>>(
-                Ae, We, sx, sw, Cb, M, N, K, swb, rs);
+            fp8_w64_launch<8, 2, 2, false>(pdl, trig, blocks, smem, stream, Ae, We, sx, sw, Cb, M, N, K,
+                                           swb, rs);
         return;
     }
     pf_gemm_fp8_kernel<false><<<grid, 256, 0, stream>>>(
