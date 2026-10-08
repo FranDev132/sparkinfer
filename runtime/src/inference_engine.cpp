@@ -2052,11 +2052,38 @@ bool ContinuousBatchEngine::step_jobs_packed(const std::vector<uint64_t>& ids, b
         if (!j->req.logit_bias.empty() || j->req.constraint) return false;
     }
 
+    // A batch one row past a multiple of `cap` leaves a chunk of one, which the loop below runs
+    // through the per-row forward: a whole single-row step on top of the packed ones. At c=32 with
+    // one more request live that is every step while it lasts (Qwen3.8: 11.5 ms beside a 16.8 ms
+    // packed step). Hold the row furthest ahead back for this step instead -- it neither emits nor
+    // advances, and takes its turn on the next step, by when another row is furthest ahead.
+    // SPARKINFER_PACKED_HOLD_ONE=0 runs the chunk of one as before.
+    static const bool hold_one = [] {
+        const char* e = getenv("SPARKINFER_PACKED_HOLD_ONE");
+        return !(e && e[0] == '0');
+    }();
+    Job* hold = nullptr;
+    if (hold_one && cap >= 2 && (int)jobs.size() > cap) {
+        // Rows still live after this step's emission (a cancellation from on_token cannot be
+        // foreseen; it only makes the held row's wait unnecessary).
+        auto finishes = [&](const Job* j) {
+            return (!j->req.ignore_eos &&
+                    (j->next_token == cfg.eos_id || (cfg.eos_id2 >= 0 && j->next_token == cfg.eos_id2))) ||
+                   j->decode_emitted + 1 >= j->req.max_new_tokens;
+        };
+        int stay = 0;
+        for (const Job* j : jobs) stay += !finishes(j);
+        if (stay > cap && stay % cap == 1)
+            for (Job* j : jobs)
+                if (!finishes(j) && (!hold || j->decode_emitted > hold->decode_emitted)) hold = j;
+    }
+
     // Emit each row's pending token and run the same termination checks step_job() does. A job
     // that finishes here simply drops out of the packed forward below.
     std::vector<Job*> live;
     live.reserve(jobs.size());
     for (Job* j : jobs) {
+        if (j == hold) continue;
         const auto t_emit = std::chrono::steady_clock::now();
         if (!j->saw_first_tok) {
             j->t_first = t_emit;
